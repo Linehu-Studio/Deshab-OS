@@ -1,0 +1,57 @@
+# firstInit 首次启动引导
+
+`CODE/firstInit` 是 Deshab 首次使用时的用户设置向导，只负责引导用户设置计算机名、用户名、密码等用户级配置。硬件/系统组件初始化（例如鼠标初始化）由 DSK 直接调度对应初始化程序，不由 FirstInit 接管。编译目标：
+
+```text
+CODE/firstInit -> SYSTEM/system/user/use/FirstInit.elf
+```
+
+## 触发条件
+
+DSK 主内核启动后，从 FAT32 块设备加载 `SYSTEM/system/user/use/firstInit.txt`：
+
+- 若 `firstInit == 0`：系统判定为**首次启动**，将值改为 `1`，加载 `FirstInit.elf` 执行用户引导
+- 若 `firstInit != 0`（或文件不存在）：跳过引导，进入正常启动
+
+## 执行流程
+
+```text
+1. 接收 DSK 传入的 dsk_boot_context
+2. 淡出加载环动画（~1秒渐变）
+3. 屏幕中央显示："欢迎使用 Deshab"
+4. 等待 5 秒
+5. 渐隐切换为："接下来让我们来引导你设置你的系统"
+6. 引导用户设置：网络、用户名、密码等（待实现）
+```
+
+## 产物路径
+
+```text
+SYSTEM/system/user/use/FirstInit.elf  — 引导程序 ELF
+SYSTEM/system/user/use/firstInit.txt  — 首次标志文件（内容为 '0' 或 '1'）
+```
+
+## 构建
+
+```bash
+cd CODE/firstInit
+make -f MAKEFILE CC=clang LD=ld.lld
+```
+
+## 文件结构
+
+```text
+CODE/firstInit/
+  main.c      — 引导程序源码
+  linker.ld   — 链接脚本
+  MAKEFILE    — 构建规则
+  README      — 本文件
+```
+
+## 后续规划
+
+1. 键盘输入响应
+2. 网络配置界面（IP/DHCP/网关）
+3. 用户名密码设置
+4. 时区/语言选择
+5. 完成后写入配置并跳转 DSK 正常启动

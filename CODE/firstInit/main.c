@@ -1,0 +1,982 @@
+/* FirstInit — first boot setup wizard
+ * Fades out loading ring, shows welcome, 5s delay, transitions to setup guide.
+ */
+
+#include "../UTSM/include/utsm/dsk.h"
+
+typedef signed char        i8;
+typedef unsigned char      u8;
+typedef unsigned short     u16;
+typedef unsigned int       u32;
+typedef unsigned long long u64;
+typedef long long          i64;
+
+#define COM1 0x3F8
+
+static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
+static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+
+static void sputc(char c) {
+    for (unsigned int i=0; i<100000; i++) { if (inb(COM1+5)&0x20) break; }
+    outb(COM1, (unsigned char)c);
+}
+static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
+static void logl(const char *s) { swrite(s); swrite("\n"); }
+
+/* ---- PS/2 controller / mouse helpers (timeout-protected) ---- */
+static int ps2_wait_write(void) {
+    for (volatile u32 i = 0; i < 100000; i++) {
+        if (!(inb(0x64) & 0x02)) return 0;  /* input buffer empty */
+    }
+    return -1;
+}
+static int ps2_wait_read(void) {
+    for (volatile u32 i = 0; i < 100000; i++) {
+        if (inb(0x64) & 0x01) return 0;     /* output buffer full */
+    }
+    return -1;
+}
+static void ps2_cmd(u8 cmd) {
+    if (ps2_wait_write() == 0) outb(0x64, cmd);
+}
+static void mouse_cmd(u8 cmd) {
+    if (ps2_wait_write() == 0) outb(0x64, 0xD4);  /* next byte -> mouse */
+    if (ps2_wait_write() == 0) outb(0x60, cmd);
+}
+static void mouse_init(void) {
+    /* flush any pending data left by firmware */
+    for (int i = 0; i < 16; i++) {
+        if (!(inb(0x64) & 0x01)) break;
+        inb(0x60);
+    }
+    logl("[mouse] enable AUX port");
+    ps2_cmd(0xA8);        /* enable AUX (mouse) port */
+    /* read controller config: enable AUX clock, keep scan-code translation enabled */
+    ps2_cmd(0x20);
+    u8 cfg = 0;
+    if (ps2_wait_read() == 0) cfg = inb(0x60);
+    logl("[mouse] old cfg read");
+    cfg &= (u8)~(1 << 5);          /* bit5=1 disables AUX clock; clear it */
+    cfg |= (1 << 1) | (1 << 6);    /* AUX IRQ + Set2→Set1 translation */
+    ps2_cmd(0x60);
+    if (ps2_wait_write() == 0) outb(0x60, cfg);
+    logl("[mouse] new cfg written");
+    /* reset mouse, drain ACK + self-test + device ID */
+    logl("[mouse] reset");
+    mouse_cmd(0xFF);
+    for (int i = 0; i < 32; i++) {
+        if (ps2_wait_read() != 0) break;
+        u8 r = inb(0x60);
+        if (r == 0xFA) logl("[mouse] ACK");
+        else if (r == 0xAA) logl("[mouse] self-test OK");
+        else if (r == 0x00) logl("[mouse] device ID 0");
+    }
+    /* enable streaming mode */
+    logl("[mouse] enable streaming");
+    mouse_cmd(0xF4);
+    for (int i = 0; i < 16; i++) {
+        if (ps2_wait_read() != 0) break;
+        inb(0x60);
+    }
+    logl("[mouse] init done");
+}
+
+#define BG_TOP    0xFFC8E0F0u
+#define BG_BOTTOM 0xFF49306Fu
+#define BG_MID    0xFF8888B0u
+#define CARD_BG   0xFFEAF5FBu
+#define INPUT_BG  0xFFF0F5FAu
+#define TEXT_FG   0xFF5F7FA6u
+#define WELCOME_FG 0xFFE8F2FCu
+
+static u64 fb_a, fb_w, fb_h, fb_p;
+
+static u32 blend(u32 c1, u32 c2, u32 a) {
+    u32 na=256-a;
+    u32 r=((c1&0xFF)*na+(c2&0xFF)*a)>>8;
+    u32 g=(((c1>>8)&0xFF)*na+((c2>>8)&0xFF)*a)>>8;
+    u32 b=(((c1>>16)&0xFF)*na+((c2>>16)&0xFF)*a)>>8;
+    return 0xFF000000|(b<<16)|(g<<8)|r;
+}
+
+/* 8x8 font for ASCII */
+static const u8 font[95][8] = {
+    {0,0,0,0,0,0,0,0},{0x18,0x3c,0x3c,0x18,0x18,0,0x18,0},  /* ! */
+    {0x6c,0x6c,0,0,0,0,0,0},{0x6c,0x6c,0xfe,0x6c,0xfe,0x6c,0x6c,0},  /* # */
+    {0x18,0x7e,0xc0,0x7c,0x6,0xfc,0x18,0},{0,0xc6,0xcc,0x18,0x30,0x66,0xc6,0}, /* $ % */
+    {0x38,0x6c,0x38,0x76,0xdc,0xcc,0x76,0},{0x18,0x18,0x30,0,0,0,0,0}, /* & ' */
+    {0xc,0x18,0x30,0x30,0x30,0x18,0xc,0},{0x30,0x18,0xc,0xc,0xc,0x18,0x30,0}, /* ( ) */
+    {0,0x66,0x3c,0xff,0x3c,0x66,0,0},{0,0x18,0x18,0x7e,0x18,0x18,0,0}, /* * + */
+    {0,0,0,0,0,0x18,0x18,0x30},{0,0,0,0x7e,0,0,0,0},{0,0,0,0,0,0x18,0x18,0}, /* , - . */
+    {0x6,0xc,0x18,0x30,0x60,0xc0,0x80,0}, /* / */
+    {0x7c,0xc6,0xce,0xde,0xf6,0xe6,0x7c,0},{0x18,0x38,0x18,0x18,0x18,0x18,0x7e,0}, /* 0 1 */
+    {0x7c,0xc6,0x6,0xc,0x30,0x60,0xfe,0},{0x7c,0xc6,0x6,0x3c,0x6,0xc6,0x7c,0}, /* 2 3 */
+    {0x1c,0x3c,0x6c,0xcc,0xfe,0xc,0x1e,0},{0xfe,0xc0,0xfc,0x6,0x6,0xc6,0x7c,0}, /* 4 5 */
+    {0x38,0x60,0xc0,0xfc,0xc6,0xc6,0x7c,0},{0xfe,0xc6,0xc,0x18,0x30,0x30,0x30,0}, /* 6 7 */
+    {0x7c,0xc6,0xc6,0x7c,0xc6,0xc6,0x7c,0},{0x7c,0xc6,0xc6,0x7e,0x6,0xc,0x78,0}, /* 8 9 */
+    {0,0x18,0x18,0,0,0x18,0x18,0},{0,0x18,0x18,0,0,0x18,0x18,0x30}, /* : ; */
+    {0x6,0xc,0x18,0x30,0x18,0xc,0x6,0},{0,0,0x7e,0,0,0x7e,0,0}, /* < = */
+    {0x60,0x30,0x18,0xc,0x18,0x30,0x60,0},{0x7c,0xc6,0xc,0x18,0x18,0,0x18,0}, /* > ? */
+    {0x7c,0xc6,0xde,0xde,0xde,0xc0,0x78,0}, /* @ */
+    {0x38,0x6c,0xc6,0xfe,0xc6,0xc6,0xc6,0},{0xfc,0x66,0x66,0x7c,0x66,0x66,0xfc,0}, /* A B */
+    {0x3c,0x66,0xc0,0xc0,0xc0,0x66,0x3c,0},{0xf8,0x6c,0x66,0x66,0x66,0x6c,0xf8,0}, /* C D */
+    {0xfe,0x62,0x68,0x78,0x68,0x62,0xfe,0},{0xfe,0x62,0x68,0x78,0x68,0x60,0xf0,0}, /* E F */
+    {0x3c,0x66,0xc0,0xc0,0xce,0x66,0x3e,0},{0xc6,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0}, /* G H */
+    {0x3c,0x18,0x18,0x18,0x18,0x18,0x3c,0},{0x1e,0xc,0xc,0xc,0xcc,0xcc,0x78,0}, /* I J */
+    {0xe6,0x66,0x6c,0x78,0x6c,0x66,0xe6,0},{0xf0,0x60,0x60,0x60,0x62,0x66,0xfe,0}, /* K L */
+    {0xc6,0xee,0xfe,0xfe,0xd6,0xc6,0xc6,0},{0xc6,0xe6,0xf6,0xde,0xce,0xc6,0xc6,0}, /* M N */
+    {0x7c,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},{0xfc,0x66,0x66,0x7c,0x60,0x60,0xf0,0}, /* O P */
+    {0x7c,0xc6,0xc6,0xc6,0xc6,0xce,0x7c,0xe},{0xfc,0x66,0x66,0x7c,0x6c,0x66,0xe6,0}, /* Q R */
+    {0x7c,0xc6,0xe0,0x78,0xe,0xc6,0x7c,0},{0x7e,0x7e,0x5a,0x18,0x18,0x18,0x3c,0}, /* S T */
+    {0xc6,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},{0xc6,0xc6,0xc6,0xc6,0xc6,0x6c,0x38,0}, /* U V */
+    {0xc6,0xc6,0xc6,0xd6,0xd6,0xfe,0x6c,0},{0xc6,0xc6,0x6c,0x38,0x38,0x6c,0xc6,0}, /* W X */
+    {0x66,0x66,0x66,0x3c,0x18,0x18,0x3c,0},{0xfe,0xc6,0x8c,0x18,0x32,0x66,0xfe,0}, /* Y Z */
+    {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},  /* [ \ */
+    {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},  /* ] ^ */
+    {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0},  /* _ */
+    {0,0,0,0,0,0,0,0},  /* ` */
+    /* a-z lowercase — full-height (no top blank rows) so they scale like uppercase */
+    {0x7c,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0},  /* a */
+    {0xc6,0xc6,0xc6,0xfc,0xc6,0xc6,0xfc,0},  /* b */
+    {0x7c,0xc6,0xc0,0xc0,0xc0,0xc6,0x7c,0},  /* c */
+    {0x06,0x06,0x06,0xfc,0xc6,0xc6,0xfc,0},  /* d */
+    {0x7c,0xc6,0xfe,0xc0,0xfc,0xc0,0xc0,0},  /* e */
+    {0x7c,0xc6,0xc0,0xf8,0xc0,0xc0,0xc0,0},  /* f */
+    {0x7c,0xc6,0xc0,0xde,0xc6,0xc6,0x7c,0},  /* g */
+    {0xc6,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0},  /* h */
+    {0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0},  /* i */
+    {0x06,0x06,0x06,0xc6,0xc6,0xc6,0x7c,0},  /* j */
+    {0xc6,0xcc,0xd8,0xf0,0xd8,0xcc,0xc6,0},  /* k */
+    {0xc0,0xc0,0xc0,0xc0,0xc0,0xc0,0xfe,0},  /* l */
+    {0xc6,0xee,0xfe,0xfe,0xc6,0xc6,0xc6,0},  /* m */
+    {0xc6,0xe6,0xf6,0xde,0xce,0xc6,0xc6,0},  /* n */
+    {0x7c,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},  /* o */
+    {0xc6,0xc6,0xc6,0xfc,0xc0,0xc0,0xc0,0},  /* p */
+    {0x7c,0xc6,0xc6,0xce,0x7c,0x06,0x06,0},  /* q */
+    {0xc6,0xc6,0xcc,0xf8,0xcc,0xc6,0xc6,0},  /* r */
+    {0x7c,0xc0,0x7c,0x06,0xc6,0xc6,0x7c,0},  /* s */
+    {0x18,0x18,0x7e,0x18,0x18,0x18,0x18,0},  /* t */
+    {0xc6,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},  /* u */
+    {0xc6,0xc6,0xc6,0xc6,0xc6,0x6c,0x38,0},  /* v */
+    {0xc6,0xc6,0xd6,0xfe,0xee,0xc6,0xc6,0},  /* w */
+    {0xc6,0xc6,0x6c,0x38,0x6c,0xc6,0xc6,0},  /* x */
+    {0xc6,0xc6,0xc6,0x7c,0x06,0x06,0x7c,0},  /* y */
+    {0xfe,0x0c,0x18,0x30,0x60,0xc0,0xfe,0},  /* z */
+};
+
+/* ASCII text — thin 8x8 → 10x16, preserves case, draws foreground only (no bg fill) */
+#define ASCII_W 10
+#define ASCII_H 16
+#define ASCII_STEP 12
+static void fb_char(u32 *fb, u32 ch, i64 x, i64 y, u32 fg, u32 bg) {
+    u32 idx = ch >= ' ' && ch <= 'z' ? (u32)(ch-' ') : 0;
+    const u8 *g = font[idx];
+    u8 pat[8][8];
+    for (i64 r=0; r<8; r++) {
+        u8 row = g[r];
+        for (i64 c=0; c<8; c++) {
+            pat[r][c] = (row & (0x80>>c)) ? 1 : 0;
+        }
+    }
+    for (i64 sy=0; sy<ASCII_H; sy++) {
+        i64 yy = y + sy;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        i64 src_y = sy * 7 / (ASCII_H - 1);
+        if (src_y > 7) src_y = 7;
+        for (i64 sx=0; sx<ASCII_W; sx++) {
+            i64 src_x = sx * 7 / (ASCII_W - 1);
+            if (src_x > 7) src_x = 7;
+            int on = pat[src_y][src_x];
+            int edge = 0;
+            if (!on) {
+                if (src_x > 0 && pat[src_y][src_x-1]) edge = 1;
+                if (src_x < 7 && pat[src_y][src_x+1]) edge = 1;
+                if (src_y > 0 && pat[src_y-1][src_x]) edge = 1;
+                if (src_y < 7 && pat[src_y+1][src_x]) edge = 1;
+                if (!edge) continue;
+            }
+            i64 xx = x + sx;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = on ? fg : blend(bg, fg, 72);
+        }
+    }
+}
+
+static void fb_text(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg) {
+    for (i64 i=0; s[i]; i++) fb_char(fb, (u32)(u8)s[i], x+i*ASCII_STEP, y, fg, bg);
+}
+
+/* draw pre-rendered grayscale bitmap – writes only, no framebuffer read */
+static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y, u32 fg, u32 bg, u32 global_alpha) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            u32 a = ((u32)data[r*(u64)w + (u64)c] * global_alpha) >> 8;
+            line[(u64)xx] = blend(bg, fg, a);
+        }
+    }
+}
+
+static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = color;
+        }
+    }
+}
+
+static u32 bg_at_y(i64 y) {
+    if (fb_h <= 1) return BG_TOP;
+    if (y < 0) y = 0;
+    if ((u64)y >= fb_h) y = (i64)fb_h - 1;
+    return blend(BG_TOP, BG_BOTTOM, (u32)(((u64)y * 255ULL) / (fb_h - 1)));
+}
+
+static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 color = bg_at_y(yy);
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = color;
+        }
+    }
+}
+
+static int rounded_rect_contains(i64 px, i64 py, i64 x, i64 y, i64 w, i64 h, i64 radius) {
+    if (px < x || py < y || px >= x + w || py >= y + h) return 0;
+    if (radius <= 0) return 1;
+    if (radius * 2 > w) radius = w / 2;
+    if (radius * 2 > h) radius = h / 2;
+
+    i64 left = x + radius;
+    i64 right = x + w - radius - 1;
+    i64 top = y + radius;
+    i64 bottom = y + h - radius - 1;
+
+    if (px >= left && px <= right) return 1;
+    if (py >= top && py <= bottom) return 1;
+
+    i64 cx = px < left ? left : right;
+    i64 cy = py < top ? top : bottom;
+    i64 dx = px - cx;
+    i64 dy = py - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static void fill_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, u32 color) {
+    if (w <= 0 || h <= 0) return;
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            if (rounded_rect_contains(xx, yy, x, y, w, h, radius)) line[(u64)xx] = color;
+        }
+    }
+}
+
+static void stroke_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 thickness, u32 color) {
+    if (w <= 0 || h <= 0 || thickness <= 0) return;
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            int outer = rounded_rect_contains(xx, yy, x, y, w, h, radius);
+            int inner = rounded_rect_contains(xx, yy, x + thickness, y + thickness, w - thickness * 2, h - thickness * 2, radius - thickness);
+            if (outer && !inner) line[(u64)xx] = color;
+        }
+    }
+}
+
+static void delay_frame(void) {
+    for (volatile u32 d=0; d<300000; d++) __asm__("pause");
+}
+
+#include "text_bitmaps.c"
+
+static void fade_ring(u32 *fb, i64 cx, i64 cy, u32 bg) {
+    /* Smoothly erase a square sprite area with the same vertical gradient as DSK. */
+    (void)bg;
+    i64 r = 72;
+    for (int step=0; step<12; step++) {
+        (void)step;
+        fill_gradient_rect(fb, cx-r, cy-r, r*2+1, r*2+1);
+        delay_frame();
+    }
+}
+
+static void draw_card(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 card, u32 bg_color) {
+    (void)bg_color;
+    fill_rounded_rect(fb, x, y, w, h, 12, card);
+}
+
+/* Draw gradient background + card in a single pass — per-row blend eliminates flicker */
+static void draw_card_fade(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, u32 alpha) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 bg_color = bg_at_y(yy);
+        u32 card_color = blend(bg_color, CARD_BG, alpha);
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = rounded_rect_contains(xx, yy, x, y, w, h, radius) ? card_color : bg_color;
+        }
+    }
+}
+
+static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *value, int mask, u32 fg, u32 card_bg, int active) {
+    u32 fill = active ? 0xFFFFFFFF : INPUT_BG;
+    fill_rounded_rect(fb, x, y, w, h, 8, fill);
+    stroke_rounded_rect(fb, x, y, w, h, 8, 1, active ? 0xFFB6C9DD : card_bg);
+    char out[64]; int i=0;
+    while(value[i] && i<60) { out[i] = mask ? '*' : value[i]; i++; }
+    out[i]=0;
+    if (out[0]) fb_text(fb, out, x+14, y+(h-16)/2, fg, fill);
+    if (active) {
+        i64 cx2 = x + 14 + i * ASCII_STEP;
+        fill_rect(fb, cx2, y+10, 2, h-20, fg);
+    }
+}
+
+static char scan_to_ascii(u8 sc, int shift) {
+    /* PS/2 scan code set 1 (controller translation enabled) */
+    static const char normal[58] = {
+        0, 27, '1','2','3','4','5','6','7','8','9','0','-','=', 8, '\t',
+        'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
+        'a','s','d','f','g','h','j','k','l',';','\'', '`',0,'\\',
+        'z','x','c','v','b','n','m',',','.','/',0,'*',0,' '
+    };
+    static const char shifted[58] = {
+        0, 27, '!','@','#','$','%','^','&','*','(',')','_','+', 8, '\t',
+        'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
+        'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
+        'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' '
+    };
+    if (sc >= 58) return 0;
+    return shift ? shifted[sc] : normal[sc];
+}
+
+/* ---- cursor save / restore (avoids full card redraw on mouse move) ---- */
+#define CUR_W 24
+#define CUR_H 24
+static u32 cursor_bg[CUR_W * CUR_H];
+static int cursor_bg_valid = 0;
+static i64 cursor_cur_x = -100, cursor_cur_y = -100;
+
+static const char *cursor_shape[CUR_H] = {
+    "X                       ",
+    "XX                      ",
+    "XOX                     ",
+    "XOOX                    ",
+    "XOOOX                   ",
+    "XOOOOX                  ",
+    "XOOOOOX                 ",
+    "XOOOOOOX                ",
+    "XOOOOOOOX               ",
+    "XOOOOOOOOX              ",
+    "XOOOOOOOOOX             ",
+    "XOOOOOOOOOOX            ",
+    "XOOOOOOOXXXXX           ",
+    "XOOOXOOX                ",
+    "XOOXXOOX                ",
+    "XOXX XOOX               ",
+    "XXX  XOOX               ",
+    "     XOOX               ",
+    "      XOOX              ",
+    "      XOOX              ",
+    "       XX               ",
+    "                        ",
+    "                        ",
+    "                        "
+};
+
+static void cursor_erase(u32 *fb) {
+    if (!cursor_bg_valid) return;
+    for (i64 y = 0; y < CUR_H; y++) {
+        i64 py = cursor_cur_y + y;
+        if (py < 0 || (u64)py >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)py * fb_p);
+        for (i64 x = 0; x < CUR_W; x++) {
+            i64 px = cursor_cur_x + x;
+            if (px < 0 || (u64)px >= fb_w) continue;
+            line[(u64)px] = cursor_bg[y * CUR_W + x];
+        }
+    }
+    cursor_bg_valid = 0;
+}
+
+static void cursor_draw(u32 *fb, i64 mx, i64 my) {
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if ((u64)(mx + CUR_W) >= fb_w) mx = (i64)fb_w - CUR_W - 1;
+    if ((u64)(my + CUR_H) >= fb_h) my = (i64)fb_h - CUR_H - 1;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    /* save background under cursor */
+    for (i64 y = 0; y < CUR_H; y++) {
+        i64 py = my + y;
+        for (i64 x = 0; x < CUR_W; x++) {
+            i64 px = mx + x;
+            if (py < 0 || (u64)py >= fb_h || px < 0 || (u64)px >= fb_w) {
+                cursor_bg[y * CUR_W + x] = 0;
+            } else {
+                u32 *line = (u32 *)((u8 *)fb + (u64)py * fb_p);
+                cursor_bg[y * CUR_W + x] = line[(u64)px];
+            }
+        }
+    }
+    cursor_bg_valid = 1;
+    cursor_cur_x = mx;
+    cursor_cur_y = my;
+    /* draw cursor shape */
+    u32 white = 0xFFFFFFFF, dark = 0xFF304760;
+    for (i64 y = 0; y < CUR_H; y++) {
+        i64 py = my + y;
+        if (py < 0 || (u64)py >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)py * fb_p);
+        for (i64 x = 0; x < CUR_W; x++) {
+            char p = cursor_shape[y][x];
+            if (p == ' ') continue;
+            i64 px = mx + x;
+            if (px < 0 || (u64)px >= fb_w) continue;
+            line[(u64)px] = (p == 'O') ? white : dark;
+        }
+    }
+}
+
+static void redraw_setup_card(u32 *fb, i64 card_x, i64 card_y, char *pc, char *user, char *pass, int active, u32 bg, u32 fg, i64 mx, i64 my) {
+    u32 card = CARD_BG;
+    cursor_erase(fb);
+    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    draw_card(fb, card_x, card_y, 900, 600, card, bg);
+    fb_bitmap_alpha(fb, g_txt_title, g_txt_title_w, g_txt_title_h, card_x+40, card_y+40, fg, card, 255);
+    fb_bitmap_alpha(fb, g_txt_computer, g_txt_computer_w, g_txt_computer_h, card_x+40, card_y+130, fg, card, 255);
+    draw_rounded_input(fb, card_x+40, card_y+180, 820, 44, pc, 0, fg, card, active==0);
+    fb_bitmap_alpha(fb, g_txt_username, g_txt_username_w, g_txt_username_h, card_x+40, card_y+280, fg, card, 255);
+    draw_rounded_input(fb, card_x+40, card_y+330, 820, 44, user, 0, fg, card, active==1);
+    fb_bitmap_alpha(fb, g_txt_password, g_txt_password_w, g_txt_password_h, card_x+40, card_y+430, fg, card, 255);
+    draw_rounded_input(fb, card_x+40, card_y+480, 820, 44, pass, 1, fg, card, active==2);
+    fb_bitmap_alpha(fb, g_txt_hint, g_txt_hint_w, g_txt_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
+    cursor_draw(fb, mx, my);
+}
+
+/* Returns: 0-2 = switch to that field, 3 = all done. */
+static int read_field(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char *user, char *pass, i64 *mx, i64 *my, u32 bg, u32 fg) {
+    char *buf = field==0 ? pc : (field==1 ? user : pass);
+    int max = 31;
+    int len = 0;
+    while (buf[len]) len++;
+    int shift = 0;
+    int release = 0;
+    int mcnt = 0;
+    u8 mpkt[3];
+    u8 prev_btns = 0;
+    int mouse_log_cnt = 0;  /* limit mouse log to first 20 packets */
+    redraw_setup_card(fb, card_x, card_y, pc, user, pass, field, bg, fg, *mx, *my);
+    for (;;) {
+        u8 st = inb(0x64);
+        if (!(st & 1)) { __asm__("pause"); continue; }
+        u8 data = inb(0x60);
+        if (st & 0x20) {
+            /* mouse data: assemble 3-byte packet, sync on bit 3 */
+            if (mcnt == 0 && !(data & 0x08)) continue;
+            mpkt[mcnt++] = data;
+            if (mcnt < 3) continue;
+            mcnt = 0;
+            i64 dx = (i64)(i8)mpkt[1];
+            i64 dy = (i64)(i8)mpkt[2];
+            u8 btns = mpkt[0] & 0x07;
+            if (mouse_log_cnt < 20 && (dx != 0 || dy != 0 || btns)) {
+                logl("[mouse] pkt");
+                mouse_log_cnt++;
+            }
+            if (dx != 0 || dy != 0) {
+                cursor_erase(fb);
+                *mx += dx;
+                *my -= dy;  /* invert Y: mouse up = screen up */
+                if (*mx < 0) *mx = 0;
+                if (*my < 0) *my = 0;
+                if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
+                if ((u64)*my >= fb_h) *my = (i64)fb_h - 1;
+                cursor_draw(fb, *mx, *my);
+            }
+            /* left click (rising edge) — switch to clicked input field */
+            if ((btns & 1) && !(prev_btns & 1)) {
+                for (int f = 0; f < 3; f++) {
+                    i64 fy = card_y + 180 + (i64)f * 150;
+                    if (*my >= fy && *my < fy + 44 && *mx >= card_x + 40 && *mx < card_x + 860) {
+                        buf[len] = 0;
+                        if (f != field) return f;
+                        break;
+                    }
+                }
+            }
+            prev_btns = btns;
+            continue;
+        }
+        /* keyboard data: PS/2 scan code set 1 (translation enabled) */
+        u8 sc = data;
+        if (sc == 0xF0) { release = 1; continue; }  /* tolerate untranslated Set2 release */
+        if (release) { release = 0; continue; }
+        if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
+        if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
+        if (sc & 0x80) continue;
+        char c = scan_to_ascii(sc, shift);
+        if (!c) continue;
+        if (c == '\n') {
+            buf[len] = 0;
+            return field < 2 ? field + 1 : 3;
+        }
+        if (c == 8) {
+            if (len > 0) buf[--len] = 0;
+        } else if (len < max-1 && c >= 32 && c <= 126) {
+            buf[len++] = c;
+            buf[len] = 0;
+        }
+        redraw_setup_card(fb, card_x, card_y, pc, user, pass, field, bg, fg, *mx, *my);
+    }
+}
+
+typedef struct {
+    int language;
+    int region;
+    int timezone;
+    int keyboard;
+    int theme;
+} setup_prefs;
+
+static const char *pref_value(int row, int val) {
+    if (row == 0) return val ? "English" : "Simplified Chinese";
+    if (row == 1) return val ? "Global" : "China Mainland";
+    if (row == 2) return val ? "UTC" : "Asia/Shanghai";
+    if (row == 3) return val ? "CN-QWERTY" : "US-QWERTY";
+    if (row == 4) return val ? "Dark" : "Light";
+    return "";
+}
+
+static int pref_get(const setup_prefs *p, int row) {
+    if (row == 0) return p->language;
+    if (row == 1) return p->region;
+    if (row == 2) return p->timezone;
+    if (row == 3) return p->keyboard;
+    if (row == 4) return p->theme;
+    return 0;
+}
+
+static void pref_toggle(setup_prefs *p, int row) {
+    if (row == 0) p->language ^= 1;
+    else if (row == 1) p->region ^= 1;
+    else if (row == 2) p->timezone ^= 1;
+    else if (row == 3) p->keyboard ^= 1;
+    else if (row == 4) p->theme ^= 1;
+}
+
+static void draw_option_row(u32 *fb, i64 x, i64 y, i64 w, i64 h,
+                            const u8 *label, i64 lw, i64 lh,
+                            const char *value, int active, u32 fg, u32 card) {
+    u32 fill = active ? 0xFFFFFFFF : INPUT_BG;
+    fb_bitmap_alpha(fb, label, lw, lh, x, y + 4, fg, card, 255);
+    fill_rounded_rect(fb, x + 220, y, w - 220, h, 8, fill);
+    stroke_rounded_rect(fb, x + 220, y, w - 220, h, 8, 1, active ? 0xFFB6C9DD : card);
+    fb_text(fb, value, x + 238, y + (h - ASCII_H) / 2, fg, fill);
+}
+
+static void redraw_prefs_card(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, int active, i64 mx, i64 my, u32 bg, u32 fg) {
+    u32 card = CARD_BG;
+    cursor_erase(fb);
+    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    draw_card(fb, card_x, card_y, 900, 600, card, bg);
+    fb_bitmap_alpha(fb, g_txt_prefs_title, g_txt_prefs_title_w, g_txt_prefs_title_h, card_x+40, card_y+40, fg, card, 255);
+    draw_option_row(fb, card_x+40, card_y+120, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card);
+    draw_option_row(fb, card_x+40, card_y+200, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card);
+    draw_option_row(fb, card_x+40, card_y+280, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card);
+    draw_option_row(fb, card_x+40, card_y+360, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card);
+    draw_option_row(fb, card_x+40, card_y+440, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card);
+    fb_bitmap_alpha(fb, g_txt_prefs_hint, g_txt_prefs_hint_w, g_txt_prefs_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
+    cursor_draw(fb, mx, my);
+}
+
+static void redraw_prefs_row(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, int row, int active, i64 mx, i64 my, u32 fg) {
+    u32 card = CARD_BG;
+    i64 ry = card_y + 120 + (i64)row * 80;
+    cursor_erase(fb);
+    fill_rect(fb, card_x + 36, ry - 8, 832, 58, card);
+    if (row == 0) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card);
+    else if (row == 1) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card);
+    else if (row == 2) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card);
+    else if (row == 3) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card);
+    else if (row == 4) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card);
+    cursor_draw(fb, mx, my);
+}
+
+static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, i64 *mx, i64 *my, u32 bg, u32 fg) {
+    int active = 0;
+    int mcnt = 0;
+    u8 mpkt[3];
+    u8 prev_btns = 0;
+    int e0 = 0;
+    redraw_prefs_card(fb, card_x, card_y, prefs, active, *mx, *my, bg, fg);
+    for (;;) {
+        u8 st = inb(0x64);
+        if (!(st & 1)) { __asm__("pause"); continue; }
+        u8 data = inb(0x60);
+        if (st & 0x20) {
+            if (mcnt == 0 && !(data & 0x08)) continue;
+            mpkt[mcnt++] = data;
+            if (mcnt < 3) continue;
+            mcnt = 0;
+            i64 dx = (i64)(i8)mpkt[1];
+            i64 dy = (i64)(i8)mpkt[2];
+            u8 btns = mpkt[0] & 0x07;
+            if (dx || dy) {
+                cursor_erase(fb);
+                *mx += dx; *my -= dy;
+                if (*mx < 0) *mx = 0;
+                if (*my < 0) *my = 0;
+                if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
+                if ((u64)*my >= fb_h) *my = (i64)fb_h - 1;
+                cursor_draw(fb, *mx, *my);
+            }
+            if ((btns & 1) && !(prev_btns & 1)) {
+                for (int r = 0; r < 5; r++) {
+                    i64 ry = card_y + 120 + (i64)r * 80;
+                    if (*mx >= card_x + 260 && *mx < card_x + 860 && *my >= ry && *my < ry + 42) {
+                        int old = active;
+                        active = r;
+                        pref_toggle(prefs, active);
+                        if (old != active) redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg);
+                        redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg);
+                    }
+                }
+            }
+            prev_btns = btns;
+            continue;
+        }
+        u8 sc = data;
+        if (sc == 0xE0) { e0 = 1; continue; }
+        if (sc & 0x80) { e0 = 0; continue; }
+        if (e0 && sc == 0x48) {
+            if (active > 0) { int old = active; active--; redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg); redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg); }
+            e0 = 0; continue;
+        }
+        if (e0 && sc == 0x50) {
+            if (active < 4) { int old = active; active++; redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg); redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg); }
+            e0 = 0; continue;
+        }
+        e0 = 0;
+        if (sc == 0x39 || sc == 0x4D || sc == 0x4B) {
+            pref_toggle(prefs, active);
+            redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg);
+            continue;
+        }
+        if (sc == 0x1C) {
+            if (active < 4) {
+                int old = active;
+                active++;
+                redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg);
+                redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg);
+            } else {
+                return;
+            }
+        }
+    }
+}
+
+typedef struct {
+    int mode;
+    int device;
+    int ip;
+    int dns;
+} setup_net;
+
+static const char *net_value(int row, int val) {
+    if (row == 0) return val == 0 ? "Disabled" : (val == 1 ? "DHCP" : "Manual");
+    if (row == 1) return val == 0 ? "Auto" : (val == 1 ? "e1000" : "virtio-net");
+    if (row == 2) return val ? "Manual" : "Auto DHCP";
+    if (row == 3) return val ? "Manual DNS" : "Auto DNS";
+    return "";
+}
+
+static int net_get(const setup_net *n, int row) {
+    if (row == 0) return n->mode;
+    if (row == 1) return n->device;
+    if (row == 2) return n->ip;
+    if (row == 3) return n->dns;
+    return 0;
+}
+
+static void net_toggle(setup_net *n, int row) {
+    if (row == 0) n->mode = (n->mode + 1) % 3;
+    else if (row == 1) n->device = (n->device + 1) % 3;
+    else if (row == 2) n->ip ^= 1;
+    else if (row == 3) n->dns ^= 1;
+}
+
+static void draw_network_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, u32 fg) {
+    u32 card = CARD_BG;
+    i64 ry = card_y + 150 + (i64)row * 88;
+    const u8 *label = g_txt_net_mode; i64 lw = g_txt_net_mode_w, lh = g_txt_net_mode_h;
+    if (row == 1) { label = g_txt_net_device; lw = g_txt_net_device_w; lh = g_txt_net_device_h; }
+    else if (row == 2) { label = g_txt_net_ip; lw = g_txt_net_ip_w; lh = g_txt_net_ip_h; }
+    else if (row == 3) { label = g_txt_net_dns; lw = g_txt_net_dns_w; lh = g_txt_net_dns_h; }
+    draw_option_row(fb, card_x+40, ry, 820, 42, label, lw, lh, net_value(row, net_get(net, row)), active==row, fg, card);
+}
+
+static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int active, i64 mx, i64 my, u32 bg, u32 fg) {
+    u32 card = CARD_BG;
+    cursor_erase(fb);
+    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    draw_card(fb, card_x, card_y, 900, 600, card, bg);
+    fb_bitmap_alpha(fb, g_txt_network_title, g_txt_network_title_w, g_txt_network_title_h, card_x+40, card_y+40, fg, card, 255);
+    for (int r=0; r<4; r++) draw_network_row(fb, card_x, card_y, net, r, active, fg);
+    fb_bitmap_alpha(fb, g_txt_net_hint, g_txt_net_hint_w, g_txt_net_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
+    cursor_draw(fb, mx, my);
+}
+
+static void redraw_network_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, i64 mx, i64 my, u32 fg) {
+    u32 card = CARD_BG;
+    i64 ry = card_y + 150 + (i64)row * 88;
+    cursor_erase(fb);
+    fill_rect(fb, card_x + 36, ry - 8, 832, 58, card);
+    draw_network_row(fb, card_x, card_y, net, row, active, fg);
+    cursor_draw(fb, mx, my);
+}
+
+static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i64 *mx, i64 *my, u32 bg, u32 fg) {
+    int active = 0, mcnt = 0, e0 = 0;
+    u8 mpkt[3]; u8 prev_btns = 0;
+    redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+    for (;;) {
+        u8 st = inb(0x64);
+        if (!(st & 1)) { __asm__("pause"); continue; }
+        u8 data = inb(0x60);
+        if (st & 0x20) {
+            if (mcnt == 0 && !(data & 0x08)) continue;
+            mpkt[mcnt++] = data;
+            if (mcnt < 3) continue;
+            mcnt = 0;
+            i64 dx = (i64)(i8)mpkt[1], dy = (i64)(i8)mpkt[2];
+            u8 btns = mpkt[0] & 0x07;
+            if (dx || dy) {
+                cursor_erase(fb);
+                *mx += dx; *my -= dy;
+                if (*mx < 0) *mx = 0; if (*my < 0) *my = 0;
+                if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
+                if ((u64)*my >= fb_h) *my = (i64)fb_h - 1;
+                cursor_draw(fb, *mx, *my);
+            }
+            if ((btns & 1) && !(prev_btns & 1)) {
+                for (int r=0; r<4; r++) {
+                    i64 ry = card_y + 150 + (i64)r * 88;
+                    if (*mx >= card_x + 260 && *mx < card_x + 860 && *my >= ry && *my < ry + 42) {
+                        int old = active; active = r; net_toggle(net, active);
+                        if (old != active) redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg);
+                        redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg);
+                    }
+                }
+            }
+            prev_btns = btns;
+            continue;
+        }
+        u8 sc = data;
+        if (sc == 0xE0) { e0 = 1; continue; }
+        if (sc & 0x80) { e0 = 0; continue; }
+        if (e0 && sc == 0x48) { if (active > 0) { int old=active; active--; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); } e0=0; continue; }
+        if (e0 && sc == 0x50) { if (active < 3) { int old=active; active++; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); } e0=0; continue; }
+        e0 = 0;
+        if (sc == 0x39 || sc == 0x4D || sc == 0x4B) { net_toggle(net, active); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); continue; }
+        if (sc == 0x1C) {
+            if (active < 3) { int old=active; active++; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); }
+            else return;
+        }
+    }
+}
+
+/* compact SHA-256 */
+#define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static const u32 K256[64] = {0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+static void sha256(const char *msg, u8 out[32]) {
+    u32 h[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    u8 block[64]; u64 len=0; while(msg[len]) len++;
+    for(int i=0;i<64;i++) block[i]=0;
+    for(u64 i=0;i<len && i<55;i++) block[i]=(u8)msg[i];
+    block[len]=0x80; u64 bit=len*8;
+    for(int i=0;i<8;i++) block[63-i]=(u8)(bit>>(i*8));
+    u32 w[64];
+    for(int i=0;i<16;i++) w[i]=((u32)block[i*4]<<24)|((u32)block[i*4+1]<<16)|((u32)block[i*4+2]<<8)|block[i*4+3];
+    for(int i=16;i<64;i++){u32 s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3);u32 s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);w[i]=w[i-16]+s0+w[i-7]+s1;}
+    u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(int i=0;i<64;i++){u32 S1=ROR(e,6)^ROR(e,11)^ROR(e,25);u32 ch=(e&f)^((~e)&g);u32 t1=hh+S1+ch+K256[i]+w[i];u32 S0=ROR(a,2)^ROR(a,13)^ROR(a,22);u32 maj=(a&b)^(a&c)^(b&c);u32 t2=S0+maj;hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+    for(int i=0;i<8;i++){out[i*4]=(u8)(h[i]>>24);out[i*4+1]=(u8)(h[i]>>16);out[i*4+2]=(u8)(h[i]>>8);out[i*4+3]=(u8)h[i];}
+}
+
+static void build_user_conf(const char *pc, const char *user, const char *pass, const setup_prefs *prefs, const setup_net *net) {
+    u8 hash[32]; sha256(pass, hash);
+    static char conf[1024]; int p=0;
+    const char *pre="DESHAB_USERCONF_V1\ncomputer=";
+    for(int i=0;pre[i];i++) conf[p++]=pre[i];
+    for(int i=0;pc[i]&&p<740;i++) conf[p++]=pc[i];
+    const char *mid="\nusername="; for(int i=0;mid[i];i++) conf[p++]=mid[i];
+    for(int i=0;user[i]&&p<740;i++) conf[p++]=user[i];
+    const char *hs="\npasswordSha256="; for(int i=0;hs[i];i++) conf[p++]=hs[i];
+    static const char hx[]="0123456789abcdef";
+    for(int i=0;i<32;i++){conf[p++]=hx[hash[i]>>4];conf[p++]=hx[hash[i]&15];}
+    const char *pref="\nlocale="; for(int i=0;pref[i];i++) conf[p++]=pref[i];
+    const char *v0 = prefs->language ? "en-US" : "zh-CN"; for(int i=0;v0[i];i++) conf[p++]=v0[i];
+    const char *r0="\nregion="; for(int i=0;r0[i];i++) conf[p++]=r0[i];
+    const char *v1 = prefs->region ? "GLOBAL" : "CN"; for(int i=0;v1[i];i++) conf[p++]=v1[i];
+    const char *t0="\ntimezone="; for(int i=0;t0[i];i++) conf[p++]=t0[i];
+    const char *v2 = prefs->timezone ? "UTC" : "Asia/Shanghai"; for(int i=0;v2[i];i++) conf[p++]=v2[i];
+    const char *k0="\nkeyboard="; for(int i=0;k0[i];i++) conf[p++]=k0[i];
+    const char *v3 = prefs->keyboard ? "cn-qwerty" : "us-qwerty"; for(int i=0;v3[i];i++) conf[p++]=v3[i];
+    const char *th0="\ntheme="; for(int i=0;th0[i];i++) conf[p++]=th0[i];
+    const char *v4 = prefs->theme ? "dark" : "light"; for(int i=0;v4[i];i++) conf[p++]=v4[i];
+    const char *nm="\nnetwork.mode="; for(int i=0;nm[i];i++) conf[p++]=nm[i];
+    const char *nv0 = net->mode == 0 ? "disabled" : (net->mode == 1 ? "dhcp" : "manual"); for(int i=0;nv0[i];i++) conf[p++]=nv0[i];
+    const char *nd="\nnetwork.device="; for(int i=0;nd[i];i++) conf[p++]=nd[i];
+    const char *nv1 = net->device == 0 ? "auto" : (net->device == 1 ? "e1000" : "virtio-net"); for(int i=0;nv1[i];i++) conf[p++]=nv1[i];
+    const char *ni="\nnetwork.ip="; for(int i=0;ni[i];i++) conf[p++]=ni[i];
+    const char *nv2 = net->ip ? "manual" : "dhcp"; for(int i=0;nv2[i];i++) conf[p++]=nv2[i];
+    const char *dns="\nnetwork.dns="; for(int i=0;dns[i];i++) conf[p++]=dns[i];
+    const char *nv3 = net->dns ? "manual" : "auto"; for(int i=0;nv3[i];i++) conf[p++]=nv3[i];
+    conf[p++]='\n';
+    /* XOR encrypt buffer with hash-derived stream; real disk write waits for FAT32 write support. */
+    for(int i=0;i<p;i++) conf[i]^=hash[i&31];
+    logl("[FirstInit] user.conf encrypted in memory (disk write pending)");
+}
+
+__attribute__((visibility("default"), noreturn))
+void dsk_entry(const dsk_boot_context *ctx) {
+    __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
+    logl("[FirstInit] boot");
+
+    if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
+        logl("[FirstInit] bad context");
+        for(;;) __asm__("hlt");
+    }
+
+    fb_a = ctx->framebuffer_address;
+    fb_w = ctx->framebuffer_width;
+    fb_h = ctx->framebuffer_height;
+    fb_p = ctx->framebuffer_pitch;
+
+    logl("[FirstInit] framebuffer info:");
+    swrite("[FirstInit]   fb_addr="); { char b[19]; u64 v=fb_a; b[0]='0';b[1]='x';
+      for(int j=15;j>=0;j--) b[2+15-j]="0123456789abcdef"[(v>>(j*4))&0xf]; b[18]=0; swrite(b); swrite("\n"); }
+    swrite("[FirstInit]   fb_w="); { char b[19]; u64 v=fb_w; b[0]='0';b[1]='x';
+      for(int j=15;j>=0;j--) b[2+15-j]="0123456789abcdef"[(v>>(j*4))&0xf]; b[18]=0; swrite(b); swrite("\n"); }
+    swrite("[FirstInit]   fb_h="); { char b[19]; u64 v=fb_h; b[0]='0';b[1]='x';
+      for(int j=15;j>=0;j--) b[2+15-j]="0123456789abcdef"[(v>>(j*4))&0xf]; b[18]=0; swrite(b); swrite("\n"); }
+
+    u32 bg = BG_MID, fg = TEXT_FG;
+    i64 cx=(i64)fb_w/2, cy=(i64)fb_h/2;
+    u32 *fb = (u32 *)(u64)fb_a;
+    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
+
+    /* fade out loading ring */
+    logl("[FirstInit] fading out ring");
+    fade_ring(fb, cx, cy, bg);
+    logl("[FirstInit] ring faded");
+
+    /* center text: Chinese bitmaps */
+    i64 tw = g_txt_welcome_w, tx = cx - tw/2, ty = cy - g_txt_welcome_h/2;
+
+    logl("[FirstInit] fading in welcome");
+    for (u32 a=0; a<=255; a+=17) {
+        fill_gradient_rect(fb, tx-4, ty-4, tw+8, g_txt_welcome_h+8);
+        fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a);
+        delay_frame();
+    }
+    logl("[FirstInit] welcome drawn");
+
+    for (int i=0; i<90; i++) delay_frame();
+
+    logl("[FirstInit] cross-fading to setup message");
+    i64 tw2 = g_txt_setup_w, tx2 = cx - tw2/2;
+    i64 area_x = tx2 < tx ? tx2 : tx;
+    i64 area_w = (tx2 + tw2 > tx + tw ? tx2 + tw2 : tx + tw) - area_x;
+    i64 area_h = (g_txt_setup_h > g_txt_welcome_h ? g_txt_setup_h : g_txt_welcome_h) + 8;
+
+    for (u32 step=0; step<=15; step++) {
+        u32 a2 = step * 17;
+        u32 a1 = 255 - a2;
+        fill_gradient_rect(fb, area_x-4, ty-4, area_w+8, area_h);
+        fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a1);
+        fb_bitmap_alpha(fb, g_txt_setup, tw2, g_txt_setup_h, tx2, ty, WELCOME_FG, bg_at_y(ty + g_txt_setup_h / 2), a2);
+        delay_frame();
+    }
+    logl("[FirstInit] setup message drawn");
+
+    for (int i=0; i<35; i++) delay_frame();
+
+    logl("[FirstInit] drawing account setup card");
+    char pc[32]; char user[32]; char pass[32];
+    pc[0]=0; user[0]=0; pass[0]=0;
+    i64 card_x = cx - 450;
+    i64 card_y = cy - 300;
+    /* fade in card + title — per-row gradient blend eliminates flicker */
+    logl("[FI] fadein start");
+    /* Phase 1: fade in card background only (no title) — avoids title/card color mismatch flicker */
+    for (u32 a=0; a<=255; a+=17) {
+        draw_card_fade(fb, card_x, card_y, 900, 600, 12, a);
+        delay_frame();
+    }
+    /* Phase 2: draw title once on fully-rendered card */
+    {
+        u32 title_bg = blend(bg_at_y(card_y + 40 + g_txt_title_h/2), CARD_BG, 255);
+        fb_bitmap_alpha(fb, g_txt_title, g_txt_title_w, g_txt_title_h, card_x+40, card_y+40, fg, title_bg, 255);
+    }
+    logl("[FI] fadein done");
+    logl("[FirstInit] initializing PS/2 mouse");
+    mouse_init();
+    i64 mx = cx, my = cy;
+    {
+        int field = 0;
+        while (field < 3) {
+            field = read_field(fb, card_x, card_y, field, pc, user, pass, &mx, &my, bg, fg);
+        }
+    }
+    setup_prefs prefs;
+    prefs.language = 0;  /* zh-CN */
+    prefs.region = 0;    /* CN */
+    prefs.timezone = 0;  /* Asia/Shanghai */
+    prefs.keyboard = 0;  /* US-QWERTY */
+    prefs.theme = 0;     /* Light */
+    read_prefs_page(fb, card_x, card_y, &prefs, &mx, &my, bg, fg);
+    setup_net net;
+    net.mode = 0;    /* Disabled */
+    net.device = 0;  /* Auto */
+    net.ip = 0;      /* Auto DHCP */
+    net.dns = 0;     /* Auto DNS */
+    read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+    build_user_conf(pc, user, pass, &prefs, &net);
+
+    cursor_erase(fb);
+    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    fb_bitmap_alpha(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 20, fg, bg_at_y(cy), 255);
+    logl("[FirstInit] user setup finished");
+
+    for(;;) __asm__("hlt");
+}

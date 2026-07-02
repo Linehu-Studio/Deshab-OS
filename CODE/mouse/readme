@@ -1,0 +1,41 @@
+# mouseInit 鼠标初始化器
+
+`CODE/mouse` 生成早期鼠标初始化 ELF：
+
+```text
+CODE/mouse -> SYSTEM/system/deshab64/mouse/mouseInit.elf
+```
+
+## 目标
+
+`mouseInit.elf` 是 DSK 直接调度的系统输入初始化器，不属于 FirstInit 用户向导。DSK 在检测到首次启动后先加载并调用它，初始化完成后返回 DSK，再由 DSK 启动 FirstInit 用户设置向导。
+
+第一版职责：
+
+1. 初始化 PS/2 Controller 的辅助设备通道（mouse / AUX）。
+2. 开启 IRQ12 配置位。
+3. 向鼠标发送默认配置 `0xF6`。
+4. 启用数据报告 `0xF4`。
+5. 输出串口日志并返回 DSK。
+
+## 当前限制
+
+- 当前只做 PS/2 鼠标初始化，不消费鼠标包。
+- 鼠标 IRQ12 的实际数据读取应由后续 DKM 输入驱动或 DSK 输入子系统接管。
+- USB 鼠标需要 xHCI/HID 支持，暂不在第一版范围。
+
+## 构建
+
+```powershell
+cd CODE\mouse
+make -f MAKEFILE CC=clang LD=ld.lld
+```
+
+## 启动链路
+
+```text
+DSK 检测 firstInit=0
+  -> 加载并调用 mouseInit.elf
+  -> mouseInit 初始化 PS/2 鼠标后返回
+  -> DSK 继续加载 FirstInit.elf
+```

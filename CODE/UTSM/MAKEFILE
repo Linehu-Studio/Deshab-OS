@@ -1,0 +1,31 @@
+CC := clang
+LD := ld.lld
+OBJCOPY := llvm-objcopy
+
+ROOT := ../..
+OUT := $(ROOT)/SYSTEM/boot/utsm.elf
+
+CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -Iinclude -O2
+ASFLAGS := -target x86_64-unknown-none -ffreestanding -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Iinclude
+LDFLAGS := -nostdlib -static -z max-page-size=0x1000 -T linker.ld
+
+C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c dkm/*.c test/*.c)
+S_SOURCES := $(wildcard arch/x86_64/*.S)
+OBJECTS := $(C_SOURCES:.c=.o) $(S_SOURCES:.S=.o)
+
+.PHONY: all clean
+
+all: $(OUT)
+
+$(OUT): $(OBJECTS) linker.ld
+	@if not exist "$(ROOT)\SYSTEM\boot" mkdir "$(ROOT)\SYSTEM\boot"
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+clean:
+	powershell -NoProfile -Command "Get-ChildItem -Path . -Recurse -Filter *.o | Remove-Item -Force; if (Test-Path '$(OUT)') { Remove-Item '$(OUT)' -Force }"

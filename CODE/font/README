@@ -1,0 +1,68 @@
+# Deshab Bitmap Font (.dbf)
+
+`CODE/font` 包含 Deshab 自研位图字体工具和规范。
+
+## 文件格式
+
+```text
+Offset  Size   Field
+0       4      magic "DBF\x10" (version 16)
+4       4      u32 glyph_count
+8       2      u16 default_width
+10      2      u16 default_height
+12      2      u16 bits_per_pixel (8=grayscale)
+14      N×12   index table (N entries)
+...     ...    glyph bitmap data
+```
+
+每条索引：
+```text
+[0..1]  u16  codepoint (Unicode BMP)
+[2..3]  u16  actual_width (pixels)
+[4..7]  u32  data_offset
+[8..11] u32  data_size
+```
+
+索引按 codepoint 升序排列，可用二分查找。
+
+## 字体文件
+
+| 文件 | 大小 | 字形数 | 精度 |
+|------|------|--------|------|
+| [simhei_16.dbf](file:///d:/Code/Deshab/SYSTEM/system/font/simhei_16.dbf) | 1.8MB | 6858 | 16×16 8bpp |
+| [simhei_24.dbf](file:///d:/Code/Deshab/SYSTEM/system/font/simhei_24.dbf) | 3.9MB | 6858 | 24×24 8bpp |
+| [simhei_32.dbf](file:///d:/Code/Deshab/SYSTEM/system/font/simhei_32.dbf) | 6.9MB | 6858 | 32×32 8bpp |
+
+字形覆盖：GB2312 全部 6763 个简体汉字 + ASCII 32–126 可打印字符。
+
+## 生成工具
+
+```bash
+python CODE/font/mkfont.py <ttf_path> <pixel_size> <output.dbf>
+```
+
+依赖：Python 3 + Pillow (`pip install Pillow`)
+
+## C 头文件
+
+[dbf.h](file:///d:/Code/Deshab/CODE/font/dbf.h) 定义数据结构和二分查找函数：
+
+```c
+#include "dbf.h"
+const u8 *font = ...; // 加载 .dbf 到内存
+dbf_header *hdr = (dbf_header *)font;
+dbf_index_entry *idx = (dbf_index_entry *)(font + 14);
+int entry = dbf_lookup(idx, hdr->count, codepoint);
+if (entry >= 0) {
+    u8 *glyph = font + idx[entry].offset;
+    u16 w = idx[entry].width;
+    u16 h = hdr->height;
+    // 逐行渲染 8bpp 灰度位图
+}
+```
+
+## 使用方式
+
+1. 启动时将 `.dbf` 文件通过 boot module 或 FAT32 加载到内存
+2. GBK/GB2312 双字节序列转为 Unicode codepoint 后查表
+3. 8bpp 灰度可直接 alpha-blend 到 framebuffer

@@ -1,0 +1,169 @@
+{
+  "schema": "deshab.driver.manifest.v1",
+  "root": "SYSTEM",
+  "driverRoot": "SYSTEM/driver",
+  "format": "elf64-drv",
+  "abi": {
+    "name": "DKM",
+    "version": 1,
+    "entry": "driver_init",
+    "exit": "driver_exit",
+    "descriptor": "driver_desc"
+  },
+  "policy": {
+    "loadModel": "module",
+    "loadOrder": "staged",
+    "requiredFailure": "drr_recovery_or_panic",
+    "optionalFailure": "mark_failed_and_continue",
+    "memoryModel": "UTSM",
+    "codeSegment": "READ|EXEC|SEALED",
+    "dataSegment": "READ|WRITE|STRONG_RECOVERY",
+    "dmaSegment": "DMA|PINNED"
+  },
+  "stages": [
+    {
+      "id": 0,
+      "name": "platform",
+      "required": true,
+      "description": "平台发现、中断、总线、基础计时。",
+      "drivers": [
+        {
+          "name": "timer",
+          "path": "driver/platform/timer.drv",
+          "class": "timer",
+          "required": true,
+          "depends": [],
+          "provides": ["timer"]
+        },
+        {
+          "name": "apic",
+          "path": "driver/platform/apic.drv",
+          "class": "interrupt",
+          "required": true,
+          "depends": ["timer"],
+          "provides": ["irq", "apic"]
+        },
+        {
+          "name": "acpi",
+          "path": "driver/platform/acpi.drv",
+          "class": "platform",
+          "required": false,
+          "depends": [],
+          "provides": ["acpi"]
+        },
+        {
+          "name": "pci",
+          "path": "driver/bus/pci.drv",
+          "class": "bus",
+          "required": true,
+          "depends": ["irq"],
+          "provides": ["pci"]
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "boot",
+      "required": true,
+      "description": "启动关键驱动：控制台、块设备、启动文件系统。",
+      "drivers": [
+        {
+          "name": "console_fb",
+          "path": "driver/console/console_fb.drv",
+          "class": "console",
+          "required": false,
+          "depends": [],
+          "provides": ["console"]
+        },
+        {
+          "name": "ahci",
+          "path": "driver/block/ahci.drv",
+          "class": "storage",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["block"]
+        },
+        {
+          "name": "nvme",
+          "path": "driver/block/nvme.drv",
+          "class": "storage",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["block"]
+        },
+        {
+          "name": "bootfs",
+          "path": "driver/fs/bootfs.drv",
+          "class": "fs",
+          "required": true,
+          "depends": [],
+          "provides": ["bootfs"]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "filesystem",
+      "required": true,
+      "description": "VFS 和可挂载文件系统。",
+      "drivers": [
+        {
+          "name": "vfs",
+          "path": "driver/fs/vfs.drv",
+          "class": "fs-core",
+          "required": true,
+          "depends": ["bootfs"],
+          "provides": ["vfs"]
+        },
+        {
+          "name": "fat32",
+          "path": "driver/fs/fat32.drv",
+          "class": "fs",
+          "required": false,
+          "depends": ["vfs", "block"],
+          "provides": ["fat32"]
+        },
+        {
+          "name": "devfs",
+          "path": "driver/fs/devfs.drv",
+          "class": "fs",
+          "required": false,
+          "depends": ["vfs"],
+          "provides": ["devfs"]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "optional",
+      "required": false,
+      "description": "网络、输入、图形等非启动关键驱动。",
+      "drivers": [
+        {
+          "name": "e1000",
+          "path": "driver/net/e1000.drv",
+          "class": "net",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["netdev"]
+        },
+        {
+          "name": "virtio_net",
+          "path": "driver/net/virtio_net.drv",
+          "class": "net",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["netdev"]
+        },
+        {
+          "name": "ps2kbd",
+          "path": "driver/input/ps2kbd.drv",
+          "class": "input",
+          "required": false,
+          "depends": ["irq"],
+          "provides": ["keyboard"]
+        }
+      ]
+    }
+  ]
+}

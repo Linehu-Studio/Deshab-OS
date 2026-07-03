@@ -528,5 +528,69 @@
 1. **反推物理地址不可靠**: 用内核高半虚拟地址（BSS）反推物理地址喂给设备 DMA，物理页与 CPU 映射不保证一致，是之前 e1000 一启用 RCTL/TCTL 就卡死的根因；DMA 缓冲必须来自明确的物理页分配。
 2. **低 4G 约束要显式**: e1000 等 32 位 BAR 设备的 DMA 描述符/缓冲需落在低 4G，bitmap 分配器直接把上界钳到 `0x100000000` 并保留最低 1MiB，避免 legacy 区。
 
+## 2026-07-02 — e1000 DHCP 联网闭环
+
+### 经验
+
+1. **PCI I/O 汇编必须 volatile**: `outl(0xCF8)` / `inl(0xCFC)` 访问 PCI config space 时必须使用 `asm volatile` 和 memory clobber，否则 `-O2` 下可能丢弃或重排，导致读取 BAR0 时仍拿到 vendor/device ID。
+2. **验证 TX 要看 descriptor 完成位**: 只看到写 TDT 不代表网卡已发送；轮询 TX descriptor `DD` 位可以区分“API 调用成功”和“设备真正消费 descriptor”。
+3. **DHCP 包要兼容 BOOTP 最小长度**: DHCP/BOOTP payload 补齐到 548 字节并计算 UDP checksum 后，QEMU user-net 能正常返回 OFFER/ACK。
+
+### 教训
+
+1. **BAR 读错会伪装成 DMA/RX 问题**: BAR0 被读成 `0x100e8086` 时，MMIO 实际指向错误地址，表现为 `STATUS=0`、TX descriptor 不完成，容易误判为 ring 或 DHCP 问题。
+2. **早期网络调试要分层验证**: 先确认 PCI BAR → MMIO STATUS → TX DD → RX frame → DHCP 解析，避免在协议层反复修改掩盖底层设备访问错误。
+
+## 2026-07-02 — FirstInit 无线网络选择界面
+
+### 经验
+
+1. **复用现有卡片/输入框最稳**: FirstInit 已有 `draw_rounded_input`、鼠标包解析和键盘轮询，直接替换旧网络选项页为 SSID 列表 + 密码框 + Connect 按钮，可以避免新增 UI 框架。
+2. **配置先写入 user.conf 缓冲**: 当前缺 FAT32 write API，网络选择结果先进入加密配置缓冲，字段使用 `network.mode=wifi`、`network.ssid`、`network.password`、`network.ip=dhcp`、`network.dns=auto`，后续写盘可直接复用。
+
+### 教训
+
+1. **真实 Wi-Fi 扫描 API 尚未存在**: 当前界面只能展示模拟检测到的 SSID，后续需要网卡/无线驱动和扫描 API 后再替换数据源。
+2. **FirstInit 仍不应接管系统联网**: UI 只收集用户选择和密码；实际联网仍由 netman/驱动负责，避免用户向导和系统初始化职责混在一起。
+
+## 2026-07-02 — netman 完整早期联网闭环
+
+### 经验
+
+1. **联网闭环要分层验收**: DHCP 只证明拿到 IP，还需要 ARP 解析网关 MAC、DNS 查询外部域名，才能证明 TX/RX 与 QEMU user-net 实际可用。
+2. **QEMU user-net 网关与 DNS 分离**: DHCP 返回网关 `10.0.2.2`，DNS 常为 `10.0.2.3`，应从 DHCP option 3/6 读取，缺失时再 fallback。
+3. **保留正式阶段日志有助于验证**: `DHCP final rc`、`ARP final rc`、`DNS final rc`、`network final rc` 足以判断完整联网状态，不需要保留临时 debug 日志。
+
+### 教训
+
+1. **DNS parser 边界必须谨慎**: DNS response 使用压缩 name，解析 answer 时必须处理 `0xC0` 指针并检查 `rdlen`，否则容易越界。
+2. **崩溃判断必须靠串口证据**: 用户观察到“崩溃重启”后，插桩证明确认联网阶段成功并进入 FirstInit；不能在没有阶段锚点证据时直接回滚功能。
+
+## 2026-07-02 — 修复 FirstInit 网络页 SSID 指针数组崩溃
+
+### 经验
+
+1. **FirstInit PIE 中避免全局指针数组**: DSK 的 PIE loader 只处理有限重定位场景，UI 页面里的字符串列表应优先使用二维字符数组或栈上字符数组，避免 `const char *arr[]` 解引用崩溃。
+2. **绘制函数要用阶段锚点定位**: 对网络页按 `redraw → row → fill → stroke → ssid → meta` 分层插桩，可以精确定位崩溃在第一条 SSID 文本绘制。
+
+### 教训
+
+1. **看似普通的字符串数组也是重定位风险**: `static const char *g_wifi_ssids[]` 在普通 C 程序中安全，但在当前 DSK 加载 FirstInit 的 PIE 环境下会变成运行期指针重定位风险。
+2. **不要用跳过流程的调试改动进入最终版本**: 为了快速复现可以临时跳过账号/偏好页，但验证后必须恢复真实流程，避免引入与用户路径不一致的行为。
+
+## 2026-07-03 — 用 Consolas TTF 替换 8x8 位图字体
+
+### 经验
+
+1. **裸金属 OS "用系统的 TTF" 的正确解读**: Deshab 没有 TTF 光栅化服务，"系统的 TTF" 应解读为构建时用宿主机 Windows 系统 TTF 字体（`C:\Windows\Fonts\consola.ttf`）预渲染为灰度位图，嵌入 FirstInit ELF，运行时仍走 alpha-blend 位图渲染路径。
+2. **Consolas 18px 渲染参数**: advance=10px，'A' bbox=(0,3,10,14)，'g' bbox=(0,5,10,18)，11x18 格子完美适配（10px 字形 + 1px 间距，ASCII_STEP=11）。等宽字体适合 UI 输入框/菜单/按钮。
+3. **统一灰度位图渲染路径**: 中文字体已用 `fb_bitmap_alpha()` 8bpp 灰度 alpha-blend，ASCII 字体改用同样的灰度位图 + alpha-blend 后，字形抗锯齿效果与中文一致，且 `fb_char()` 逻辑大幅简化（移除 8x8→10x16 缩放和边缘检测）。
+4. **构建时预渲染脚本**: 新增 `CODE/font/render_ascii.py`，用 PIL 从 Consolas TTF 渲染 ASCII 32-126 共 95 个字符到 `CODE/firstInit/ascii_bitmaps.c`（18810 字节 glyph data），通过 `#include` 嵌入 main.c。
+
+### 教训
+
+1. **8x8 位图字体缩放到 10x16 形状怪异**: 手工 8x8 位图字体在小写字母上使用满高设计，2x2 近邻缩放后字形不自然；TTF 预渲染直接生成目标尺寸的灰度位图，避免缩放失真。
+2. **字符范围要覆盖全部可打印 ASCII**: 原 `fb_char` 用 `ch >= ' ' && ch <= 'z'`（0x7a）截断，导致 `{` `|` `}` `~` 显示为空格；改为 `ch > '~'`（0x7e）后覆盖全部 95 个可打印字符。
+3. **布局偏移要跟随字高调整**: ASCII_H 从 16 变为 18 后，硬编码的 `y+(h-16)/2` 需改为 `y+(h-ASCII_H)/2`，wifi 行的 `y+17`（选中标记居中）需改为 `y+16`（(50-18)/2=16）。
 
 

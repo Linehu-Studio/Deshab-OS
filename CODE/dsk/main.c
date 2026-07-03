@@ -327,48 +327,80 @@ static void dsk_spinner_and_check(u32 *fb_arg, i64 cx, i64 cy, i64 r, i64 thk,
             logl("[DSK] checking firstInit...");
             if(g_block_read){logl("[DSK] have block read, calling dsk_check_firstinit");
                 int is_first=0;
-                if(dsk_check_firstinit(&is_first)==0&&is_first){
-                    logl("[DSK] first init detected; running system initializers");
+                if(dsk_check_firstinit(&is_first)==0){
+                    if(is_first){
+                        logl("[DSK] first init detected; running system initializers");
 
-                    /* DSK owns system component initialization. FirstInit is only user setup. */
-                    char mn[12]; /* MOUSE   ELF */
-                    mn[0]='M';mn[1]='O';mn[2]='U';mn[3]='S';mn[4]='E';mn[5]=' ';mn[6]=' ';mn[7]=' ';mn[8]='E';mn[9]='L';mn[10]='F';
-                    u8 *md=0; u32 ms=0; void *me=0;
-                    if(fat32_read_root_file(mn,&md,&ms)==0){
-                        if(dsk_load_elf(md,ms,&me)==0){
-                            logl("[DSK] jumping to mouseInit");
-                            void(*mentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))me;
-                            mentry(ctx);
-                            logl("[DSK] mouseInit returned");
+                        /* DSK owns system component initialization. FirstInit is only user setup. */
+                        char mn[12]; /* MOUSE   ELF */
+                        mn[0]='M';mn[1]='O';mn[2]='U';mn[3]='S';mn[4]='E';mn[5]=' ';mn[6]=' ';mn[7]=' ';mn[8]='E';mn[9]='L';mn[10]='F';
+                        u8 *md=0; u32 ms=0; void *me=0;
+                        if(fat32_read_root_file(mn,&md,&ms)==0){
+                            if(dsk_load_elf(md,ms,&me)==0){
+                                logl("[DSK] jumping to mouseInit");
+                                void(*mentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))me;
+                                mentry(ctx);
+                                logl("[DSK] mouseInit returned");
+                            }
                         }
-                    }
 
-                    char nn[12]; /* NETMAN  ELF */
-                    nn[0]='N';nn[1]='E';nn[2]='T';nn[3]='M';nn[4]='A';nn[5]='N';nn[6]=' ';nn[7]=' ';nn[8]='E';nn[9]='L';nn[10]='F';
-                    u8 *nd=0; u32 ns=0; void *ne=0;
-                    if(fat32_read_root_file(nn,&nd,&ns)==0){
-                        if(dsk_load_elf(nd,ns,&ne)==0){
-                            logl("[DSK] jumping to netman");
-                            void(*nentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))ne;
-                            nentry(ctx);
-                            logl("[DSK] netman returned");
+                        char nn[12]; /* NETMAN  ELF */
+                        nn[0]='N';nn[1]='E';nn[2]='T';nn[3]='M';nn[4]='A';nn[5]='N';nn[6]=' ';nn[7]=' ';nn[8]='E';nn[9]='L';nn[10]='F';
+                        u8 *nd=0; u32 ns=0; void *ne=0;
+                        if(fat32_read_root_file(nn,&nd,&ns)==0){
+                            if(dsk_load_elf(nd,ns,&ne)==0){
+                                logl("[DSK] jumping to netman");
+                                void(*nentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))ne;
+                                nentry(ctx);
+                                logl("[DSK] netman returned");
+                            }
                         }
-                    }
 
-                    logl("[DSK] loading FirstInit.elf");
-                    char en[12]; /* FIRSTINIT */
-                    en[0]='F';en[1]='I';en[2]='R';en[3]='S';en[4]='T';
-                    en[5]='I';en[6]='N';en[7]='I';en[8]='T';en[9]=' ';en[10]=0;
-                    u8 *fd=0; u32 fs=0;
-                    if(fat32_read_root_file(en,&fd,&fs)==0){
-                        if(dsk_load_elf(fd,fs,&fe_entry)==0) logl("[DSK] FirstInit.elf loaded");
+                        logl("[DSK] loading FirstInit.elf");
+                        char en[12]; /* FIRSTINIT */
+                        en[0]='F';en[1]='I';en[2]='R';en[3]='S';en[4]='T';
+                        en[5]='I';en[6]='N';en[7]='I';en[8]='T';en[9]=' ';en[10]=0;
+                        u8 *fd=0; u32 fs=0;
+                        if(fat32_read_root_file(en,&fd,&fs)==0){
+                            if(dsk_load_elf(fd,fs,&fe_entry)==0) logl("[DSK] FirstInit.elf loaded");
+                        }
+                    } else {
+                        logl("[DSK] firstInit=1, skipping user setup, loading shell directly");
                     }
                 }
             }
         }
         if(fe_entry&&frame>150){logl("[DSK] jumping to FirstInit");  /* was 600 */
             void(*entry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))fe_entry;
-            entry(ctx); for(;;)__asm__("hlt");
+            entry(ctx);
+            logl("[DSK] FirstInit returned, loading shell");
+            /* FirstInit 返回后加载 shell */
+            char sh[12]; /* SHELL   ELF */
+            sh[0]='S';sh[1]='H';sh[2]='E';sh[3]='L';sh[4]='L';sh[5]=' ';sh[6]=' ';sh[7]=' ';sh[8]='E';sh[9]='L';sh[10]='F';
+            u8 *sd=0; u32 ss=0; void *se=0;
+            if(fat32_read_root_file(sh,&sd,&ss)==0){
+                if(dsk_load_elf(sd,ss,&se)==0){
+                    logl("[DSK] jumping to shell");
+                    void(*sentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))se;
+                    sentry(ctx);
+                }
+            }
+            for(;;)__asm__("hlt");
+        }
+        /* 非首次启动：直接加载 shell */
+        if(checked&&!fe_entry&&frame>150){
+            logl("[DSK] loading shell directly (non-first boot)");
+            char sh[12]; /* SHELL   ELF */
+            sh[0]='S';sh[1]='H';sh[2]='E';sh[3]='L';sh[4]='L';sh[5]=' ';sh[6]=' ';sh[7]=' ';sh[8]='E';sh[9]='L';sh[10]='F';
+            u8 *sd=0; u32 ss=0; void *se=0;
+            if(fat32_read_root_file(sh,&sd,&ss)==0){
+                if(dsk_load_elf(sd,ss,&se)==0){
+                    logl("[DSK] jumping to shell");
+                    void(*sentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))se;
+                    sentry(ctx);
+                }
+            }
+            for(;;)__asm__("hlt");
         }
         if(!g_block_read&&frame>800){logl("[DSK] no block device, skipping firstInit");break;}
         if(checked&&!fe_entry&&frame>800){logl("[DSK] firstInit not found, continuing normal boot");break;}

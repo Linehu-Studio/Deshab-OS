@@ -12,6 +12,7 @@ typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
 typedef unsigned long long u64;
+typedef signed char        i8;
 typedef long long          i64;
 #define NULL ((void *)0)
 
@@ -22,6 +23,14 @@ struct dkm_log_api {
     void (*panic)(const char *msg);
 };
 
+struct dkm_net_scan_result {
+    char ssid[33];
+    u8 bssid[6];
+    u8 channel;
+    i8 rssi;
+    u8 security;
+};
+
 struct dkm_net_device_desc {
     const char *name;
     u8 mac[6];
@@ -29,12 +38,23 @@ struct dkm_net_device_desc {
     void *ctx;
     int (*tx)(void *ctx, const void *packet, u32 length);
     int (*rx_poll)(void *ctx, void *buffer, u32 capacity, u32 *out_length);
+    /* 无线扩展回调（有线驱动置 NULL，向后兼容）。 */
+    int (*scan_start)(void *ctx);
+    int (*scan_count)(void *ctx);
+    int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
+    int (*is_wireless)(void *ctx);
 };
 
 struct dkm_net_api {
     int (*register_device)(const struct dkm_net_device_desc *desc);
     u32 (*device_count)(void);
     int (*device_info)(u32 index, void *out);
+    int (*tx)(u32 index, const void *packet, u32 length);
+    int (*rx_poll)(u32 index, void *buffer, u32 capacity, u32 *out_length);
+    int (*scan_start)(u32 index);
+    int (*scan_count)(u32 index);
+    int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
+    int (*is_wireless)(u32 index);
 };
 
 struct dkm_dma_buffer {
@@ -95,6 +115,7 @@ const struct dkm_driver_desc driver_desc = {
 #define PCI_DEVICE_ID 0x02
 #define PCI_COMMAND   0x04
 #define PCI_BAR0 0x10
+#define PCI_BAR1 0x14
 #define PCI_IRQ_LINE 0x3C
 
 /* e1000 MMIO registers */
@@ -184,10 +205,10 @@ static u32 g_rx_tail;
 static u32 g_tx_tail;
 static int g_rings_ready;
 
-static __inline__ void outl(u16 p, u32 v) { __asm__("outl %0,%1"::"a"(v),"Nd"(p)); }
-static __inline__ u32 inl(u16 p) { u32 v; __asm__("inl %1,%0":"=a"(v):"Nd"(p)); return v; }
-static u8 inb(u16 p) { u8 v; __asm__("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
-static void outb(u16 p, u8 v) { __asm__("outb %0,%1"::"a"(v),"Nd"(p)); }
+static __inline__ void outl(u16 p, u32 v) { __asm__ volatile("outl %0,%1"::"a"(v),"Nd"(p):"memory"); }
+static __inline__ u32 inl(u16 p) { u32 v; __asm__ volatile("inl %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
+static u8 inb(u16 p) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
+static void outb(u16 p, u8 v) { __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p):"memory"); }
 
 static void raw_log(const char *s) {
     while (*s) {
@@ -199,6 +220,17 @@ static void raw_log(const char *s) {
         for (u32 i=0;i<100000;i++) if (inb(0x3F8+5)&0x20) break;
         outb(0x3F8, (u8)c);
     }
+}
+
+static void raw_hex(const char *prefix, u64 v) {
+    static const char h[] = "0123456789abcdef";
+    raw_log(prefix);
+    raw_log("0x");
+    for (int i=15; i>=0; i--) {
+        for (u32 wait=0; wait<100000; wait++) if (inb(0x3F8+5)&0x20) break;
+        outb(0x3F8, (u8)h[(v >> (i * 4)) & 0xf]);
+    }
+    raw_log("\n");
 }
 
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
@@ -253,6 +285,19 @@ static void copy_bytes(void *dst, const void *src, u32 len) {
     for (u32 i=0;i<len;i++) d[i]=s[i];
 }
 
+static void zero_bytes(void *dst, u32 len) {
+    u8 *d = (u8 *)dst;
+    for (u32 i=0;i<len;i++) d[i]=0;
+}
+
+static void mmio_flush(void) {
+    if (g_mmio) (void)g_mmio[E1000_STATUS/4];
+}
+
+static void dma_fence(void) {
+    __asm__ volatile("" ::: "memory");
+}
+
 static int e1000_init_rings(const struct dkm_dma_api *dma) {
     if (!dma || !dma->alloc_pages || !g_mmio) return -1;
 
@@ -269,8 +314,8 @@ static int e1000_init_rings(const struct dkm_dma_api *dma) {
         if (dma->alloc_pages(1, 16, 0x100000000ULL, &b) != 0) return -4;
         g_rx_buf[i] = (u8 *)b.virt;
         g_rx_buf_phys[i] = b.phys;
+        zero_bytes(&g_rx_desc[i], sizeof(g_rx_desc[i]));
         g_rx_desc[i].addr = b.phys;
-        g_rx_desc[i].status = 0;
     }
 
     for (u32 i=0;i<E1000_TX_DESC_COUNT;i++) {
@@ -278,13 +323,16 @@ static int e1000_init_rings(const struct dkm_dma_api *dma) {
         if (dma->alloc_pages(1, 16, 0x100000000ULL, &b) != 0) return -5;
         g_tx_buf[i] = (u8 *)b.virt;
         g_tx_buf_phys[i] = b.phys;
+        zero_bytes(&g_tx_desc[i], sizeof(g_tx_desc[i]));
         g_tx_desc[i].addr = b.phys;
         g_tx_desc[i].status = E1000_TX_STA_DD;
     }
+    dma_fence();
     raw_log("[e1000.raw] ring/buffers allocated\n");
 
     g_mmio[E1000_RCTL/4] = 0;
     g_mmio[E1000_TCTL/4] = 0;
+    mmio_flush();
 
     g_mmio[E1000_RDBAL/4] = (u32)(g_rx_desc_phys & 0xffffffffu);
     g_mmio[E1000_RDBAH/4] = (u32)(g_rx_desc_phys >> 32);
@@ -305,8 +353,10 @@ static int e1000_init_rings(const struct dkm_dma_api *dma) {
     g_mmio[E1000_TXDCTL/4] = (1u << 25);
 
     g_mmio[E1000_TIPG/4] = 0x0060200Au;
+    dma_fence();
     g_mmio[E1000_RCTL/4] = E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM | E1000_RCTL_SECRC | E1000_RCTL_BSIZE_2048;
     g_mmio[E1000_TCTL/4] = E1000_TCTL_EN | E1000_TCTL_PSP | (0x0Fu << E1000_TCTL_CT_SHIFT) | (0x40u << E1000_TCTL_COLD_SHIFT);
+    mmio_flush();
 
     g_rings_ready = 1;
     raw_log("[e1000.raw] RX/TX rings initialized\n");
@@ -316,32 +366,62 @@ static int e1000_init_rings(const struct dkm_dma_api *dma) {
 static int e1000_tx(void *ctx, const void *packet, u32 length) {
     (void)ctx;
     raw_log("[e1000.raw] tx enter\n");
-    if (!g_rings_ready || !packet || length == 0 || length > E1000_RX_BUF_SIZE) return -1;
+    if (!g_rings_ready || !packet || length == 0 || length > E1000_TX_BUF_SIZE) return -1;
     u32 index = g_tx_tail;
     if (!(g_tx_desc[index].status & E1000_TX_STA_DD)) return -2;
     copy_bytes(g_tx_buf[index], packet, length);
+    dma_fence();
     raw_log("[e1000.raw] tx copied\n");
     g_tx_desc[index].length = (u16)length;
+    g_tx_desc[index].cso = 0;
     g_tx_desc[index].cmd = E1000_TX_CMD_EOP | E1000_TX_CMD_IFCS | E1000_TX_CMD_RS;
+    g_tx_desc[index].css = 0;
+    g_tx_desc[index].special = 0;
     g_tx_desc[index].status = 0;
+    dma_fence();
     g_tx_tail = (index + 1) % E1000_TX_DESC_COUNT;
     g_mmio[E1000_TDT/4] = g_tx_tail;
-    raw_log("[e1000.raw] tx tdt written\n");
-    return 0;
+    mmio_flush();
+    for (u32 wait=0; wait<1000000; wait++) {
+        dma_fence();
+        if (g_tx_desc[index].status & E1000_TX_STA_DD) {
+            raw_log("[e1000.raw] tx complete\n");
+            return 0;
+        }
+        __asm__ volatile("pause");
+    }
+    raw_log("[e1000.raw] tx timeout\n");
+    raw_hex("[e1000.raw] STATUS=", g_mmio[E1000_STATUS/4]);
+    raw_hex("[e1000.raw] TCTL=", g_mmio[E1000_TCTL/4]);
+    raw_hex("[e1000.raw] TDH=", g_mmio[E1000_TDH/4]);
+    raw_hex("[e1000.raw] TDT=", g_mmio[E1000_TDT/4]);
+    raw_hex("[e1000.raw] desc.status=", g_tx_desc[index].status);
+    return -3;
 }
 
 static int e1000_rx_poll(void *ctx, void *buffer, u32 capacity, u32 *out_length) {
     (void)ctx;
+    if (out_length) *out_length = 0;
     if (!g_rings_ready || !buffer || !out_length) return -1;
     u32 next = (g_rx_tail + 1) % E1000_RX_DESC_COUNT;
+    dma_fence();
     if (!(g_rx_desc[next].status & E1000_RX_STA_DD)) return 1;
     u32 len = g_rx_desc[next].length;
-    if (len > capacity) return -2;
+    if (len > capacity) {
+        g_rx_desc[next].status = 0;
+        dma_fence();
+        g_rx_tail = next;
+        g_mmio[E1000_RDT/4] = g_rx_tail;
+        mmio_flush();
+        return -2;
+    }
     copy_bytes(buffer, g_rx_buf[next], len);
     *out_length = len;
     g_rx_desc[next].status = 0;
+    dma_fence();
     g_rx_tail = next;
     g_mmio[E1000_RDT/4] = g_rx_tail;
+    mmio_flush();
     return 0;
 }
 
@@ -367,7 +447,18 @@ int driver_init(const struct dkm_kernel_api *api,
     pci_write(bus, dev, 0, PCI_COMMAND, cmd);
     raw_log("[e1000.raw] PCI command enabled\n");
 
-    g_bar0_phys = (u64)pci_read(bus,dev,0,PCI_BAR0) & 0xFFFFFFF0ULL;
+    u32 bar0 = pci_read(bus,dev,0,PCI_BAR0);
+    if (bar0 & 1u) {
+        raw_log("[e1000.raw] IO BAR unsupported\n");
+        return 0;
+    }
+    g_bar0_phys = (u64)(bar0 & 0xFFFFFFF0ULL);
+    if ((bar0 & 0x6u) == 0x4u) {
+        u32 bar1 = pci_read(bus,dev,0,PCI_BAR1);
+        g_bar0_phys |= ((u64)bar1 << 32);
+    }
+    raw_hex("[e1000.raw] BAR0 raw=", bar0);
+    raw_hex("[e1000.raw] BAR0 phys=", g_bar0_phys);
     if (!g_bar0_phys) {
         raw_log("[e1000.raw] BAR0 unavailable\n");
         return 0;

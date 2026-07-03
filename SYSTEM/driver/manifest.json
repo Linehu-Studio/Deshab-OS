@@ -156,6 +156,14 @@
           "provides": ["netdev"]
         },
         {
+          "name": "ath9k",
+          "path": "driver/net/ath9k.drv",
+          "class": "net",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["netdev"]
+        },
+        {
           "name": "ps2kbd",
           "path": "driver/input/ps2kbd.drv",
           "class": "input",

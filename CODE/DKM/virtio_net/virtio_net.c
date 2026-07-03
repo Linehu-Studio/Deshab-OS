@@ -13,6 +13,7 @@ typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
 typedef unsigned long long u64;
+typedef signed char        i8;
 typedef long long          i64;
 
 #define NULL ((void *)0)
@@ -24,6 +25,14 @@ struct dkm_log_api {
     void (*panic)(const char *msg);
 };
 
+struct dkm_net_scan_result {
+    char ssid[33];
+    u8 bssid[6];
+    u8 channel;
+    i8 rssi;
+    u8 security;
+};
+
 struct dkm_net_device_desc {
     const char *name;
     u8 mac[6];
@@ -31,12 +40,23 @@ struct dkm_net_device_desc {
     void *ctx;
     int (*tx)(void *ctx, const void *packet, u32 length);
     int (*rx_poll)(void *ctx, void *buffer, u32 capacity, u32 *out_length);
+    /* 无线扩展回调（有线驱动置 NULL，向后兼容）。 */
+    int (*scan_start)(void *ctx);
+    int (*scan_count)(void *ctx);
+    int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
+    int (*is_wireless)(void *ctx);
 };
 
 struct dkm_net_api {
     int (*register_device)(const struct dkm_net_device_desc *desc);
     u32 (*device_count)(void);
     int (*device_info)(u32 index, void *out);
+    int (*tx)(u32 index, const void *packet, u32 length);
+    int (*rx_poll)(u32 index, void *buffer, u32 capacity, u32 *out_length);
+    int (*scan_start)(u32 index);
+    int (*scan_count)(u32 index);
+    int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
+    int (*is_wireless)(u32 index);
 };
 
 #define DKM_NET_F_LINK_UP (1u << 0)

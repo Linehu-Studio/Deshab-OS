@@ -1,4 +1,4 @@
-﻿/* netman — Deshab network manager initializer
+/* netman — Deshab network manager initializer
  * 读取 /system/deshab64/network/conf/conf.conf（SATA 早期镜像里为 root 目录 NETCONF.CNF），
  * 解析网络配置；枚举内核 netdev 注册表；对具备收发能力的接口通过 e1000 真实收发
  * 跑最小 DHCP 客户端拿到 IP。
@@ -50,6 +50,14 @@ static void log_hex(const char *p, u64 v) {
 static void *memset_nm(void *d, int c, u64 n) { u8 *p=(u8*)d; while(n--)*p++=(u8)c; return d; }
 static int streqn(const char *a, const char *b, u32 n) { for(u32 i=0;i<n;i++) if(a[i]!=b[i]) return 0; return 1; }
 static int neq11(const char *a, const char *b) { for(int i=0;i<11;i++) if(a[i]!=b[i]) return 0; return 1; }
+static int str_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
 static u16 r16(const u8 *p) { return (u16)p[0]|((u16)p[1]<<8); }
 static u32 r32(const u8 *p) { return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24); }
 
@@ -216,6 +224,8 @@ static u8 g_rxbuf[2048];
 static u8 g_local_mac[6];
 static u32 g_lease_ip;
 static u32 g_server_ip;
+static u32 g_gateway_ip;
+static u32 g_dns_ip;
 static u32 g_dhcp_xid = 0x21030201u;
 
 /* 累加和，用于 IPv4 头部校验 */
@@ -227,8 +237,20 @@ static u16 ip_checksum(const u8 *data, u32 len) {
     return (u16)(~sum);
 }
 
+static u16 udp_checksum_ipv4(const u8 *ip, const u8 *udp, u32 udp_len) {
+    u32 sum = 0;
+    for (u32 i=12;i<20;i+=2) sum += (u32)((ip[i]<<8)|ip[i+1]);
+    sum += 17;
+    sum += udp_len;
+    for (u32 i=0;i+1<udp_len;i+=2) sum += (u32)((udp[i]<<8)|udp[i+1]);
+    if (udp_len & 1) sum += (u32)(udp[udp_len-1]<<8);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    u16 out = (u16)(~sum);
+    return out ? out : 0xffff;
+}
+
 static void delay_spin(u32 loops) {
-    for (volatile u32 i=0;i<loops;i++) { __asm__ volatile(""); }
+    for (volatile u32 i=0;i<loops;i++) { __asm__ volatile("pause"); }
 }
 
 /* 构造并发送一个 DHCP 报文。type: 1=DISCOVER 3=REQUEST */
@@ -267,6 +289,7 @@ static int dhcp_send(u32 index, u8 type, u32 requested_ip, u32 server_ip) {
     dhcp[opt++]=255;
 
     u32 dhcp_len = opt;
+    if (dhcp_len < 548) dhcp_len = 548;
     u32 udp_len = 8 + dhcp_len;
     u32 ip_len = 20 + udp_len;
 
@@ -285,20 +308,28 @@ static int dhcp_send(u32 index, u8 type, u32 requested_ip, u32 server_ip) {
     u16 ipck = ip_checksum(ip, 20);
     ip[10]=(u8)(ipck>>8); ip[11]=(u8)(ipck);
 
+    u16 udpck = udp_checksum_ipv4(ip, udp, udp_len);
+    udp[6]=(u8)(udpck>>8); udp[7]=(u8)(udpck);
+
     u32 frame_len = 14 + ip_len;
     if (frame_len < 60) frame_len = 60;
     return g_net_tx(index, g_pktbuf, frame_len);
 }
 
 /* 解析收到的帧，若为本机 xid 的 DHCP 回复则返回 message type。 */
-static int dhcp_parse(const u8 *frame, u32 len, u32 *out_yiaddr, u32 *out_server) {
+static int dhcp_parse(const u8 *frame, u32 len, u32 *out_yiaddr, u32 *out_server, u32 *out_router, u32 *out_dns) {
     if (len < 14+20+8+240) return -1;
     if (frame[12]!=0x08 || frame[13]!=0x00) return -1;
     const u8 *ip = frame + 14;
     if ((ip[0]>>4)!=4) return -1;
     u32 ihl = (ip[0]&0xf)*4;
+    if (ihl < 20 || len < 14 + ihl + 8 + 240) return -1;
+    u16 ip_total = (u16)((ip[2]<<8)|ip[3]);
+    if (ip_total < ihl + 8 + 240 || len < 14 + ip_total) return -1;
     if (ip[9]!=17) return -1;
     const u8 *udp = ip + ihl;
+    u16 udp_len = (u16)((udp[4]<<8)|udp[5]);
+    if (udp_len < 8 + 240 || udp_len > ip_total - ihl) return -1;
     u16 dport = (u16)((udp[2]<<8)|udp[3]);
     if (dport != 68) return -1;
     const u8 *dhcp = udp + 8;
@@ -309,7 +340,9 @@ static int dhcp_parse(const u8 *frame, u32 len, u32 *out_yiaddr, u32 *out_server
     u32 o = 240;
     u8 msg_type = 0;
     u32 server = 0;
-    u32 cap = len - 14;
+    u32 router = 0;
+    u32 dns = 0;
+    u32 cap = udp_len - 8;
     while (o < cap) {
         u8 code = dhcp[o++];
         if (code == 255) break;
@@ -320,10 +353,16 @@ static int dhcp_parse(const u8 *frame, u32 len, u32 *out_yiaddr, u32 *out_server
         if (code == 53 && l >= 1) msg_type = dhcp[o];
         if (code == 54 && l >= 4)
             server = ((u32)dhcp[o]<<24)|((u32)dhcp[o+1]<<16)|((u32)dhcp[o+2]<<8)|dhcp[o+3];
+        if (code == 3 && l >= 4)
+            router = ((u32)dhcp[o]<<24)|((u32)dhcp[o+1]<<16)|((u32)dhcp[o+2]<<8)|dhcp[o+3];
+        if (code == 6 && l >= 4)
+            dns = ((u32)dhcp[o]<<24)|((u32)dhcp[o+1]<<16)|((u32)dhcp[o+2]<<8)|dhcp[o+3];
         o += l;
     }
     *out_yiaddr = yi;
     *out_server = server;
+    if (out_router) *out_router = router;
+    if (out_dns) *out_dns = dns;
     return msg_type;
 }
 
@@ -350,60 +389,198 @@ static void log_ipv4(const char *pre, u32 ip_hostorder) {
 static int dhcp_run(u32 index, const u8 mac[6]) {
     if (!g_net_tx || !g_net_rx_poll) { logl("[netman] DHCP: net tx/rx api missing"); return -1; }
     for (int i=0;i<6;i++) g_local_mac[i]=mac[i];
-    g_lease_ip = 0; g_server_ip = 0;
+    g_lease_ip = 0; g_server_ip = 0; g_gateway_ip = 0; g_dns_ip = 0;
 
-    logl("[netman] DHCP: sending DISCOVER");
-    int txrc = dhcp_send(index, 1, 0, 0);
-    log_hex("[netman] DHCP DISCOVER tx rc=", (u64)(i8)txrc);
-    if (txrc != 0) { logl("[netman] DHCP: DISCOVER tx failed"); return -1; }
-
-    u32 offer_ip = 0, offer_srv = 0;
+    u32 offer_ip = 0, offer_srv = 0, offer_router = 0, offer_dns = 0;
     int got_offer = 0;
     u32 rx_frames = 0;
-    for (u32 attempt=0; attempt<40000 && !got_offer; attempt++) {
-        u32 rlen = 0;
-        int rc = g_net_rx_poll(index, g_rxbuf, sizeof(g_rxbuf), &rlen);
-        if (rc == 0 && rlen > 0) {
-            rx_frames++;
-            int t = dhcp_parse(g_rxbuf, rlen, &offer_ip, &offer_srv);
-            if (t == 2) { got_offer = 1; break; }   /* OFFER */
+    for (u32 round=0; round<4 && !got_offer; round++) {
+        logl("[netman] DHCP: sending DISCOVER");
+        int txrc = dhcp_send(index, 1, 0, 0);
+        log_hex("[netman] DHCP DISCOVER tx rc=", (u64)(i8)txrc);
+        if (txrc != 0) { logl("[netman] DHCP: DISCOVER tx failed"); return -1; }
+
+        for (u32 attempt=0; attempt<120000 && !got_offer; attempt++) {
+            u32 rlen = 0;
+            int rc = g_net_rx_poll(index, g_rxbuf, sizeof(g_rxbuf), &rlen);
+            if (rc == 0 && rlen > 0) {
+                rx_frames++;
+                int t = dhcp_parse(g_rxbuf, rlen, &offer_ip, &offer_srv, &offer_router, &offer_dns);
+                if (t == 2) { got_offer = 1; break; }
+            }
+            delay_spin(300);
         }
-        delay_spin(200);
     }
     log_hex("[netman] DHCP rx frames seen=", rx_frames);
     if (!got_offer) { logl("[netman] DHCP: no OFFER received"); return -2; }
     log_ipv4("[netman] DHCP OFFER ip=", offer_ip);
 
-    logl("[netman] DHCP: sending REQUEST");
-    if (dhcp_send(index, 3, offer_ip, offer_srv) != 0) { logl("[netman] DHCP: REQUEST tx failed"); return -3; }
-
-    u32 ack_ip=0, ack_srv=0;
+    u32 ack_ip=0, ack_srv=0, ack_router=0, ack_dns=0;
     int got_ack=0;
-    for (u32 attempt=0; attempt<40000 && !got_ack; attempt++) {
-        u32 rlen=0;
-        int rc = g_net_rx_poll(index, g_rxbuf, sizeof(g_rxbuf), &rlen);
-        if (rc == 0 && rlen > 0) {
-            int t = dhcp_parse(g_rxbuf, rlen, &ack_ip, &ack_srv);
-            if (t == 5) { got_ack=1; break; }        /* ACK */
+    for (u32 round=0; round<4 && !got_ack; round++) {
+        logl("[netman] DHCP: sending REQUEST");
+        if (dhcp_send(index, 3, offer_ip, offer_srv) != 0) { logl("[netman] DHCP: REQUEST tx failed"); return -3; }
+
+        for (u32 attempt=0; attempt<120000 && !got_ack; attempt++) {
+            u32 rlen=0;
+            int rc = g_net_rx_poll(index, g_rxbuf, sizeof(g_rxbuf), &rlen);
+            if (rc == 0 && rlen > 0) {
+                int t = dhcp_parse(g_rxbuf, rlen, &ack_ip, &ack_srv, &ack_router, &ack_dns);
+                if (t == 5) { got_ack=1; break; }
+            }
+            delay_spin(300);
         }
-        delay_spin(200);
     }
     if (!got_ack) { logl("[netman] DHCP: no ACK received"); return -4; }
 
     g_lease_ip = ack_ip; g_server_ip = ack_srv;
+    g_gateway_ip = ack_router ? ack_router : (offer_router ? offer_router : 0x0a000202u);
+    g_dns_ip = ack_dns ? ack_dns : (offer_dns ? offer_dns : g_gateway_ip);
     log_ipv4("[netman] DHCP ACK, leased ip=", ack_ip);
     log_ipv4("[netman] DHCP server=", ack_srv);
+    log_ipv4("[netman] gateway=", g_gateway_ip);
+    log_ipv4("[netman] dns=", g_dns_ip);
     logl("[netman] DHCP: connected");
     return 0;
 }
 
-static void query_netdevs(void) {
+static int arp_resolve_gateway(u32 index, u32 target_ip, u8 out_mac[6]) {
+    memset_nm(g_pktbuf, 0, sizeof(g_pktbuf));
+    u8 *p = g_pktbuf;
+    for (int i=0;i<6;i++) p[i]=0xff;
+    for (int i=0;i<6;i++) p[6+i]=g_local_mac[i];
+    p[12]=0x08; p[13]=0x06;
+    u8 *a = p + 14;
+    a[0]=0x00; a[1]=0x01;
+    a[2]=0x08; a[3]=0x00;
+    a[4]=6; a[5]=4;
+    a[6]=0x00; a[7]=0x01;
+    for (int i=0;i<6;i++) a[8+i]=g_local_mac[i];
+    a[14]=(u8)(g_lease_ip>>24); a[15]=(u8)(g_lease_ip>>16); a[16]=(u8)(g_lease_ip>>8); a[17]=(u8)g_lease_ip;
+    a[24]=(u8)(target_ip>>24); a[25]=(u8)(target_ip>>16); a[26]=(u8)(target_ip>>8); a[27]=(u8)target_ip;
+    logl("[netman] ARP: who-has gateway");
+    if (g_net_tx(index, g_pktbuf, 60) != 0) return -1;
+    for (u32 attempt=0; attempt<160000; attempt++) {
+        u32 rlen=0;
+        int rc = g_net_rx_poll(index, g_rxbuf, sizeof(g_rxbuf), &rlen);
+        if (rc == 0 && rlen >= 42 && g_rxbuf[12]==0x08 && g_rxbuf[13]==0x06) {
+            const u8 *r = g_rxbuf + 14;
+            u16 op = (u16)((r[6]<<8)|r[7]);
+            u32 spa = ((u32)r[14]<<24)|((u32)r[15]<<16)|((u32)r[16]<<8)|r[17];
+            if (op == 2 && spa == target_ip) {
+                for (int i=0;i<6;i++) out_mac[i]=r[8+i];
+                logl("[netman] ARP: gateway resolved");
+                return 0;
+            }
+        }
+        delay_spin(300);
+    }
+    logl("[netman] ARP: timeout");
+    return -2;
+}
+
+static int dns_query_a(u32 index, const u8 dst_mac[6], u32 dns_ip, const char *name, u32 *out_ip) {
+    memset_nm(g_pktbuf, 0, sizeof(g_pktbuf));
+    u8 *p = g_pktbuf;
+    for (int i=0;i<6;i++) p[i]=dst_mac[i];
+    for (int i=0;i<6;i++) p[6+i]=g_local_mac[i];
+    p[12]=0x08; p[13]=0x00;
+    u8 *ip = p + 14;
+    u8 *udp = ip + 20;
+    u8 *dns = udp + 8;
+    dns[0]=0x12; dns[1]=0x34;
+    dns[2]=0x01; dns[3]=0x00;
+    dns[4]=0x00; dns[5]=0x01;
+    u32 q=12;
+    const char *s=name;
+    while (*s) {
+        const char *dot=s;
+        u32 l=0;
+        while (dot[l] && dot[l] != '.') l++;
+        dns[q++]=(u8)l;
+        for (u32 i=0;i<l;i++) dns[q++]=(u8)dot[i];
+        s = dot + l;
+        if (*s=='.') s++;
+    }
+    dns[q++]=0;
+    dns[q++]=0x00; dns[q++]=0x01;
+    dns[q++]=0x00; dns[q++]=0x01;
+    u32 dns_len=q;
+    u32 udp_len=8+dns_len;
+    u32 ip_len=20+udp_len;
+    udp[0]=0xC0; udp[1]=0x01;
+    udp[2]=0x00; udp[3]=0x35;
+    udp[4]=(u8)(udp_len>>8); udp[5]=(u8)udp_len;
+    udp[6]=0; udp[7]=0;
+    ip[0]=0x45; ip[1]=0;
+    ip[2]=(u8)(ip_len>>8); ip[3]=(u8)ip_len;
+    ip[4]=0x12; ip[5]=0x34; ip[6]=0; ip[7]=0;
+    ip[8]=64; ip[9]=17; ip[10]=0; ip[11]=0;
+    ip[12]=(u8)(g_lease_ip>>24); ip[13]=(u8)(g_lease_ip>>16); ip[14]=(u8)(g_lease_ip>>8); ip[15]=(u8)g_lease_ip;
+    ip[16]=(u8)(dns_ip>>24); ip[17]=(u8)(dns_ip>>16); ip[18]=(u8)(dns_ip>>8); ip[19]=(u8)dns_ip;
+    u16 ipck=ip_checksum(ip,20); ip[10]=(u8)(ipck>>8); ip[11]=(u8)ipck;
+    u16 udpck=udp_checksum_ipv4(ip,udp,udp_len); udp[6]=(u8)(udpck>>8); udp[7]=(u8)udpck;
+    logl("[netman] DNS: query example.com A");
+    if (g_net_tx(index, g_pktbuf, 14+ip_len) != 0) return -1;
+    for (u32 attempt=0; attempt<240000; attempt++) {
+        u32 rlen=0;
+        int rc=g_net_rx_poll(index,g_rxbuf,sizeof(g_rxbuf),&rlen);
+        if (rc==0 && rlen>=14+20+8+12 && g_rxbuf[12]==0x08 && g_rxbuf[13]==0x00) {
+            const u8 *rip=g_rxbuf+14;
+            u32 ihl=(rip[0]&0xf)*4;
+            if ((rip[0]>>4)!=4 || rip[9]!=17 || rlen<14+ihl+8+12) { delay_spin(300); continue; }
+            const u8 *rudp=rip+ihl;
+            if (rudp[2]!=0xC0 || rudp[3]!=0x01) { delay_spin(300); continue; }
+            const u8 *rdns=rudp+8;
+            if (rdns[0]!=0x12 || rdns[1]!=0x34) { delay_spin(300); continue; }
+            u16 an=(u16)((rdns[6]<<8)|rdns[7]);
+            u32 off=12;
+            while (off<rlen && rdns[off]) off += 1 + rdns[off];
+            off += 5;
+            for (u16 ai=0; ai<an && off+12<=rlen; ai++) {
+                if ((rdns[off]&0xC0)==0xC0) off += 2; else { while (off<rlen && rdns[off]) off += 1 + rdns[off]; off++; }
+                if (off+10>rlen) break;
+                u16 typ=(u16)((rdns[off]<<8)|rdns[off+1]);
+                u16 cls=(u16)((rdns[off+2]<<8)|rdns[off+3]);
+                u16 rdlen=(u16)((rdns[off+8]<<8)|rdns[off+9]);
+                off += 10;
+                if (typ==1 && cls==1 && rdlen==4 && off+4<=rlen) {
+                    *out_ip=((u32)rdns[off]<<24)|((u32)rdns[off+1]<<16)|((u32)rdns[off+2]<<8)|rdns[off+3];
+                    log_ipv4("[netman] DNS example.com=", *out_ip);
+                    return 0;
+                }
+                off += rdlen;
+            }
+        }
+        delay_spin(300);
+    }
+    logl("[netman] DNS: timeout");
+    return -2;
+}
+
+static int network_full_connect(u32 index, const u8 mac[6]) {
+    int rc = dhcp_run(index, mac);
+    log_hex("[netman] DHCP final rc=", (u64)(i8)rc);
+    if (rc != 0) return rc;
+    u8 gw_mac[6];
+    rc = arp_resolve_gateway(index, g_gateway_ip, gw_mac);
+    log_hex("[netman] ARP final rc=", (u64)(i8)rc);
+    if (rc != 0) return rc;
+    u32 resolved=0;
+    rc = dns_query_a(index, gw_mac, g_dns_ip, "example.com", &resolved);
+    log_hex("[netman] DNS final rc=", (u64)(i8)rc);
+    return rc;
+}
+
+static void query_netdevs(const net_conf *cfg) {
     if (!g_net_device_count || !g_net_device_info) {
         logl("[netman] net API not ready; configuration staged only");
         return;
     }
 
     u32 count = g_net_device_count();
+    int dhcp_done = 0;
+    int dhcp_enabled = cfg && !str_eq(cfg->mode, "disabled") && !str_eq(cfg->mode, "off") && !str_eq(cfg->ip, "static");
     log_hex("[netman] netdev_count=", count);
     for (u32 i=0;i<count;i++) {
         nm_net_device_info info;
@@ -425,12 +602,15 @@ static void query_netdevs(void) {
         if (info.flags & DKM_NET_F_TX_READY) logl("[netman]   tx=ready");
         if (info.flags & DKM_NET_F_RX_READY) logl("[netman]   rx=ready");
 
-        /* 对第一个具备收发能力且 link up 的接口尝试真实 DHCP 连接 */
-        if ((info.flags & (DKM_NET_F_LINK_UP|DKM_NET_F_TX_READY|DKM_NET_F_RX_READY))
+        if (!dhcp_done && dhcp_enabled &&
+            (info.flags & (DKM_NET_F_LINK_UP|DKM_NET_F_TX_READY|DKM_NET_F_RX_READY))
             == (DKM_NET_F_LINK_UP|DKM_NET_F_TX_READY|DKM_NET_F_RX_READY)) {
-            dhcp_run(i, info.mac);
+            int drc = network_full_connect(i, info.mac);
+            log_hex("[netman] network final rc=", (u64)(i8)drc);
+            dhcp_done = 1;
         }
     }
+    if (!dhcp_enabled) logl("[netman] DHCP skipped by config");
 }
 
 __attribute__((visibility("default")))
@@ -465,7 +645,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
     memset_nm(&cfg, 0, sizeof(cfg));
     parse_conf(g_conf, &cfg);
     log_cfg(&cfg);
-    if (cfg.mode[0]=='d' && cfg.mode[1]=='i') logl("[netman] networking disabled by config");
-    query_netdevs();
+    if (str_eq(cfg.mode, "disabled") || str_eq(cfg.mode, "off")) {
+        logl("[netman] networking disabled by config");
+    }
+    query_netdevs(&cfg);
     logl("[netman] done");
 }

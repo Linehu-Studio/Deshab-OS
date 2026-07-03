@@ -549,9 +549,28 @@ if (-not (Test-Path $NetmanOutput)) {
 }
 Write-Host "[build] netman Output: $NetmanOutput"
 
+$ShellDir = Join-Path $Root 'CODE\shell'
+$ShellOutput = Join-Path $SystemDir 'system\deshab64\shell.elf'
+
+Write-Host '[build] Building shell.elf...'
+try {
+    & $make -C "$ShellDir" -f MAKEFILE "CC=$clang" "LD=$lld"
+    if ($LASTEXITCODE -ne 0) {
+        throw "make shell failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+}
+
+if (-not (Test-Path $ShellOutput)) {
+    throw "shell build did not produce $ShellOutput"
+}
+Write-Host "[build] shell Output: $ShellOutput"
+
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir 'driver\net\ath9k.drv')
 
 Write-Host "[build] Output: $Output"
 Write-Host "[build] DSK Output: $DskOutput"

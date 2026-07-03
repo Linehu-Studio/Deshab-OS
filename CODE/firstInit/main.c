@@ -99,106 +99,26 @@ static u32 blend(u32 c1, u32 c2, u32 a) {
     return 0xFF000000|(b<<16)|(g<<8)|r;
 }
 
-/* 8x8 font for ASCII */
-static const u8 font[95][8] = {
-    {0,0,0,0,0,0,0,0},{0x18,0x3c,0x3c,0x18,0x18,0,0x18,0},  /* ! */
-    {0x6c,0x6c,0,0,0,0,0,0},{0x6c,0x6c,0xfe,0x6c,0xfe,0x6c,0x6c,0},  /* # */
-    {0x18,0x7e,0xc0,0x7c,0x6,0xfc,0x18,0},{0,0xc6,0xcc,0x18,0x30,0x66,0xc6,0}, /* $ % */
-    {0x38,0x6c,0x38,0x76,0xdc,0xcc,0x76,0},{0x18,0x18,0x30,0,0,0,0,0}, /* & ' */
-    {0xc,0x18,0x30,0x30,0x30,0x18,0xc,0},{0x30,0x18,0xc,0xc,0xc,0x18,0x30,0}, /* ( ) */
-    {0,0x66,0x3c,0xff,0x3c,0x66,0,0},{0,0x18,0x18,0x7e,0x18,0x18,0,0}, /* * + */
-    {0,0,0,0,0,0x18,0x18,0x30},{0,0,0,0x7e,0,0,0,0},{0,0,0,0,0,0x18,0x18,0}, /* , - . */
-    {0x6,0xc,0x18,0x30,0x60,0xc0,0x80,0}, /* / */
-    {0x7c,0xc6,0xce,0xde,0xf6,0xe6,0x7c,0},{0x18,0x38,0x18,0x18,0x18,0x18,0x7e,0}, /* 0 1 */
-    {0x7c,0xc6,0x6,0xc,0x30,0x60,0xfe,0},{0x7c,0xc6,0x6,0x3c,0x6,0xc6,0x7c,0}, /* 2 3 */
-    {0x1c,0x3c,0x6c,0xcc,0xfe,0xc,0x1e,0},{0xfe,0xc0,0xfc,0x6,0x6,0xc6,0x7c,0}, /* 4 5 */
-    {0x38,0x60,0xc0,0xfc,0xc6,0xc6,0x7c,0},{0xfe,0xc6,0xc,0x18,0x30,0x30,0x30,0}, /* 6 7 */
-    {0x7c,0xc6,0xc6,0x7c,0xc6,0xc6,0x7c,0},{0x7c,0xc6,0xc6,0x7e,0x6,0xc,0x78,0}, /* 8 9 */
-    {0,0x18,0x18,0,0,0x18,0x18,0},{0,0x18,0x18,0,0,0x18,0x18,0x30}, /* : ; */
-    {0x6,0xc,0x18,0x30,0x18,0xc,0x6,0},{0,0,0x7e,0,0,0x7e,0,0}, /* < = */
-    {0x60,0x30,0x18,0xc,0x18,0x30,0x60,0},{0x7c,0xc6,0xc,0x18,0x18,0,0x18,0}, /* > ? */
-    {0x7c,0xc6,0xde,0xde,0xde,0xc0,0x78,0}, /* @ */
-    {0x38,0x6c,0xc6,0xfe,0xc6,0xc6,0xc6,0},{0xfc,0x66,0x66,0x7c,0x66,0x66,0xfc,0}, /* A B */
-    {0x3c,0x66,0xc0,0xc0,0xc0,0x66,0x3c,0},{0xf8,0x6c,0x66,0x66,0x66,0x6c,0xf8,0}, /* C D */
-    {0xfe,0x62,0x68,0x78,0x68,0x62,0xfe,0},{0xfe,0x62,0x68,0x78,0x68,0x60,0xf0,0}, /* E F */
-    {0x3c,0x66,0xc0,0xc0,0xce,0x66,0x3e,0},{0xc6,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0}, /* G H */
-    {0x3c,0x18,0x18,0x18,0x18,0x18,0x3c,0},{0x1e,0xc,0xc,0xc,0xcc,0xcc,0x78,0}, /* I J */
-    {0xe6,0x66,0x6c,0x78,0x6c,0x66,0xe6,0},{0xf0,0x60,0x60,0x60,0x62,0x66,0xfe,0}, /* K L */
-    {0xc6,0xee,0xfe,0xfe,0xd6,0xc6,0xc6,0},{0xc6,0xe6,0xf6,0xde,0xce,0xc6,0xc6,0}, /* M N */
-    {0x7c,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},{0xfc,0x66,0x66,0x7c,0x60,0x60,0xf0,0}, /* O P */
-    {0x7c,0xc6,0xc6,0xc6,0xc6,0xce,0x7c,0xe},{0xfc,0x66,0x66,0x7c,0x6c,0x66,0xe6,0}, /* Q R */
-    {0x7c,0xc6,0xe0,0x78,0xe,0xc6,0x7c,0},{0x7e,0x7e,0x5a,0x18,0x18,0x18,0x3c,0}, /* S T */
-    {0xc6,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},{0xc6,0xc6,0xc6,0xc6,0xc6,0x6c,0x38,0}, /* U V */
-    {0xc6,0xc6,0xc6,0xd6,0xd6,0xfe,0x6c,0},{0xc6,0xc6,0x6c,0x38,0x38,0x6c,0xc6,0}, /* W X */
-    {0x66,0x66,0x66,0x3c,0x18,0x18,0x3c,0},{0xfe,0xc6,0x8c,0x18,0x32,0x66,0xfe,0}, /* Y Z */
-    {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},  /* [ \ */
-    {0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0},  /* ] ^ */
-    {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0},  /* _ */
-    {0,0,0,0,0,0,0,0},  /* ` */
-    /* a-z lowercase — full-height (no top blank rows) so they scale like uppercase */
-    {0x7c,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0},  /* a */
-    {0xc6,0xc6,0xc6,0xfc,0xc6,0xc6,0xfc,0},  /* b */
-    {0x7c,0xc6,0xc0,0xc0,0xc0,0xc6,0x7c,0},  /* c */
-    {0x06,0x06,0x06,0xfc,0xc6,0xc6,0xfc,0},  /* d */
-    {0x7c,0xc6,0xfe,0xc0,0xfc,0xc0,0xc0,0},  /* e */
-    {0x7c,0xc6,0xc0,0xf8,0xc0,0xc0,0xc0,0},  /* f */
-    {0x7c,0xc6,0xc0,0xde,0xc6,0xc6,0x7c,0},  /* g */
-    {0xc6,0xc6,0xc6,0xfe,0xc6,0xc6,0xc6,0},  /* h */
-    {0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0},  /* i */
-    {0x06,0x06,0x06,0xc6,0xc6,0xc6,0x7c,0},  /* j */
-    {0xc6,0xcc,0xd8,0xf0,0xd8,0xcc,0xc6,0},  /* k */
-    {0xc0,0xc0,0xc0,0xc0,0xc0,0xc0,0xfe,0},  /* l */
-    {0xc6,0xee,0xfe,0xfe,0xc6,0xc6,0xc6,0},  /* m */
-    {0xc6,0xe6,0xf6,0xde,0xce,0xc6,0xc6,0},  /* n */
-    {0x7c,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},  /* o */
-    {0xc6,0xc6,0xc6,0xfc,0xc0,0xc0,0xc0,0},  /* p */
-    {0x7c,0xc6,0xc6,0xce,0x7c,0x06,0x06,0},  /* q */
-    {0xc6,0xc6,0xcc,0xf8,0xcc,0xc6,0xc6,0},  /* r */
-    {0x7c,0xc0,0x7c,0x06,0xc6,0xc6,0x7c,0},  /* s */
-    {0x18,0x18,0x7e,0x18,0x18,0x18,0x18,0},  /* t */
-    {0xc6,0xc6,0xc6,0xc6,0xc6,0xc6,0x7c,0},  /* u */
-    {0xc6,0xc6,0xc6,0xc6,0xc6,0x6c,0x38,0},  /* v */
-    {0xc6,0xc6,0xd6,0xfe,0xee,0xc6,0xc6,0},  /* w */
-    {0xc6,0xc6,0x6c,0x38,0x6c,0xc6,0xc6,0},  /* x */
-    {0xc6,0xc6,0xc6,0x7c,0x06,0x06,0x7c,0},  /* y */
-    {0xfe,0x0c,0x18,0x30,0x60,0xc0,0xfe,0},  /* z */
-};
-
-/* ASCII text — thin 8x8 → 10x16, preserves case, draws foreground only (no bg fill) */
-#define ASCII_W 10
-#define ASCII_H 16
-#define ASCII_STEP 12
+/* ASCII font — Consolas 18px grayscale, pre-rendered from C:\Windows\Fonts\consola.ttf */
+#include "ascii_bitmaps.c"
+/* ASCII text — Consolas 18px grayscale, alpha-blend rendered (skips transparent pixels) */
+#define ASCII_W  11
+#define ASCII_H  18
+#define ASCII_STEP 11
 static void fb_char(u32 *fb, u32 ch, i64 x, i64 y, u32 fg, u32 bg) {
-    u32 idx = ch >= ' ' && ch <= 'z' ? (u32)(ch-' ') : 0;
-    const u8 *g = font[idx];
-    u8 pat[8][8];
-    for (i64 r=0; r<8; r++) {
-        u8 row = g[r];
-        for (i64 c=0; c<8; c++) {
-            pat[r][c] = (row & (0x80>>c)) ? 1 : 0;
-        }
-    }
-    for (i64 sy=0; sy<ASCII_H; sy++) {
-        i64 yy = y + sy;
+    if (ch < ' ' || ch > '~') ch = ' ';
+    u32 idx = (u32)(ch - ' ');
+    const u8 *g = g_ascii[idx];
+    for (i64 r=0; r<ASCII_H; r++) {
+        i64 yy = y + r;
         if (yy < 0 || (u64)yy >= fb_h) continue;
         u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
-        i64 src_y = sy * 7 / (ASCII_H - 1);
-        if (src_y > 7) src_y = 7;
-        for (i64 sx=0; sx<ASCII_W; sx++) {
-            i64 src_x = sx * 7 / (ASCII_W - 1);
-            if (src_x > 7) src_x = 7;
-            int on = pat[src_y][src_x];
-            int edge = 0;
-            if (!on) {
-                if (src_x > 0 && pat[src_y][src_x-1]) edge = 1;
-                if (src_x < 7 && pat[src_y][src_x+1]) edge = 1;
-                if (src_y > 0 && pat[src_y-1][src_x]) edge = 1;
-                if (src_y < 7 && pat[src_y+1][src_x]) edge = 1;
-                if (!edge) continue;
-            }
-            i64 xx = x + sx;
+        for (i64 c=0; c<ASCII_W; c++) {
+            u32 a = g[r * ASCII_W + c];
+            if (a == 0) continue;
+            i64 xx = x + c;
             if (xx < 0 || (u64)xx >= fb_w) continue;
-            line[(u64)xx] = on ? fg : blend(bg, fg, 72);
+            line[(u64)xx] = (a == 255) ? fg : blend(bg, fg, a);
         }
     }
 }
@@ -352,7 +272,7 @@ static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *
     char out[64]; int i=0;
     while(value[i] && i<60) { out[i] = mask ? '*' : value[i]; i++; }
     out[i]=0;
-    if (out[0]) fb_text(fb, out, x+14, y+(h-16)/2, fg, fill);
+    if (out[0]) fb_text(fb, out, x+14, y+(h-ASCII_H)/2, fg, fill);
     if (active) {
         i64 cx2 = x + 14 + i * ASCII_STEP;
         fill_rect(fb, cx2, y+10, 2, h-20, fg);
@@ -704,43 +624,202 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
 }
 
 typedef struct {
-    int mode;
-    int device;
-    int ip;
-    int dns;
+    int selected;
+    int connected;
+    char ssid[32];
+    char password[64];
 } setup_net;
 
-static const char *net_value(int row, int val) {
-    if (row == 0) return val == 0 ? "Disabled" : (val == 1 ? "DHCP" : "Manual");
-    if (row == 1) return val == 0 ? "Auto" : (val == 1 ? "e1000" : "virtio-net");
-    if (row == 2) return val ? "Manual" : "Auto DHCP";
-    if (row == 3) return val ? "Manual DNS" : "Auto DNS";
-    return "";
+/* UI 显示行数（固定 4 行布局）；真实扫描结果数由 g_wifi_scan_count 决定。 */
+#define WIFI_SCAN_COUNT 4
+#define WIFI_MAX_RESULTS 8
+
+/* 真实 WiFi 扫描结果（来自 ath9k 驱动通过 kernel_api.net.scan_* 查询）。 */
+static char g_wifi_ssids[WIFI_MAX_RESULTS][34];
+static char g_wifi_meta[WIFI_MAX_RESULTS][20];
+static int  g_wifi_scan_count;
+static int  g_wifi_scan_tried;  /* 是否已尝试查询扫描结果 */
+static int  g_no_wireless_device;  /* 检测到无无线设备时跳过 WiFi 页面 */
+
+/* dkm_net_api 函数指针类型（通过偏移访问 kernel_api.net）。 */
+typedef u32  (*net_device_count_fn)(void);
+typedef int  (*net_device_info_fn)(u32 index, void *out);
+typedef int  (*net_scan_start_fn)(u32 index);
+typedef int  (*net_scan_count_fn)(u32 index);
+typedef int  (*net_scan_result_fn)(u32 index, u32 n, void *out);
+typedef int  (*net_is_wireless_fn)(u32 index);
+
+/* dkm_net_scan_result 布局（须与 UTSM/include/utsm/net.h 一致）。 */
+typedef struct {
+    char ssid[33];
+    u8 bssid[6];
+    u8 channel;
+    i8 rssi;
+    u8 security;
+} net_scan_result;
+
+#define DKM_NET_SEC_OPEN 0
+#define DKM_NET_SEC_WEP  1
+#define DKM_NET_SEC_WPA  2
+#define DKM_NET_SEC_WPA2 3
+#define DKM_NET_SEC_WPA3 4
+
+/* 把加密类型 + RSSI 转为 "WPA2 strong" 这种简短描述。 */
+static void wifi_meta_str(char *out, u32 cap, u8 security, i8 rssi) {
+    if (!cap) return;
+    const char *sec;
+    switch (security) {
+        case DKM_NET_SEC_WPA2: sec = "WPA2"; break;
+        case DKM_NET_SEC_WPA:  sec = "WPA "; break;
+        case DKM_NET_SEC_WPA3: sec = "WPA3"; break;
+        case DKM_NET_SEC_WEP:  sec = "WEP "; break;
+        default:               sec = "Open"; break;
+    }
+    /* RSSI 分级：>=-50 strong, -51..-65 good, -66..-75 weak, else very weak */
+    const char *q;
+    i8 r = rssi;
+    if (r >= -50) q = "strong";
+    else if (r >= -65) q = "good";
+    else if (r >= -75) q = "weak";
+    else q = "very weak";
+    /* 手动拼接 "SEC  quality" */
+    u32 i = 0;
+    while (sec[i] && i + 1 < cap) { out[i] = sec[i]; i++; }
+    while (i < 5 && i + 1 < cap) { out[i++] = ' '; }
+    u32 j = 0;
+    while (q[j] && i + 1 < cap) { out[i++] = q[j++]; }
+    out[i] = 0;
 }
 
-static int net_get(const setup_net *n, int row) {
-    if (row == 0) return n->mode;
-    if (row == 1) return n->device;
-    if (row == 2) return n->ip;
-    if (row == 3) return n->dns;
-    return 0;
+/* 通过 kernel_api 查询无线设备并读取扫描结果。
+ * kernel_api 偏移布局：
+ *   +0x48 net_api 指针
+ * net_api 偏移布局（追加 scan 接口后）：
+ *   +0  register_device, +8  device_count, +16 device_info,
+ *   +24 tx, +32 rx_poll, +40 scan_start, +48 scan_count,
+ *   +56 scan_result, +64 is_wireless
+ */
+static void wifi_query_scan(u64 kernel_api) {
+    g_wifi_scan_tried = 1;
+    g_wifi_scan_count = 0;
+    if (!kernel_api) { logl("[FirstInit] no kernel_api, wifi scan skipped"); return; }
+    u64 net_api = *(u64 *)(kernel_api + 0x48);
+    if (!net_api) { logl("[FirstInit] no net_api, wifi scan skipped"); return; }
+    net_device_count_fn dcount = (net_device_count_fn)*(u64 *)(net_api + 8);
+    net_scan_start_fn   sstart = (net_scan_start_fn)*(u64 *)(net_api + 40);
+    net_scan_count_fn   scount = (net_scan_count_fn)*(u64 *)(net_api + 48);
+    net_scan_result_fn  sresult = (net_scan_result_fn)*(u64 *)(net_api + 56);
+    net_is_wireless_fn  iswl = (net_is_wireless_fn)*(u64 *)(net_api + 64);
+    if (!dcount || !iswl || !scount || !sresult) {
+        logl("[FirstInit] net scan api incomplete");
+        return;
+    }
+    u32 ndev = dcount();
+    /* 串口日志：设备数 */
+    {
+        char b[24]; int p=0;
+        const char *s="[FirstInit] net devices=";
+        while(s[p]) b[p]=s[p], p++;
+        b[p++]='0'+(ndev/10); b[p++]='0'+(ndev%10); b[p]=0;
+        logl(b);
+    }
+    /* 找第一个无线设备 */
+    int wifi_idx = -1;
+    for (u32 i = 0; i < ndev; i++) {
+        int rc = iswl(i);
+        if (rc == 1) { wifi_idx = (int)i; break; }
+    }
+    if (wifi_idx < 0) {
+        logl("[FirstInit] no wireless device found");
+        g_no_wireless_device = 1;
+        return;
+    }
+    /* ath9k 驱动在 driver_init 时已同步扫描，但保险起见若 count=0 再触发一次 */
+    int count = scount((u32)wifi_idx);
+    if (count <= 0 && sstart) {
+        logl("[FirstInit] triggering wifi scan...");
+        int rc = sstart((u32)wifi_idx);
+        {
+            char b[32]; int p=0;
+            const char *s="[FirstInit] scan_start rc=";
+            while(s[p]) b[p]=s[p], p++;
+            if (rc < 0) { b[p++]='-'; b[p++]='0'+(-rc); } else { b[p++]='0'+rc; }
+            b[p]=0; logl(b);
+        }
+        count = scount((u32)wifi_idx);
+    }
+    if (count <= 0) {
+        logl("[FirstInit] wifi scan: no results");
+        return;
+    }
+    if (count > WIFI_MAX_RESULTS) count = WIFI_MAX_RESULTS;
+    /* 读取每个扫描结果 */
+    for (int i = 0; i < count; i++) {
+        net_scan_result r;
+        for (u32 k = 0; k < sizeof(r); k++) ((u8 *)&r)[k] = 0;
+        int rc = sresult((u32)wifi_idx, (u32)i, &r);
+        if (rc != 0) continue;
+        /* 拷贝 SSID */
+        u32 j = 0;
+        while (r.ssid[j] && j + 1 < sizeof(g_wifi_ssids[i])) {
+            g_wifi_ssids[i][j] = r.ssid[j]; j++;
+        }
+        g_wifi_ssids[i][j] = 0;
+        /* 生成 meta 字符串 */
+        wifi_meta_str(g_wifi_meta[i], sizeof(g_wifi_meta[i]), r.security, r.rssi);
+        g_wifi_scan_count++;
+    }
+    {
+        char b[32]; int p=0;
+        const char *s="[FirstInit] wifi scan results=";
+        while(s[p]) b[p]=s[p], p++;
+        b[p++]='0'+(g_wifi_scan_count/10); b[p++]='0'+(g_wifi_scan_count%10); b[p]=0;
+        logl(b);
+    }
 }
 
-static void net_toggle(setup_net *n, int row) {
-    if (row == 0) n->mode = (n->mode + 1) % 3;
-    else if (row == 1) n->device = (n->device + 1) % 3;
-    else if (row == 2) n->ip ^= 1;
-    else if (row == 3) n->dns ^= 1;
+static void net_copy(char *dst, u32 cap, const char *src) {
+    if (!cap) return;
+    u32 i = 0;
+    while (src[i] && i + 1 < cap) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = 0;
 }
 
-static void draw_network_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, u32 fg) {
+static void net_select(setup_net *net, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= WIFI_SCAN_COUNT) idx = WIFI_SCAN_COUNT - 1;
+    if (net->selected != idx) {
+        net->password[0] = 0;
+        net->connected = 0;
+    }
+    net->selected = idx;
+    if (idx < g_wifi_scan_count) {
+        net_copy(net->ssid, sizeof(net->ssid), g_wifi_ssids[idx]);
+    } else {
+        net->ssid[0] = 0;
+    }
+}
+
+static void draw_wifi_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, u32 fg) {
     u32 card = CARD_BG;
-    i64 ry = card_y + 150 + (i64)row * 88;
-    const u8 *label = g_txt_net_mode; i64 lw = g_txt_net_mode_w, lh = g_txt_net_mode_h;
-    if (row == 1) { label = g_txt_net_device; lw = g_txt_net_device_w; lh = g_txt_net_device_h; }
-    else if (row == 2) { label = g_txt_net_ip; lw = g_txt_net_ip_w; lh = g_txt_net_ip_h; }
-    else if (row == 3) { label = g_txt_net_dns; lw = g_txt_net_dns_w; lh = g_txt_net_dns_h; }
-    draw_option_row(fb, card_x+40, ry, 820, 42, label, lw, lh, net_value(row, net_get(net, row)), active==row, fg, card);
+    i64 x = card_x + 40;
+    i64 y = card_y + 132 + (i64)row * 64;
+    u32 fill = active == row ? 0xFFFFFFFF : (net->selected == row ? 0xFFDCECF8 : INPUT_BG);
+    fill_rounded_rect(fb, x, y, 390, 50, 9, fill);
+    stroke_rounded_rect(fb, x, y, 390, 50, 9, 1, active == row ? 0xFF7FA7C8 : card);
+    fb_text(fb, net->selected == row ? ">" : " ", x + 12, y + 16, fg, fill);
+    if (row < g_wifi_scan_count) {
+        fb_text(fb, g_wifi_ssids[row], x + 42, y + 8, fg, fill);
+        fb_text(fb, g_wifi_meta[row], x + 42, y + 28, 0xFF7F97AC, fill);
+    } else {
+        /* 无扫描结果时的占位行 */
+        const char *placeholder = (g_wifi_scan_tried && g_wifi_scan_count == 0)
+            ? "No networks found" : "(empty)";
+        fb_text(fb, placeholder, x + 42, y + 16, 0xFF9AACC0, fill);
+    }
 }
 
 static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int active, i64 mx, i64 my, u32 bg, u32 fg) {
@@ -749,23 +828,42 @@ static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net,
     fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_network_title, g_txt_network_title_w, g_txt_network_title_h, card_x+40, card_y+40, fg, card, 255);
-    for (int r=0; r<4; r++) draw_network_row(fb, card_x, card_y, net, r, active, fg);
-    fb_bitmap_alpha(fb, g_txt_net_hint, g_txt_net_hint_w, g_txt_net_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
-    cursor_draw(fb, mx, my);
-}
+    fb_text(fb, "Choose a network", card_x + 40, card_y + 88, 0xFF7F97AC, card);
+    for (int r=0; r<WIFI_SCAN_COUNT; r++) draw_wifi_row(fb, card_x, card_y, net, r, active, fg);
 
-static void redraw_network_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, i64 mx, i64 my, u32 fg) {
-    u32 card = CARD_BG;
-    i64 ry = card_y + 150 + (i64)row * 88;
-    cursor_erase(fb);
-    fill_rect(fb, card_x + 36, ry - 8, 832, 58, card);
-    draw_network_row(fb, card_x, card_y, net, row, active, fg);
+    fill_rounded_rect(fb, card_x + 470, card_y + 120, 390, 260, 12, INPUT_BG);
+    stroke_rounded_rect(fb, card_x + 470, card_y + 120, 390, 260, 12, 1, 0xFFD2E3F0);
+    fb_text(fb, "Highlighted network", card_x + 494, card_y + 148, 0xFF7F97AC, INPUT_BG);
+    int preview = active < WIFI_SCAN_COUNT ? active : net->selected;
+    if (preview < g_wifi_scan_count) {
+        fb_text(fb, g_wifi_ssids[preview], card_x + 494, card_y + 182, fg, INPUT_BG);
+        fb_text(fb, g_wifi_meta[preview], card_x + 494, card_y + 210, 0xFF7F97AC, INPUT_BG);
+    } else {
+        fb_text(fb, g_wifi_scan_tried ? "No networks found" : "WiFi not initialized",
+                card_x + 494, card_y + 182, 0xFF9AACC0, INPUT_BG);
+        fb_text(fb, g_wifi_scan_tried ? "Check ath9k driver" : "Run ath9k driver first",
+                card_x + 494, card_y + 210, 0xFF9AACC0, INPUT_BG);
+    }
+    fb_text(fb, "Use Up/Down or click menu", card_x + 494, card_y + 260, 0xFF7F97AC, INPUT_BG);
+    fb_text(fb, "Enter selects highlighted item", card_x + 494, card_y + 288, 0xFF7F97AC, INPUT_BG);
+
+    fb_text(fb, "Password", card_x + 470, card_y + 400, fg, card);
+    draw_rounded_input(fb, card_x + 470, card_y + 430, 390, 44, net->password, 1, fg, card, active == WIFI_SCAN_COUNT);
+    u32 btn = active == WIFI_SCAN_COUNT + 1 ? 0xFFFFFFFF : 0xFFDCECF8;
+    fill_rounded_rect(fb, card_x + 620, card_y + 500, 240, 48, 10, btn);
+    stroke_rounded_rect(fb, card_x + 620, card_y + 500, 240, 48, 10, 1, active == WIFI_SCAN_COUNT + 1 ? 0xFFB6C9DD : card);
+    fb_text(fb, "Connect", card_x + 690, card_y + 516, fg, btn);
+    if (net->connected) fb_text(fb, "Connection profile saved", card_x + 40, card_y + 515, 0xFF4F8A5F, card);
+    else fb_text(fb, "Select SSID, enter password, then Connect", card_x + 40, card_y + 555, 0xFF7F97AC, card);
     cursor_draw(fb, mx, my);
 }
 
 static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i64 *mx, i64 *my, u32 bg, u32 fg) {
-    int active = 0, mcnt = 0, e0 = 0;
+    int active = 0, mcnt = 0, e0 = 0, shift = 0;
     u8 mpkt[3]; u8 prev_btns = 0;
+    int len = 0;
+    while (net->password[len]) len++;
+    net_select(net, net->selected);
     redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
     for (;;) {
         u8 st = inb(0x64);
@@ -787,13 +885,25 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 cursor_draw(fb, *mx, *my);
             }
             if ((btns & 1) && !(prev_btns & 1)) {
-                for (int r=0; r<4; r++) {
-                    i64 ry = card_y + 150 + (i64)r * 88;
-                    if (*mx >= card_x + 260 && *mx < card_x + 860 && *my >= ry && *my < ry + 42) {
-                        int old = active; active = r; net_toggle(net, active);
-                        if (old != active) redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg);
-                        redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg);
+                for (int r=0; r<WIFI_SCAN_COUNT; r++) {
+                    i64 ry = card_y + 132 + (i64)r * 64;
+                    if (*mx >= card_x + 40 && *mx < card_x + 430 && *my >= ry && *my < ry + 50) {
+                        active = r;
+                        net_select(net, r);
+                        len = 0;
+                        redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                     }
+                }
+                if (*mx >= card_x + 470 && *mx < card_x + 860 && *my >= card_y + 430 && *my < card_y + 474) {
+                    active = WIFI_SCAN_COUNT;
+                    redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+                }
+                if (*mx >= card_x + 620 && *mx < card_x + 860 && *my >= card_y + 500 && *my < card_y + 548) {
+                    net->connected = 1;
+                    logl("[FirstInit] wireless profile selected");
+                    redraw_network_card(fb, card_x, card_y, net, WIFI_SCAN_COUNT + 1, *mx, *my, bg, fg);
+                    for (int i=0;i<30;i++) delay_frame();
+                    return;
                 }
             }
             prev_btns = btns;
@@ -801,14 +911,53 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
         }
         u8 sc = data;
         if (sc == 0xE0) { e0 = 1; continue; }
+        if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
+        if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
         if (sc & 0x80) { e0 = 0; continue; }
-        if (e0 && sc == 0x48) { if (active > 0) { int old=active; active--; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); } e0=0; continue; }
-        if (e0 && sc == 0x50) { if (active < 3) { int old=active; active++; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); } e0=0; continue; }
+        if (e0 && sc == 0x48) {
+            if (active > 0) active--;
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+            e0=0; continue;
+        }
+        if (e0 && sc == 0x50) {
+            if (active < WIFI_SCAN_COUNT + 1) active++;
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+            e0=0; continue;
+        }
         e0 = 0;
-        if (sc == 0x39 || sc == 0x4D || sc == 0x4B) { net_toggle(net, active); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); continue; }
-        if (sc == 0x1C) {
-            if (active < 3) { int old=active; active++; redraw_network_row(fb, card_x, card_y, net, old, active, *mx, *my, fg); redraw_network_row(fb, card_x, card_y, net, active, active, *mx, *my, fg); }
-            else return;
+        char c = scan_to_ascii(sc, shift);
+        if (!c) continue;
+        if (c == '\n') {
+            if (active < WIFI_SCAN_COUNT) {
+                net_select(net, active);
+                len = 0;
+                active = WIFI_SCAN_COUNT;
+            } else if (active == WIFI_SCAN_COUNT) {
+                active = WIFI_SCAN_COUNT + 1;
+            } else {
+                net->connected = 1;
+                logl("[FirstInit] wireless profile selected");
+                redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+                for (int i=0;i<30;i++) delay_frame();
+                return;
+            }
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+            continue;
+        }
+        if (c == '\t') {
+            active = (active + 1) % (WIFI_SCAN_COUNT + 2);
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+            continue;
+        }
+        if (active == WIFI_SCAN_COUNT) {
+            if (c == 8) {
+                if (len > 0) net->password[--len] = 0;
+            } else if (len < 63 && c >= 32 && c <= 126) {
+                net->password[len++] = c;
+                net->password[len] = 0;
+            }
+            net->connected = 0;
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
         }
     }
 }
@@ -854,20 +1003,20 @@ static void build_user_conf(const char *pc, const char *user, const char *pass, 
     const char *th0="\ntheme="; for(int i=0;th0[i];i++) conf[p++]=th0[i];
     const char *v4 = prefs->theme ? "dark" : "light"; for(int i=0;v4[i];i++) conf[p++]=v4[i];
     const char *nm="\nnetwork.mode="; for(int i=0;nm[i];i++) conf[p++]=nm[i];
-    const char *nv0 = net->mode == 0 ? "disabled" : (net->mode == 1 ? "dhcp" : "manual"); for(int i=0;nv0[i];i++) conf[p++]=nv0[i];
-    const char *nd="\nnetwork.device="; for(int i=0;nd[i];i++) conf[p++]=nd[i];
-    const char *nv1 = net->device == 0 ? "auto" : (net->device == 1 ? "e1000" : "virtio-net"); for(int i=0;nv1[i];i++) conf[p++]=nv1[i];
-    const char *ni="\nnetwork.ip="; for(int i=0;ni[i];i++) conf[p++]=ni[i];
-    const char *nv2 = net->ip ? "manual" : "dhcp"; for(int i=0;nv2[i];i++) conf[p++]=nv2[i];
-    const char *dns="\nnetwork.dns="; for(int i=0;dns[i];i++) conf[p++]=dns[i];
-    const char *nv3 = net->dns ? "manual" : "auto"; for(int i=0;nv3[i];i++) conf[p++]=nv3[i];
+    const char *nv0 = net->connected ? "wifi" : "disabled"; for(int i=0;nv0[i];i++) conf[p++]=nv0[i];
+    const char *ns="\nnetwork.ssid="; for(int i=0;ns[i];i++) conf[p++]=ns[i];
+    for(int i=0;net->ssid[i]&&p<740;i++) conf[p++]=net->ssid[i];
+    const char *np="\nnetwork.password="; for(int i=0;np[i];i++) conf[p++]=np[i];
+    for(int i=0;net->password[i]&&p<740;i++) conf[p++]=net->password[i];
+    const char *ni="\nnetwork.ip=dhcp"; for(int i=0;ni[i];i++) conf[p++]=ni[i];
+    const char *dns="\nnetwork.dns=auto"; for(int i=0;dns[i];i++) conf[p++]=dns[i];
     conf[p++]='\n';
     /* XOR encrypt buffer with hash-derived stream; real disk write waits for FAT32 write support. */
     for(int i=0;i<p;i++) conf[i]^=hash[i&31];
     logl("[FirstInit] user.conf encrypted in memory (disk write pending)");
 }
 
-__attribute__((visibility("default"), noreturn))
+__attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[FirstInit] boot");
@@ -965,12 +1114,25 @@ void dsk_entry(const dsk_boot_context *ctx) {
     prefs.keyboard = 0;  /* US-QWERTY */
     prefs.theme = 0;     /* Light */
     read_prefs_page(fb, card_x, card_y, &prefs, &mx, &my, bg, fg);
+    /* 查询真实 WiFi 扫描结果（来自 ath9k 驱动通过 kernel_api.net.scan_*） */
+    wifi_query_scan(ctx->dkm_kernel_api);
     setup_net net;
-    net.mode = 0;    /* Disabled */
-    net.device = 0;  /* Auto */
-    net.ip = 0;      /* Auto DHCP */
-    net.dns = 0;     /* Auto DNS */
-    read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+    net.selected = 0;
+    net.connected = 0;
+    net.ssid[0] = 0;
+    net.password[0] = 0;
+    if (g_no_wireless_device) {
+        /* QEMU 或无无线网卡场景：跳过 WiFi 设置页面，network.mode=disabled */
+        logl("[FirstInit] no wireless device, skipping WiFi setup page");
+        net.connected = 0;
+    } else {
+        cursor_bg_valid = 0;
+        cursor_cur_x = -100;
+        cursor_cur_y = -100;
+        logl("[FirstInit] entering wireless setup page");
+        read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+        logl("[FirstInit] wireless setup page returned");
+    }
     build_user_conf(pc, user, pass, &prefs, &net);
 
     cursor_erase(fb);
@@ -978,5 +1140,6 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fb_bitmap_alpha(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 20, fg, bg_at_y(cy), 255);
     logl("[FirstInit] user setup finished");
 
-    for(;;) __asm__("hlt");
+    /* 短暂停留后返回，由 DSK 接管加载 shell */
+    for (int i = 0; i < 60; i++) delay_frame();
 }

@@ -1,1 +1,6 @@
 ISO/deshab.img
+*.o
+.build_tmp/
+.trae/
+docs/workbuddy-planning/
+sata_fat32_dsk.img

@@ -567,6 +567,46 @@ if (-not (Test-Path $ShellOutput)) {
 }
 Write-Host "[build] shell Output: $ShellOutput"
 
+$DesktopDir = Join-Path $Root 'CODE\desktop'
+$DesktopOutput = Join-Path $SystemDir 'system\deshab64\desktop.elf'
+
+Write-Host '[build] Building desktop.elf...'
+try {
+    & $make -C "$DesktopDir" -f MAKEFILE "CC=$clang" "LD=$lld"
+    if ($LASTEXITCODE -ne 0) {
+        throw "make desktop failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+}
+
+if (-not (Test-Path $DesktopOutput)) {
+    throw "desktop build did not produce $DesktopOutput"
+}
+Write-Host "[build] desktop Output: $DesktopOutput"
+
+# ---------- Tool applications ----------
+$ToolsDir = Join-Path $Root 'CODE\tools'
+$ToolsOutDir = Join-Path $SystemDir 'system\deshab64\tools'
+
+$toolApps = @('bash', 'editor', 'fileman', 'browser', 'curl', 'ping')
+
+foreach ($tool in $toolApps) {
+    $toolDir = Join-Path $ToolsDir $tool
+    $toolMake = Join-Path $toolDir 'MAKEFILE'
+    if (Test-Path $toolMake) {
+        Write-Host "[build] Building ${tool}.elf..."
+        try {
+            & $make -C "$toolDir" -f MAKEFILE "CC=$clang" "LD=$lld"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[build] WARNING: make $tool failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+        }
+    }
+}
+
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
@@ -581,19 +621,13 @@ Write-Host "[build] Done: $ImagePath"
 # Rebuild SATA FAT32 disk image (DSK reads deshab.elf/FirstInit.elf/mouseInit.elf from here)
 Write-Host '[build] Rebuilding SATA FAT32 disk image...'
 $BuildTmp = Join-Path $Root '.build_tmp'
-$MkFat32 = Join-Path $BuildTmp 'mkfat32.exe'
-if (Test-Path $MkFat32) {
-    Push-Location $BuildTmp
-    try {
-        & $MkFat32
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[build] WARNING: mkfat32 exited with $LASTEXITCODE"
-        }
-    }
-    finally {
-        Pop-Location
+$MkFat32Ps = Join-Path $BuildTmp 'mkfat32.ps1'
+if (Test-Path $MkFat32Ps) {
+    & powershell -ExecutionPolicy Bypass -File $MkFat32Ps
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[build] WARNING: mkfat32.ps1 exited with $LASTEXITCODE"
     }
     Write-Host "[build] SATA IMG: $(Join-Path $BuildTmp 'sata_fat32_dsk.img')"
 } else {
-    Write-Host '[build] WARNING: mkfat32.exe not found, SATA image not rebuilt'
+    Write-Host '[build] WARNING: mkfat32.ps1 not found, SATA image not rebuilt'
 }

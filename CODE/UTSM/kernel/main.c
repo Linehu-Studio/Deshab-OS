@@ -28,9 +28,9 @@ void kernel_main(void) {
     net_init();
     log_info("[UTSM] net registry init ok");
 
-    log_info("[UTSM] drr stub init begin");
-    drr_stub_init();
-    log_info("[UTSM] drr stub init ok");
+    log_info("[UTSM] drr init begin");
+    drr_init();
+    log_info("[UTSM] drr init ok");
 
     log_info("[UTSM] core init begin");
     utsm_init();

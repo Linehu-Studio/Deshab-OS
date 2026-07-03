@@ -1,11 +1,10 @@
 /* Deshab Shell — 命令行交互界面
  * 接收 PS/2 键盘输入，执行内置命令。
- * 显示在 framebuffer 上，使用 Consolas 18px 等宽字体。
+ * 使用 Deshab "Sealed Arc" 视觉风格系统。
  */
 
 #include "../UTSM/include/utsm/dsk.h"
 
-typedef signed char        i8;
 typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
@@ -24,28 +23,37 @@ static void sputc(char c) {
 static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static void logl(const char *s) { swrite(s); swrite("\n"); }
 
-/* ASCII 字体 — Consolas 18px 灰度位图（与 FirstInit 共享） */
+/* ASCII 字体 — 必须在 deshab_ui.h 之前包含，因为 du_draw_char 引用 g_ascii */
 #include "../firstInit/ascii_bitmaps.c"
+#include "../UTSM/include/utsm/deshab_ui.h"
 
-#define ASCII_W  11
-#define ASCII_H  18
-#define ASCII_STEP 11
+/* ---- 风格令牌（引用 deshab_ui.h 语义色） ---- */
+#define BG_COLOR      DS_DARK_BG_PRIMARY
+#define TEXT_FG       DS_DARK_TEXT_PRIMARY
+#define PROMPT_FG     DS_DARK_PROMPT
+#define ERROR_FG      DP_ERROR
+#define OK_FG         DP_SUCCESS
+#define DIM_FG        DS_DARK_TEXT_DIM
+#define ACCENT_FG     DS_DARK_ACCENT
+#define DECORATIVE_FG DS_DARK_DECORATIVE
+
+/* 标题栏参数 */
+#define TITLEBAR_H    28
+#define TITLEBAR_BG   DP_ABYSS_800
+#define TITLEBAR_FG   DS_DARK_TEXT_SECONDARY
+#define TITLEBAR_ACCENT DS_DARK_ACCENT
+
+/* 状态栏参数 */
+#define STATUSBAR_H   22
+#define STATUSBAR_BG  DP_ABYSS_800
 
 /* 终端尺寸 */
 #define TERM_COLS  100
 #define TERM_ROWS  35
 #define TERM_MAX_CHARS (TERM_COLS * TERM_ROWS)
 
-/* 颜色 — 深色主题，类似经典终端 */
-#define BG_COLOR    0xFF0A1428u   /* 深蓝黑 */
-#define TEXT_FG     0xFFE0E8F0u   /* 浅灰白 */
-#define PROMPT_FG   0xFF66CCFFu   /* 青色提示符 */
-#define ERROR_FG    0xFFFF6680u   /* 红色错误 */
-#define OK_FG       0xFF66FF99u   /* 绿色成功 */
-#define DIM_FG      0xFF7080A0u   /* 灰色注释 */
-
+static du_context g_ctx;
 static u64 fb_a, fb_w, fb_h, fb_p;
-static u32 *g_fb;
 
 /* 终端缓冲区 — 字符 + 颜色 */
 static u8  term_ch[TERM_MAX_CHARS];
@@ -56,61 +64,18 @@ static int cur_col = 0;
 static int cur_row = 0;
 static int cur_visible = 1;
 
-/* 颜色混合 */
-static u32 blend(u32 c1, u32 c2, u32 a) {
-    u32 na=256-a;
-    u32 r=((c1&0xFF)*na+(c2&0xFF)*a)>>8;
-    u32 g=(((c1>>8)&0xFF)*na+((c2>>8)&0xFF)*a)>>8;
-    u32 b=(((c1>>16)&0xFF)*na+((c2>>16)&0xFF)*a)>>8;
-    return 0xFF000000|(b<<16)|(g<<8)|r;
-}
-
-/* ---- 字符渲染（与 FirstInit 类似，但用纯色背景） ---- */
-static void fb_char(u32 *fb, u32 ch, i64 x, i64 y, u32 fg, u32 bg) {
-    if (ch < ' ' || ch > '~') ch = ' ';
-    u32 idx = (u32)(ch - ' ');
-    const u8 *g = g_ascii[idx];
-    for (i64 r=0; r<ASCII_H; r++) {
-        i64 yy = y + r;
-        if (yy < 0 || (u64)yy >= fb_h) continue;
-        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
-        for (i64 c=0; c<ASCII_W; c++) {
-            u32 a = g[r * ASCII_W + c];
-            if (a == 0) continue;
-            i64 xx = x + c;
-            if (xx < 0 || (u64)xx >= fb_w) continue;
-            line[(u64)xx] = (a == 255) ? fg : blend(bg, fg, a);
-        }
-    }
-}
-
-static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
-    for (i64 r=0; r<h; r++) {
-        i64 yy = y + r;
-        if (yy < 0 || (u64)yy >= fb_h) continue;
-        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
-        for (i64 c=0; c<w; c++) {
-            i64 xx = x + c;
-            if (xx < 0 || (u64)xx >= fb_w) continue;
-            line[(u64)xx] = color;
-        }
-    }
-}
-
-/* ---- 终端逻辑 ---- */
-static int term_start_x, term_start_y;  /* 像素坐标 */
+/* ---- 终端像素坐标 ---- */
+static int term_start_x, term_start_y;
 
 static void term_init_pos(void) {
-    /* 居中布局，每字符 11px 宽，行高 20px */
-    int margin_x = 16;
-    int margin_y = 16;
+    int margin_x = (int)DU_SPACE_MD;
     term_start_x = margin_x;
-    term_start_y = margin_y;
-    /* 自适应行数/列数到 framebuffer */
+    /* 标题栏下方开始 */
+    term_start_y = TITLEBAR_H + (int)DU_SPACE_SM;
     int avail_w = (int)fb_w - margin_x * 2;
-    int avail_h = (int)fb_h - margin_y * 2;
-    term_w = avail_w / ASCII_STEP;
-    term_h = avail_h / (ASCII_H + 2);
+    int avail_h = (int)fb_h - term_start_y - STATUSBAR_H - (int)DU_SPACE_SM;
+    term_w = avail_w / (int)DU_ASCII_STEP;
+    term_h = avail_h / (int)DU_ASCII_LINE_H;
     if (term_w < 10) term_w = 10;
     if (term_h < 5) term_h = 5;
     if (term_w > TERM_COLS) term_w = TERM_COLS;
@@ -127,7 +92,6 @@ static void term_clear(void) {
 }
 
 static void term_scroll(void) {
-    /* 向上滚动一行 */
     for (int r = 1; r < term_h; r++) {
         for (int c = 0; c < term_w; c++) {
             int src = r * TERM_COLS + c;
@@ -136,7 +100,6 @@ static void term_scroll(void) {
             term_fg[dst] = term_fg[src];
         }
     }
-    /* 清空最后一行 */
     for (int c = 0; c < term_w; c++) {
         term_ch[(term_h-1) * TERM_COLS + c] = ' ';
         term_fg[(term_h-1) * TERM_COLS + c] = TEXT_FG;
@@ -168,57 +131,96 @@ static void term_putc_color(char c, u32 color) {
 }
 
 static void term_putc(char c) { term_putc_color(c, TEXT_FG); }
+static void term_puts_color(const char *s, u32 color) { while (*s) term_putc_color(*s++, color); }
+static void term_puts(const char *s) { term_puts_color(s, TEXT_FG); }
 
-static void term_puts_color(const char *s, u32 color) {
-    while (*s) term_putc_color(*s++, color);
+/* ---- 标题栏渲染 ---- */
+static void draw_titlebar(void) {
+    du_fill_rect(&g_ctx, 0, 0, (i64)fb_w, TITLEBAR_H, TITLEBAR_BG);
+    /* 底部强调线 */
+    du_fill_rect(&g_ctx, 0, TITLEBAR_H - 2, (i64)fb_w, 2, TITLEBAR_ACCENT);
+    /* 左侧标题文字 */
+    du_draw_string(&g_ctx, "Deshab Shell",
+                   (i64)DU_SPACE_MD, (TITLEBAR_H - (i64)DU_ASCII_CELL_H) / 2,
+                   DS_DARK_TEXT_PRIMARY, TITLEBAR_BG, DU_ASCII_STEP);
+    /* 右侧版本号 */
+    du_draw_string(&g_ctx, "v0.1.0",
+                   (i64)fb_w - 6 * (i64)DU_ASCII_STEP - (i64)DU_SPACE_MD,
+                   (TITLEBAR_H - (i64)DU_ASCII_CELL_H) / 2,
+                   DS_DARK_TEXT_DIM, TITLEBAR_BG, DU_ASCII_STEP);
 }
 
-static void term_puts(const char *s) { term_puts_color(s, TEXT_FG); }
+/* ---- 状态栏渲染 ---- */
+static void draw_statusbar(void) {
+    i64 sy = (i64)fb_h - STATUSBAR_H;
+    du_fill_rect(&g_ctx, 0, sy, (i64)fb_w, STATUSBAR_H, STATUSBAR_BG);
+    /* 顶部强调线 */
+    du_fill_rect(&g_ctx, 0, sy, (i64)fb_w, 1, DS_DARK_DIVIDER);
+    /* 左侧：当前路径 */
+    du_draw_string(&g_ctx, "/",
+                   (i64)DU_SPACE_MD, sy + (STATUSBAR_H - (i64)DU_ASCII_CELL_H) / 2,
+                   DS_DARK_TEXT_DIM, STATUSBAR_BG, DU_ASCII_STEP);
+    /* 右侧：root@deshab */
+    const char *user = "root@deshab";
+    int ulen = 0;
+    while (user[ulen]) ulen++;
+    du_draw_string(&g_ctx, user,
+                   (i64)fb_w - ulen * (i64)DU_ASCII_STEP - (i64)DU_SPACE_MD,
+                   sy + (STATUSBAR_H - (i64)DU_ASCII_CELL_H) / 2,
+                   DS_DARK_ACCENT, STATUSBAR_BG, DU_ASCII_STEP);
+}
 
 static void term_redraw_all(void) {
     /* 清屏背景 */
-    fill_rect(g_fb, 0, 0, (i64)fb_w, (i64)fb_h, BG_COLOR);
+    du_fill_bg_solid(&g_ctx, BG_COLOR);
+    /* 标题栏 */
+    draw_titlebar();
     /* 渲染所有字符 */
     for (int r = 0; r < term_h; r++) {
         for (int c = 0; c < term_w; c++) {
             int idx = r * TERM_COLS + c;
             u8 ch = term_ch[idx];
             if (ch == ' ') continue;
-            i64 x = term_start_x + (i64)c * ASCII_STEP;
-            i64 y = term_start_y + (i64)r * (ASCII_H + 2);
-            fb_char(g_fb, ch, x, y, term_fg[idx], BG_COLOR);
+            i64 x = term_start_x + (i64)c * (i64)DU_ASCII_STEP;
+            i64 y = term_start_y + (i64)r * (i64)DU_ASCII_LINE_H;
+            du_draw_char(&g_ctx, ch, x, y, term_fg[idx], BG_COLOR);
         }
     }
-    /* 渲染光标 */
+    /* 光标 */
     if (cur_visible && cur_col < term_w && cur_row < term_h) {
-        i64 x = term_start_x + (i64)cur_col * ASCII_STEP;
-        i64 y = term_start_y + (i64)cur_row * (ASCII_H + 2);
-        fill_rect(g_fb, x, y + ASCII_H - 3, ASCII_W, 2, TEXT_FG);
+        i64 x = term_start_x + (i64)cur_col * (i64)DU_ASCII_STEP;
+        i64 y = term_start_y + (i64)cur_row * (i64)DU_ASCII_LINE_H;
+        du_fill_rect(&g_ctx, x, y + (i64)DU_ASCII_CELL_H - 3,
+                     (i64)DU_ASCII_CELL_W, 2, DS_DARK_CURSOR);
     }
+    /* 状态栏 */
+    draw_statusbar();
 }
 
 static void term_redraw_cursor(void) {
     if (cur_visible && cur_col < term_w && cur_row < term_h) {
-        i64 x = term_start_x + (i64)cur_col * ASCII_STEP;
-        i64 y = term_start_y + (i64)cur_row * (ASCII_H + 2);
-        fill_rect(g_fb, x, y + ASCII_H - 3, ASCII_W, 2, TEXT_FG);
+        i64 x = term_start_x + (i64)cur_col * (i64)DU_ASCII_STEP;
+        i64 y = term_start_y + (i64)cur_row * (i64)DU_ASCII_LINE_H;
+        du_fill_rect(&g_ctx, x, y + (i64)DU_ASCII_CELL_H - 3,
+                     (i64)DU_ASCII_CELL_W, 2, DS_DARK_CURSOR);
     }
 }
 
 static void term_clear_cursor(void) {
     if (cur_col < term_w && cur_row < term_h) {
-        i64 x = term_start_x + (i64)cur_col * ASCII_STEP;
-        i64 y = term_start_y + (i64)cur_row * (ASCII_H + 2);
-        fill_rect(g_fb, x, y + ASCII_H - 3, ASCII_W, 2, BG_COLOR);
+        i64 x = term_start_x + (i64)cur_col * (i64)DU_ASCII_STEP;
+        i64 y = term_start_y + (i64)cur_row * (i64)DU_ASCII_LINE_H;
+        du_fill_rect(&g_ctx, x, y + (i64)DU_ASCII_CELL_H - 3,
+                     (i64)DU_ASCII_CELL_W, 2, BG_COLOR);
     }
 }
 
 /* ---- 输入缓冲 ---- */
 static char input_buf[256];
 static int input_len = 0;
-static int input_cursor = 0;  /* 在 input_buf 中的位置（支持左右移动） */
+static int input_cursor = 0;
 
-/* ---- 键盘扫描码 → ASCII（Set 1，与 FirstInit 共享逻辑） ---- */
+/* ---- 键盘扫描码 → ASCII（Set 1） ---- */
 static char scan_to_ascii(u8 sc, int shift) {
     static const char normal[58] = {
         0, 27, '1','2','3','4','5','6','7','8','9','0','-','=', 8, '\t',
@@ -264,6 +266,7 @@ static void cmd_version(void) {
     term_puts("  Architecture: x86_64\n");
     term_puts("  ABI: DKM (Deshab Kernel Module) v1\n");
     term_puts("  Bootloader: Limine\n");
+    term_puts_color("  Style: Sealed Arc (Deshab UI)\n", DIM_FG);
 }
 
 static void cmd_uname(void) {
@@ -274,20 +277,20 @@ static void cmd_about(void) {
     term_puts_color("=== Deshab OS ===\n", PROMPT_FG);
     term_puts("单地址空间 Ring0 内核实验系统\n");
     term_puts("架构: UTSM + DSK + DKM 驱动模型\n");
+    term_puts_color("视觉: Sealed Arc 设计语言\n", DECORATIVE_FG);
     term_puts_color("Built with Clang + lld\n", DIM_FG);
-    term_puts_color("© 2026 Deshab Project\n", DIM_FG);
+    term_puts_color("(c) 2026 Deshab Project\n", DIM_FG);
 }
 
 static void cmd_clear(void) {
     term_clear();
+    term_redraw_all();
 }
 
 static void cmd_reboot(void) {
     term_puts_color("Rebooting...\n", PROMPT_FG);
     term_redraw_all();
-    /* ACPI 重启：写 0x64 = 0xFE 触发键盘控制器复位 */
     outb(0x64, 0xFE);
-    /* 备用：三重故障 */
     __asm__ volatile("int $0x03");
     for(;;) __asm__("hlt");
 }
@@ -303,22 +306,18 @@ static void cmd_echo(const char *args) {
     term_putc('\n');
 }
 
-/* 前向声明 — CMOS RTC 读取 */
 static u8 read_rtc_reg(u8 reg);
 static u8 bcd_to_bin_impl(u8 bcd);
 
 static void cmd_date(void) {
-    /* 通过 CMOS RTC 读取日期 */
     u8 year = bcd_to_bin_impl(read_rtc_reg(9));
     u8 month = bcd_to_bin_impl(read_rtc_reg(8));
     u8 day = bcd_to_bin_impl(read_rtc_reg(7));
     u8 hour = bcd_to_bin_impl(read_rtc_reg(4));
     u8 minute = bcd_to_bin_impl(read_rtc_reg(2));
     u8 second = bcd_to_bin_impl(read_rtc_reg(0));
-    /* 简单打印 */
     char buf[32];
     int p = 0;
-    /* YYYY-MM-DD HH:MM:SS */
     buf[p++] = '2'; buf[p++] = '0';
     buf[p++] = '0' + year / 10; buf[p++] = '0' + year % 10;
     buf[p++] = '-';
@@ -349,21 +348,16 @@ static void cmd_not_impl(const char *cmd) {
 }
 
 static void execute_command(const char *cmd) {
-    /* 跳过前导空格 */
     while (*cmd == ' ') cmd++;
     if (*cmd == 0) return;
-    /* 找命令名（第一个单词） */
     const char *args = cmd;
     while (*args && *args != ' ') args++;
     int cmd_name_len = (int)(args - cmd);
-    /* 复制命令名到本地缓冲 */
     char name[32];
     if (cmd_name_len >= 32) cmd_name_len = 31;
     for (int i = 0; i < cmd_name_len; i++) name[i] = cmd[i];
     name[cmd_name_len] = 0;
-    /* 跳过参数前的空格 */
     while (*args == ' ') args++;
-    /* 分派 */
     if (str_eq(name, "help") || str_eq(name, "?")) cmd_help();
     else if (str_eq(name, "version") || str_eq(name, "ver")) cmd_version();
     else if (str_eq(name, "uname")) cmd_uname();
@@ -402,30 +396,26 @@ static void draw_prompt(void) {
 
 /* ---- 输入行编辑 ---- */
 static void redraw_input_line(void) {
-    /* 清除当前行从提示符开始的部分并重绘 */
     int prompt_len = 0;
     while (PROMPT[prompt_len]) prompt_len++;
-    /* 清除整行 */
-    i64 y = term_start_y + (i64)cur_row * (ASCII_H + 2);
-    fill_rect(g_fb, term_start_x, y, (i64)term_w * ASCII_STEP, ASCII_H, BG_COLOR);
-    /* 重绘提示符 */
+    i64 y = term_start_y + (i64)cur_row * (i64)DU_ASCII_LINE_H;
+    du_fill_rect(&g_ctx, term_start_x, y,
+                 (i64)term_w * (i64)DU_ASCII_STEP,
+                 (i64)DU_ASCII_CELL_H, BG_COLOR);
     for (int i = 0; i < prompt_len; i++) {
-        i64 x = term_start_x + (i64)i * ASCII_STEP;
-        fb_char(g_fb, PROMPT[i], x, y, PROMPT_FG, BG_COLOR);
+        i64 x = term_start_x + (i64)i * (i64)DU_ASCII_STEP;
+        du_draw_char(&g_ctx, PROMPT[i], x, y, PROMPT_FG, BG_COLOR);
     }
-    /* 重绘输入缓冲 */
     for (int i = 0; i < input_len; i++) {
-        i64 x = term_start_x + (i64)(prompt_len + i) * ASCII_STEP;
-        fb_char(g_fb, input_buf[i], x, y, TEXT_FG, BG_COLOR);
+        i64 x = term_start_x + (i64)(prompt_len + i) * (i64)DU_ASCII_STEP;
+        du_draw_char(&g_ctx, input_buf[i], x, y, TEXT_FG, BG_COLOR);
     }
-    /* 同步 cur_col 到输入光标 */
     cur_col = prompt_len + input_cursor;
     term_redraw_cursor();
 }
 
 static void insert_char(char c) {
     if (input_len >= 255) return;
-    /* 在 input_cursor 处插入 */
     for (int i = input_len; i > input_cursor; i--) {
         input_buf[i] = input_buf[i-1];
     }
@@ -437,7 +427,6 @@ static void insert_char(char c) {
 
 static void delete_char_back(void) {
     if (input_cursor == 0) return;
-    /* 删除 input_cursor-1 处的字符 */
     for (int i = input_cursor - 1; i < input_len - 1; i++) {
         input_buf[i] = input_buf[i+1];
     }
@@ -523,14 +512,16 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fb_w = ctx->framebuffer_width;
     fb_h = ctx->framebuffer_height;
     fb_p = ctx->framebuffer_pitch;
-    g_fb = (u32 *)(u64)fb_a;
+
+    /* 初始化风格系统渲染上下文 */
+    du_context_init(&g_ctx, fb_a, fb_w, fb_h, fb_p);
 
     term_init_pos();
     term_clear();
     term_redraw_all();
 
-    /* 启动 banner */
-    term_puts_color("=== Deshab OS v0.1.0 ===\n", PROMPT_FG);
+    /* 启动 banner — 使用风格令牌 */
+    term_puts_color("=== Deshab OS v0.1.0 ===\n", ACCENT_FG);
     term_puts_color("欢迎使用 Deshab Shell\n", OK_FG);
     term_puts_color("输入 'help' 查看可用命令\n", DIM_FG);
     term_putc('\n');
@@ -548,47 +539,40 @@ void dsk_entry(const dsk_boot_context *ctx) {
         cur_col = prompt_len;
         term_redraw_cursor();
 
-        /* 等待命令输入 */
         int cmd_done = 0;
         while (!cmd_done) {
             u8 st = inb(0x64);
             if (!(st & 1)) { __asm__("pause"); continue; }
             u8 data = inb(0x60);
-            /* 忽略鼠标数据（AUX 位） */
             if (st & 0x20) continue;
             u8 sc = data;
             if (sc == 0xE0) { e0 = 1; continue; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
             if (sc & 0x80) {
-                /* 松开事件 — 仅处理扩展键 */
-                if (e0 && sc == 0x9C) { e0 = 0; }  /* Enter 释放 */
-                else if (e0 && sc == 0xCB) { e0 = 0; }  /* Left 释放 */
-                else if (e0 && sc == 0xCD) { e0 = 0; }  /* Right 释放 */
-                else if (e0 && sc == 0xC8) { e0 = 0; }  /* Up 释放 */
-                else if (e0 && sc == 0xD0) { e0 = 0; }  /* Down 释放 */
-                else if (e0 && sc == 0xD3) { e0 = 0; }  /* Delete 释放 */
-                else if (e0 && sc == 0xC7) { e0 = 0; }  /* Home 释放 */
-                else if (e0 && sc == 0xCF) { e0 = 0; }  /* End 释放 */
+                if (e0 && sc == 0x9C) { e0 = 0; }
+                else if (e0 && sc == 0xCB) { e0 = 0; }
+                else if (e0 && sc == 0xCD) { e0 = 0; }
+                else if (e0 && sc == 0xC8) { e0 = 0; }
+                else if (e0 && sc == 0xD0) { e0 = 0; }
+                else if (e0 && sc == 0xD3) { e0 = 0; }
+                else if (e0 && sc == 0xC7) { e0 = 0; }
+                else if (e0 && sc == 0xCF) { e0 = 0; }
                 e0 = 0;
                 continue;
             }
-            /* 按下事件 */
             if (e0) {
-                /* 扩展键 */
-                if (sc == 0x4B) cursor_left();        /* Left */
-                else if (sc == 0x4D) cursor_right();  /* Right */
-                else if (sc == 0x47) cursor_home();   /* Home */
-                else if (sc == 0x4F) cursor_end();    /* End */
-                else if (sc == 0x53) delete_char_fwd(); /* Delete */
-                else if (sc == 0x48) { /* Up — 命令历史暂未实现 */ }
-                else if (sc == 0x50) { /* Down — 命令历史暂未实现 */ }
+                if (sc == 0x4B) cursor_left();
+                else if (sc == 0x4D) cursor_right();
+                else if (sc == 0x47) cursor_home();
+                else if (sc == 0x4F) cursor_end();
+                else if (sc == 0x53) delete_char_fwd();
+                else if (sc == 0x48) { }
+                else if (sc == 0x50) { }
                 e0 = 0;
                 continue;
             }
-            /* 控制键 */
             if (sc == 0x1C) {
-                /* Enter — 执行命令 */
                 term_clear_cursor();
                 input_buf[input_len] = 0;
                 term_putc('\n');
@@ -596,32 +580,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 cmd_done = 1;
                 continue;
             }
-            if (sc == 0x0E) {
-                /* Backspace */
-                delete_char_back();
-                continue;
-            }
-            if (sc == 0x01) {
-                /* Esc — 清行 */
-                kill_line();
-                continue;
-            }
-            /* Ctrl+U (kill line) */
-            if (sc == 0x15 && !shift) {
-                kill_line();
-                continue;
-            }
-            if (sc == 0x17 && !shift) {
-                /* Ctrl+W — 删除到行首 */
-                while (input_cursor > 0) delete_char_back();
-                continue;
-            }
-            if (sc == 0x0B && !shift) {
-                /* Ctrl+K — 删除到行尾 */
-                kill_to_end();
-                continue;
-            }
-            /* 普通字符 */
+            if (sc == 0x0E) { delete_char_back(); continue; }
+            if (sc == 0x01) { kill_line(); continue; }
+            if (sc == 0x15 && !shift) { kill_line(); continue; }
+            if (sc == 0x17 && !shift) { while (input_cursor > 0) delete_char_back(); continue; }
+            if (sc == 0x0B && !shift) { kill_to_end(); continue; }
             char c = scan_to_ascii(sc, shift);
             if (c && c >= 32 && c <= 126) {
                 insert_char(c);

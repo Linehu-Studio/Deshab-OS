@@ -373,31 +373,31 @@ static void dsk_spinner_and_check(u32 *fb_arg, i64 cx, i64 cy, i64 r, i64 thk,
         if(fe_entry&&frame>150){logl("[DSK] jumping to FirstInit");  /* was 600 */
             void(*entry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))fe_entry;
             entry(ctx);
-            logl("[DSK] FirstInit returned, loading shell");
-            /* FirstInit 返回后加载 shell */
-            char sh[12]; /* SHELL   ELF */
-            sh[0]='S';sh[1]='H';sh[2]='E';sh[3]='L';sh[4]='L';sh[5]=' ';sh[6]=' ';sh[7]=' ';sh[8]='E';sh[9]='L';sh[10]='F';
-            u8 *sd=0; u32 ss=0; void *se=0;
-            if(fat32_read_root_file(sh,&sd,&ss)==0){
-                if(dsk_load_elf(sd,ss,&se)==0){
-                    logl("[DSK] jumping to shell");
-                    void(*sentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))se;
-                    sentry(ctx);
+            logl("[DSK] FirstInit returned, loading desktop");
+            /* FirstInit 返回后加载 desktop */
+            char dn[12]; /* DESKTOP ELF */
+            dn[0]='D';dn[1]='E';dn[2]='S';dn[3]='K';dn[4]='T';dn[5]='O';dn[6]='P';dn[7]=' ';dn[8]='E';dn[9]='L';dn[10]='F';
+            u8 *dd=0; u32 ds=0; void *de=0;
+            if(fat32_read_root_file(dn,&dd,&ds)==0){
+                if(dsk_load_elf(dd,ds,&de)==0){
+                    logl("[DSK] jumping to desktop");
+                    void(*dentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))de;
+                    dentry(ctx);
                 }
             }
             for(;;)__asm__("hlt");
         }
-        /* 非首次启动：直接加载 shell */
+        /* 非首次启动：直接加载 desktop */
         if(checked&&!fe_entry&&frame>150){
-            logl("[DSK] loading shell directly (non-first boot)");
-            char sh[12]; /* SHELL   ELF */
-            sh[0]='S';sh[1]='H';sh[2]='E';sh[3]='L';sh[4]='L';sh[5]=' ';sh[6]=' ';sh[7]=' ';sh[8]='E';sh[9]='L';sh[10]='F';
-            u8 *sd=0; u32 ss=0; void *se=0;
-            if(fat32_read_root_file(sh,&sd,&ss)==0){
-                if(dsk_load_elf(sd,ss,&se)==0){
-                    logl("[DSK] jumping to shell");
-                    void(*sentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))se;
-                    sentry(ctx);
+            logl("[DSK] loading desktop directly (non-first boot)");
+            char dn[12]; /* DESKTOP ELF */
+            dn[0]='D';dn[1]='E';dn[2]='S';dn[3]='K';dn[4]='T';dn[5]='O';dn[6]='P';dn[7]=' ';dn[8]='E';dn[9]='L';dn[10]='F';
+            u8 *dd=0; u32 ds=0; void *de=0;
+            if(fat32_read_root_file(dn,&dd,&ds)==0){
+                if(dsk_load_elf(dd,ds,&de)==0){
+                    logl("[DSK] jumping to desktop");
+                    void(*dentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))de;
+                    dentry(ctx);
                 }
             }
             for(;;)__asm__("hlt");

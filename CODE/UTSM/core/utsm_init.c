@@ -1,6 +1,7 @@
 #include <utsm/utsm.h>
 #include <utsm/segment.h>
 #include <utsm/pckc.h>
+#include <utsm/process.h>
 #include <utsm/log.h>
 
 static utsm_segment_desc g_segments[UTSM_MAX_SEGMENTS];
@@ -18,6 +19,8 @@ void utsm_init(void) {
     log_info("[UTSM] pckc init begin");
     utsm_pckc_init();
     log_info("[UTSM] pckc init ok");
+
+    utsm_process_init();
 }
 
 utsm_segment_desc *utsm_get_segment(u32 slot) {

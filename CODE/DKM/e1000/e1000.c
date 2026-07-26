@@ -3,98 +3,7 @@
  * Finds e1000 via PCI, maps MMIO, reads MAC address.
  */
 
-#include <stdint.h>
-
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
-
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef signed char        i8;
-typedef long long          i64;
-#define NULL ((void *)0)
-
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_net_scan_result {
-    char ssid[33];
-    u8 bssid[6];
-    u8 channel;
-    i8 rssi;
-    u8 security;
-};
-
-struct dkm_net_device_desc {
-    const char *name;
-    u8 mac[6];
-    u32 flags;
-    void *ctx;
-    int (*tx)(void *ctx, const void *packet, u32 length);
-    int (*rx_poll)(void *ctx, void *buffer, u32 capacity, u32 *out_length);
-    /* 无线扩展回调（有线驱动置 NULL，向后兼容）。 */
-    int (*scan_start)(void *ctx);
-    int (*scan_count)(void *ctx);
-    int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(void *ctx);
-};
-
-struct dkm_net_api {
-    int (*register_device)(const struct dkm_net_device_desc *desc);
-    u32 (*device_count)(void);
-    int (*device_info)(u32 index, void *out);
-    int (*tx)(u32 index, const void *packet, u32 length);
-    int (*rx_poll)(u32 index, void *buffer, u32 capacity, u32 *out_length);
-    int (*scan_start)(u32 index);
-    int (*scan_count)(u32 index);
-    int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(u32 index);
-};
-
-struct dkm_dma_buffer {
-    void *virt;
-    u64 phys;
-    u64 size;
-};
-
-struct dkm_dma_api {
-    int (*alloc_pages)(u64 page_count, u64 alignment, u64 max_phys, struct dkm_dma_buffer *out);
-};
-
-#define DKM_NET_F_LINK_UP  (1u << 0)
-#define DKM_NET_F_TX_READY (1u << 1)
-#define DKM_NET_F_RX_READY (1u << 2)
-
-struct dkm_kernel_api {
-    u32 version; u32 size; u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem,*utsm,*irq_api,*pci_api;
-    const struct dkm_dma_api *dma;
-    const void *vfs_api;
-    const struct dkm_net_api *net;
-    const void *timer,*drr;
-    const void *rsdp_address,*fb_address;
-    u64 fb_width,fb_height,fb_pitch; u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-    u64 hhdm_offset;
-};
-
-struct dkm_driver_handle;
-struct dkm_driver_desc {
-    u32 magic; u16 abi_version; u16 desc_size;
-    const char *name,*version,*vendor;
-    u32 driver_class,stage,flags,priority;
-    const char *const *depends; u32 depends_count;
-    const char *const *provides; u32 provides_count;
-    u64 min_kernel_abi,feature_bits,reserved0,reserved1;
-};
+#include "../dkm_shared.h"
 
 static const char *const g_depends[] = {"pci","irq"};
 static const char *const g_provides[] = {"netdev"};
@@ -107,16 +16,6 @@ const struct dkm_driver_desc driver_desc = {
     .depends=g_depends,.depends_count=2,
     .provides=g_provides,.provides_count=1,.min_kernel_abi=1,
 };
-
-/* PCI config ports */
-#define PCI_ADDR 0xCF8
-#define PCI_DATA 0xCFC
-#define PCI_VENDOR_ID 0x00
-#define PCI_DEVICE_ID 0x02
-#define PCI_COMMAND   0x04
-#define PCI_BAR0 0x10
-#define PCI_BAR1 0x14
-#define PCI_IRQ_LINE 0x3C
 
 /* e1000 MMIO registers */
 #define E1000_CTRL    0x0000
@@ -205,20 +104,20 @@ static u32 g_rx_tail;
 static u32 g_tx_tail;
 static int g_rings_ready;
 
-static __inline__ void outl(u16 p, u32 v) { __asm__ volatile("outl %0,%1"::"a"(v),"Nd"(p):"memory"); }
-static __inline__ u32 inl(u16 p) { u32 v; __asm__ volatile("inl %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
-static u8 inb(u16 p) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
-static void outb(u16 p, u8 v) { __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p):"memory"); }
+#define COM1 0x3F8
+
+/* 串口发送等待 thin wrapper — 调用 dkm 共享实现 */
+static void serial_wait_tx(void) { dkm_serial_wait_tx(COM1); }
 
 static void raw_log(const char *s) {
     while (*s) {
         char c = *s++;
         if (c == '\n') {
-            for (u32 i=0;i<100000;i++) if (inb(0x3F8+5)&0x20) break;
-            outb(0x3F8, '\r');
+            serial_wait_tx();
+            dkm_outb(COM1, '\r');
         }
-        for (u32 i=0;i<100000;i++) if (inb(0x3F8+5)&0x20) break;
-        outb(0x3F8, (u8)c);
+        serial_wait_tx();
+        dkm_outb(COM1, (u8)c);
     }
 }
 
@@ -227,20 +126,18 @@ static void raw_hex(const char *prefix, u64 v) {
     raw_log(prefix);
     raw_log("0x");
     for (int i=15; i>=0; i--) {
-        for (u32 wait=0; wait<100000; wait++) if (inb(0x3F8+5)&0x20) break;
-        outb(0x3F8, (u8)h[(v >> (i * 4)) & 0xf]);
+        serial_wait_tx();
+        dkm_outb(COM1, (u8)h[(v >> (i * 4)) & 0xf]);
     }
     raw_log("\n");
 }
 
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
-    u32 a = (1u<<31)|((u32)bus<<16)|((u32)dev<<11)|((u32)func<<8)|((u32)reg&0xFC);
-    outl(PCI_ADDR,a); return inl(PCI_DATA);
+    return dkm_pci_read(bus, dev, func, reg);
 }
 
 static void pci_write(u8 bus, u8 dev, u8 func, u8 reg, u32 v) {
-    u32 a = (1u<<31)|((u32)bus<<16)|((u32)dev<<11)|((u32)func<<8)|((u32)reg&0xFC);
-    outl(PCI_ADDR,a); outl(PCI_DATA,v);
+    dkm_pci_write(bus, dev, func, reg, v);
 }
 
 static int e1000_find(u8 *bus, u8 *dev) {
@@ -262,9 +159,12 @@ static int e1000_find(u8 *bus, u8 *dev) {
 static u16 e1000_eeprom_read(u16 addr) {
     /* EERD: bit0=START, addr<<8, 完成后 bit4=DONE, data 在高 16 位 */
     g_mmio[E1000_EERD/4] = ((u32)addr << 8) | 1u;
-    for (u32 i=0;i<100000;i++) {
+    /* 实机: 100ms TSC 超时 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 100;
+    while (dkm_rdtsc() < deadline) {
         u32 v = g_mmio[E1000_EERD/4];
         if (v & (1u<<4)) return (u16)(v >> 16);
+        __asm__ volatile("pause");
     }
     return 0xffff;
 }
@@ -382,7 +282,9 @@ static int e1000_tx(void *ctx, const void *packet, u32 length) {
     g_tx_tail = (index + 1) % E1000_TX_DESC_COUNT;
     g_mmio[E1000_TDT/4] = g_tx_tail;
     mmio_flush();
-    for (u32 wait=0; wait<1000000; wait++) {
+    /* 实机: 1秒 TSC 超时等待 TX 完成 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 1000;
+    while (dkm_rdtsc() < deadline) {
         dma_fence();
         if (g_tx_desc[index].status & E1000_TX_STA_DD) {
             raw_log("[e1000.raw] tx complete\n");
@@ -428,6 +330,8 @@ static int e1000_rx_poll(void *ctx, void *buffer, u32 capacity, u32 *out_length)
 __attribute__((visibility("default")))
 int driver_init(const struct dkm_kernel_api *api,
                 struct dkm_driver_handle *handle) {
+    /* 实机要求: 先校准 TSC, 再使用基于 CPU 频率的延迟 */
+    dkm_tsc_calibrate();
     raw_log("[e1000.raw] driver_init entered\n");
     (void)handle;
     if (!api||!api->log) return -1;
@@ -472,8 +376,11 @@ int driver_init(const struct dkm_kernel_api *api,
 
     /* 软件复位，确保 RX/TX/RAL/RAH 从已知状态开始配置。 */
     g_mmio[E1000_CTRL/4] = g_mmio[E1000_CTRL/4] | (1u << 26);
-    for (u32 wait=0; wait<1000000; wait++) {
+    /* 实机: 1秒 TSC 超时等待复位完成 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 1000;
+    while (dkm_rdtsc() < deadline) {
         if (!(g_mmio[E1000_CTRL/4] & (1u << 26))) break;
+        __asm__ volatile("pause");
     }
     raw_log("[e1000.raw] reset done\n");
 

@@ -195,12 +195,12 @@ typedef long long          du_i64;
 #define DU_ANIM_DELAY_NORMAL  100000u   /* 标准动画 */
 #define DU_ANIM_DELAY_FAST     40000u   /* 快速反馈 */
 
-/* 弧线动画参数（DSK spinner 专用） */
+/* 弧线动画参数（DSK spinner 专用 — Sealed Arc Comet 设计） */
 #define DU_SPINNER_RADIUS     48u
-#define DU_SPINNER_THICKNESS   4u
-#define DU_SPINNER_ARC_GAP    82u      /* 每弧宽度（度） */
-#define DU_SPINNER_ARC_COUNT   4u
-#define DU_SPINNER_SPEED       2u      /* 每帧旋转度数 */
+#define DU_SPINNER_THICKNESS   5u
+#define DU_SPINNER_HEAD_WIDTH  40u      /* 弧头宽度（度） */
+#define DU_SPINNER_TAIL_LEN   220u      /* 拖尾长度（度） */
+#define DU_SPINNER_SPEED       4u      /* 每帧旋转度数 */
 #define DU_SPINNER_SPRITE     128u    /* 精灵缓冲边长 */
 
 /* 渐变动画步进 */
@@ -673,12 +673,13 @@ static inline void du_draw_progress(du_context *ctx,
 /* ===================================================================
  *  Spinner（加载弧） — DSK 启动加载动画
  *
- *  使用 "Sealed Arc" 四弧旋转设计，弧色取自色板。
+ *  使用 "Sealed Arc Comet" 单弧彗星尾设计：
+ *  一个明亮的弧头 + 渐变拖尾，颜色从弧头色过渡到拖尾色。
  * =================================================================== */
 
-/* 默认弧色（从亮到暗的青蓝色） */
+/* 默认弧色：[0]=弧头色（亮蓝）, [1]=拖尾色（紫） */
 #define DU_SPINNER_ARCS { \
-    DP_SEAL_100, DP_SEAL_300, DP_SEAL_500, DP_SEAL_700 \
+    DP_SEAL_300, DP_SEAL_700, DP_SEAL_500, DP_SEAL_100 \
 }
 
 /* ===================================================================

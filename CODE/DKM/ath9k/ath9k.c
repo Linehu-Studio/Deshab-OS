@@ -17,105 +17,7 @@
  * 部分高级特性（ANI/MRR/AGC 调优）留待硬件验证后增量完善。
  */
 
-#include <stdint.h>
-
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
-
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef long long          i64;
-typedef signed char        i8;
-#define NULL ((void *)0)
-
-/* ---- DKM ABI ---- */
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_net_scan_result {
-    char ssid[33];
-    u8 bssid[6];
-    u8 channel;
-    i8 rssi;
-    u8 security;
-};
-
-struct dkm_net_device_desc {
-    const char *name;
-    u8 mac[6];
-    u32 flags;
-    void *ctx;
-    int (*tx)(void *ctx, const void *packet, u32 length);
-    int (*rx_poll)(void *ctx, void *buffer, u32 capacity, u32 *out_length);
-    int (*scan_start)(void *ctx);
-    int (*scan_count)(void *ctx);
-    int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(void *ctx);
-};
-
-struct dkm_net_api {
-    int (*register_device)(const struct dkm_net_device_desc *desc);
-    u32 (*device_count)(void);
-    int (*device_info)(u32 index, void *out);
-    int (*tx)(u32 index, const void *packet, u32 length);
-    int (*rx_poll)(u32 index, void *buffer, u32 capacity, u32 *out_length);
-    int (*scan_start)(u32 index);
-    int (*scan_count)(u32 index);
-    int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(u32 index);
-};
-
-struct dkm_dma_buffer {
-    void *virt;
-    u64 phys;
-    u64 size;
-};
-
-struct dkm_dma_api {
-    int (*alloc_pages)(u64 page_count, u64 alignment, u64 max_phys, struct dkm_dma_buffer *out);
-};
-
-#define DKM_NET_F_LINK_UP  (1u << 0)
-#define DKM_NET_F_TX_READY (1u << 1)
-#define DKM_NET_F_RX_READY (1u << 2)
-#define DKM_NET_F_WIRELESS (1u << 3)
-
-#define DKM_NET_SEC_OPEN   0u
-#define DKM_NET_SEC_WEP    1u
-#define DKM_NET_SEC_WPA    2u
-#define DKM_NET_SEC_WPA2   3u
-#define DKM_NET_SEC_WPA3   4u
-
-struct dkm_kernel_api {
-    u32 version; u32 size; u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem,*utsm,*irq_api,*pci_api;
-    const struct dkm_dma_api *dma;
-    const void *vfs_api;
-    const struct dkm_net_api *net;
-    const void *timer,*drr;
-    const void *rsdp_address,*fb_address;
-    u64 fb_width,fb_height,fb_pitch; u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-    u64 hhdm_offset;
-};
-
-struct dkm_driver_handle;
-struct dkm_driver_desc {
-    u32 magic; u16 abi_version; u16 desc_size;
-    const char *name,*version,*vendor;
-    u32 driver_class,stage,flags,priority;
-    const char *const *depends; u32 depends_count;
-    const char *const *provides; u32 provides_count;
-    u64 min_kernel_abi,feature_bits,reserved0,reserved1;
-};
+#include "../dkm_shared.h"
 
 static const char *const g_depends[] = {"pci","irq"};
 static const char *const g_provides[] = {"netdev"};
@@ -128,19 +30,6 @@ const struct dkm_driver_desc driver_desc = {
     .depends=g_depends,.depends_count=2,
     .provides=g_provides,.provides_count=1,.min_kernel_abi=1,
 };
-
-/* ---- PCI config ---- */
-#define PCI_ADDR 0xCF8
-#define PCI_DATA 0xCFC
-#define PCI_VENDOR_ID 0x00
-#define PCI_COMMAND   0x04
-#define PCI_BAR0 0x10
-#define PCI_BAR1 0x14
-#define PCI_IRQ_LINE 0x3C
-
-#define PCI_CMD_IO     (1u << 0)
-#define PCI_CMD_MEM    (1u << 1)
-#define PCI_CMD_BUSMST (1u << 2)
 
 /* ---- ath9k 寄存器（AR9280/9285/9287 PCIe MAC，Linux ath9k reg.h 关键子集） ---- */
 #define AR_RC                 0x4000u
@@ -285,20 +174,20 @@ static u32 g_scan_count;
 static int g_scanning;
 
 /* ---- 串口日志（参考 e1000 raw_log） ---- */
-static __inline__ void outb(u16 p, u8 v) { __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p):"memory"); }
-static __inline__ u8 inb(u16 p) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
-static __inline__ void outl(u16 p, u32 v) { __asm__ volatile("outl %0,%1"::"a"(v),"Nd"(p):"memory"); }
-static __inline__ u32 inl(u16 p) { u32 v; __asm__ volatile("inl %1,%0":"=a"(v):"Nd"(p):"memory"); return v; }
+#define COM1 0x3F8
+
+/* 串口发送等待 thin wrapper — 调用 dkm 共享实现 */
+static void serial_wait_tx(void) { dkm_serial_wait_tx(COM1); }
 
 static void raw_log(const char *s) {
     while (*s) {
         char c = *s++;
         if (c == '\n') {
-            for (u32 i=0;i<100000;i++) if (inb(0x3F8+5)&0x20) break;
-            outb(0x3F8, '\r');
+            serial_wait_tx();
+            dkm_outb(COM1, '\r');
         }
-        for (u32 i=0;i<100000;i++) if (inb(0x3F8+5)&0x20) break;
-        outb(0x3F8, (u8)c);
+        serial_wait_tx();
+        dkm_outb(COM1, (u8)c);
     }
 }
 
@@ -307,26 +196,19 @@ static void raw_hex(const char *prefix, u64 v) {
     raw_log(prefix);
     raw_log("0x");
     for (int i=15; i>=0; i--) {
-        for (u32 wait=0; wait<100000; wait++) if (inb(0x3F8+5)&0x20) break;
-        outb(0x3F8, (u8)h[(v >> (i * 4)) & 0xf]);
+        serial_wait_tx();
+        dkm_outb(COM1, (u8)h[(v >> (i * 4)) & 0xf]);
     }
     raw_log("\n");
 }
 
-static void delay_us(u32 us) {
-    /* 粗略延时：每个 iteration ~1us on QEMU x86 */
-    for (u32 i = 0; i < us * 10; i++) __asm__ volatile("pause");
-}
-
 /* ---- PCI 配置空间 ---- */
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
-    u32 a = (1u<<31)|((u32)bus<<16)|((u32)dev<<11)|((u32)func<<8)|((u32)reg&0xFC);
-    outl(PCI_ADDR,a); return inl(PCI_DATA);
+    return dkm_pci_read(bus, dev, func, reg);
 }
 
 static void pci_write(u8 bus, u8 dev, u8 func, u8 reg, u32 v) {
-    u32 a = (1u<<31)|((u32)bus<<16)|((u32)dev<<11)|((u32)func<<8)|((u32)reg&0xFC);
-    outl(PCI_ADDR,a); outl(PCI_DATA,v);
+    dkm_pci_write(bus, dev, func, reg, v);
 }
 
 /* ath9k PCI 设备 ID 表（vendor 0x168c Atheros） */
@@ -403,11 +285,12 @@ static u16 ath9k_eeprom_read(u16 addr) {
     /* AR5416_EEPROM_CMD: bit0=READ, bit1=BUSY, bit2=RESET */
     /* 启动 read：写 cmd=READ | addr<<3 */
     ath9k_reg_write(AR_EEPROM_CMD, AR_EEPROM_CMD_RESET);
-    delay_us(5);
+    dkm_delay_us(5);
     u32 cmd = AR_EEPROM_CMD_READ | ((u32)(addr & 0x3FF) << 3);
     ath9k_reg_write(AR_EEPROM_CMD, cmd);
-    /* 等待 RDBUSY 清除 */
-    for (u32 i = 0; i < 100000; i++) {
+    /* 等待 RDBUSY 清除 (实机: 100ms TSC 超时) */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 100;
+    while (dkm_rdtsc() < deadline) {
         u32 sts = ath9k_reg_read(AR_EEPROM_STS);
         if (!(sts & AR_EEPROM_STS_RDBUSY)) {
             if (sts & AR_EEPROM_STS_VALID) {
@@ -415,7 +298,7 @@ static u16 ath9k_eeprom_read(u16 addr) {
             }
             return 0xffff;
         }
-        delay_us(1);
+        dkm_delay_us(1);
     }
     return 0xffff;
 }
@@ -425,27 +308,29 @@ static int ath9k_reset(void) {
     raw_log("[ath9k.raw] reset sequence\n");
     /* 1. 强制唤醒（Power-On） */
     ath9k_reg_write(AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_ON | AR_RTC_FORCE_WAKE_INT);
-    delay_us(50);
-    /* 2. 等待 RTC 进入 ON 状态 */
-    for (u32 i = 0; i < 100000; i++) {
+    dkm_delay_us(50);
+    /* 2. 等待 RTC 进入 ON 状态 (实机: 100ms TSC 超时) */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 100;
+    while (dkm_rdtsc() < deadline) {
         u32 s = ath9k_reg_read(AR_RTC_STATUS);
         if ((s & 0x3) == AR_RTC_STATUS_ON) break;
-        delay_us(1);
+        dkm_delay_us(1);
     }
     /* 3. 全 chip 复位 */
     ath9k_reg_write(AR_RC, AR_RC_MAC | AR_RC_BB | AR_RC_RPCU);
-    delay_us(100);
+    dkm_delay_us(100);
     ath9k_reg_write(AR_RC, 0);
-    delay_us(100);
+    dkm_delay_us(100);
     /* 4. 重新唤醒 */
     ath9k_reg_write(AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_ON | AR_RTC_FORCE_WAKE_INT);
-    delay_us(50);
-    /* 5. 等待 RTC ON */
+    dkm_delay_us(50);
+    /* 5. 等待 RTC ON (实机: 100ms TSC 超时) */
     u32 ok = 0;
-    for (u32 i = 0; i < 100000; i++) {
+    u64 deadline2 = dkm_rdtsc() + dkm_tsc_per_ms * 100;
+    while (dkm_rdtsc() < deadline2) {
         u32 s = ath9k_reg_read(AR_RTC_STATUS);
         if ((s & 0x3) == AR_RTC_STATUS_ON) { ok = 1; break; }
-        delay_us(1);
+        dkm_delay_us(1);
     }
     if (!ok) { raw_log("[ath9k.raw] reset: RTC not ON\n"); return -1; }
     raw_log("[ath9k.raw] reset: RTC ON\n");
@@ -461,7 +346,7 @@ static int ath9k_hw_init(void) {
     raw_log("[ath9k.raw] hw_init minimal\n");
     /* 关闭 RX/DMA，清 STA_ID1 */
     ath9k_reg_write(AR_CR, AR_CR_RXD);
-    delay_us(10);
+    dkm_delay_us(10);
     ath9k_reg_write(AR_STA_ID1, 0);
     /* 清中断 */
     ath9k_reg_write(AR_ISR, 0xFFFFFFFFu);
@@ -650,13 +535,13 @@ static void ath9k_set_channel(u8 channel) {
     /* TODO: 完整 ath9k 信道切换序列（参考 ar9002_hw_set_channel） */
     /* 触发 RFBUS 请求，等待 grant */
     ath9k_reg_write(AR_PHY_RFBUS_REQ, 0x1);
-    delay_us(5);
+    dkm_delay_us(5);
     for (u32 i = 0; i < 1000; i++) {
         if (ath9k_reg_read(AR_PHY_RFBUS_REQ) & 0x2) break;
-        delay_us(1);
+        dkm_delay_us(1);
     }
     ath9k_reg_write(AR_PHY_RFBUS_REQ, 0);
-    delay_us(50);
+    dkm_delay_us(50);
 }
 
 /* ---- 被动扫描状态机 ----
@@ -684,7 +569,7 @@ static int ath9k_scan_start_impl(void *ctx) {
         /* 在该信道停留 ~400ms，期间轮询 RX 环 */
         for (u32 tick = 0; tick < 400; tick++) {
             ath9k_rx_drain();
-            delay_us(1000);
+            dkm_delay_us(1000);
         }
     }
     g_scanning = 0;
@@ -752,6 +637,8 @@ __attribute__((visibility("default")))
 int driver_init(const struct dkm_kernel_api *api,
                 struct dkm_driver_handle *handle) {
     (void)handle;
+    /* 实机要求: 先校准 TSC, 再使用基于 CPU 频率的延迟 */
+    dkm_tsc_calibrate();
     raw_log("[ath9k.raw] driver_init entered\n");
     if (!api || !api->log) return -1;
     g_log = api->log;
@@ -766,7 +653,7 @@ int driver_init(const struct dkm_kernel_api *api,
 
     /* 2. 启用 PCI 命令（MEM + Bus Master） */
     u32 cmd = pci_read(bus, dev, 0, PCI_COMMAND);
-    pci_write(bus, dev, 0, PCI_COMMAND, cmd | PCI_CMD_MEM | PCI_CMD_BUSMST);
+    pci_write(bus, dev, 0, PCI_COMMAND, cmd | PCI_CMD_MEM | PCI_CMD_BUSM);
 
     /* 3. 读取 BAR0 */
     u32 bar0 = pci_read(bus, dev, 0, PCI_BAR0);

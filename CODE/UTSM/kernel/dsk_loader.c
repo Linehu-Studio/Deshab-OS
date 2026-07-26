@@ -152,7 +152,8 @@ static struct limine_file *dsk_find_module(void) {
 /* ---- FAT32 block-provider file reader ---- */
 static u8 g_dsk_fat32_disk[65536];  /* 128-sector BPB+FAT+root dir buffer */
 static u8 g_dsk_fat32_cluster[4096]; /* 8-sector cluster buffer */
-static u8 g_dsk_fat32_filedata[65536]; /* file data buffer */
+/* 实机要求: 文件缓冲区足够大容纳 deshab.elf (~1.5MB) */
+static u8 g_dsk_fat32_filedata[2097152]; /* 2MB file data buffer */
 
 static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
     const dkm_kernel_api *api = dkm_get_kernel_api();

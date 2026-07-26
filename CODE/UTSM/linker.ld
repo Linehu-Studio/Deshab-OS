@@ -25,6 +25,9 @@ SECTIONS
     .data : ALIGN(4K) {
         *(.data*)
         *(COMMON)
+    } :data
+
+    .bss : ALIGN(4K) {
         *(.bss*)
     } :data
 }

@@ -32,6 +32,10 @@ static void sputc(char c) {
 static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static void slog(const char *s) { swrite("[desktop] "); swrite(s); swrite("\n"); }
 
+/* 前向声明 */
+static void redraw_all(void);
+static int  ps2_mouse_poll(void);
+
 /* ============================================================
  *  常量
  * ============================================================ */
@@ -184,15 +188,15 @@ static const u8 cursor_shape[24][24] = {
     {1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {1,1,1,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {1,1,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {1,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
@@ -308,6 +312,22 @@ static void cursor_draw(int mx, int my) {
     }
 }
 
+/* 非阻塞延时：动画期间持续轮询鼠标，保持光标响应。
+ * 将 ms 个 50000-iter pause 块拆开，每块结束后轮询一次鼠标。
+ * 若鼠标有新数据包，立即擦除旧光标、在新位置保存背景并重绘光标。 */
+static void anim_delay_poll_mouse(u32 ms) {
+    for (u32 i = 0; i < ms; i++) {
+        for (volatile u32 j = 0; j < 50000; j++) {
+            __asm__ volatile("pause");
+        }
+        if (ps2_mouse_poll()) {
+            cursor_restore_bg();
+            cursor_save_bg(g_mouse_x, g_mouse_y);
+            cursor_draw(g_mouse_x, g_mouse_y);
+        }
+    }
+}
+
 /* ============================================================
  *  窗口管理
  * ============================================================ */
@@ -372,6 +392,28 @@ static void win_destroy(desktop_window *w) {
         if (g_windows[i].id == w->id) { idx = i; break; }
     }
     if (idx < 0) return;
+
+    /* Window close animation - shrinking rectangle */
+    {
+        int wx = w->x, wy = w->y, ww = w->w, wh = w->h;
+        w->visible = 0;
+        for (int step = 5; step >= 0; step--) {
+            int scale = (step + 1) * 100 / 6;
+            int aw = ww * scale / 100;
+            int ah = wh * scale / 100;
+            int ax = wx + (ww - aw) / 2;
+            int ay = wy + (wh - ah) / 2;
+            cursor_restore_bg();
+            redraw_all();
+            /* redraw_all 末尾已绘制光标，这里先擦除以保证保存的背景干净（不含光标像素） */
+            cursor_restore_bg();
+            du_rect_outline(&g_fb, ax, ay, aw, ah, DS_DARK_ACCENT, DU_RADIUS_SM);
+            cursor_save_bg(g_mouse_x, g_mouse_y);
+            cursor_draw(g_mouse_x, g_mouse_y);
+            anim_delay_poll_mouse(16);
+        }
+    }
+
     /* 调用应用的 on_destroy */
     if (w->app_id >= 0 && w->app_id < g_app_count && g_apps[w->app_id].on_destroy && w->app_state) {
         g_apps[w->app_id].on_destroy(w->app_state);
@@ -474,7 +516,20 @@ static void draw_taskbar(void) {
         if (w->minimized) continue;
         u32 btn_bg = w->focused ? DS_DARK_ACCENT : DP_ABYSS_600;
         du_fill_rounded_rect(&g_fb, wx, tb_y + 4, 100, 32, btn_bg, DU_RADIUS_SM);
-        du_draw_string(&g_fb, w->title, wx + 4, tb_y + 8,
+        /* Truncate title to fit button width (100px - 8px padding = ~11 chars) */
+        char truncated[16];
+        int max_chars = 11;
+        int tlen = 0;
+        while (w->title[tlen] && tlen < max_chars) { truncated[tlen] = w->title[tlen]; tlen++; }
+        if (tlen == max_chars && w->title[tlen]) {
+            /* Add ellipsis */
+            if (tlen > 8) tlen = 8;
+            truncated[tlen++] = '.';
+            truncated[tlen++] = '.';
+            truncated[tlen++] = '.';
+        }
+        truncated[tlen] = 0;
+        du_draw_string(&g_fb, truncated, wx + 4, tb_y + 8,
                        DS_DARK_TEXT_PRIMARY, btn_bg, DU_ASCII_STEP);
         wx += 104;
         if (wx > (int)g_fb_w - 200) break;
@@ -507,7 +562,7 @@ static void draw_taskbar(void) {
 static void draw_desktop_icons(void) {
     for (int i = 0; i < g_icon_count; i++) {
         desktop_icon *ic = &g_icons[i];
-        int cx = ic->x;
+        int cx = ic->x + (DESKTOP_ICON_W - 32) / 2;  /* center icon in slot */
         int cy = ic->y;
         /* 根据应用 ID 画不同图标 */
         switch (ic->app_id) {
@@ -520,8 +575,8 @@ static void draw_desktop_icons(void) {
         /* 标签文字 */
         int label_len = 0;
         while (ic->label[label_len]) label_len++;
-        int label_x = cx + (32 - label_len * (int)DU_ASCII_STEP) / 2;
-        if (label_x < cx) label_x = cx;
+        int label_x = ic->x + (DESKTOP_ICON_W - label_len * (int)DU_ASCII_STEP) / 2;
+        if (label_x < ic->x) label_x = ic->x;
         du_draw_string(&g_fb, ic->label, label_x, cy + 36,
                        DS_DARK_TEXT_PRIMARY, DS_DARK_BG_PRIMARY, DU_ASCII_STEP);
     }
@@ -531,43 +586,94 @@ static void draw_desktop_icons(void) {
  *  PS/2 鼠标处理
  * ============================================================ */
 
+/* PS/2 控制器等待 — 输入缓冲区空（可写） */
+static int ps2_wait_write(void) {
+    for (int t = 0; t < 200000; t++) {
+        if (!(inb(0x64) & 0x02)) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+
+/* PS/2 控制器等待 — 输出缓冲区满（可读） */
+static int ps2_wait_read(void) {
+    for (int t = 0; t < 200000; t++) {
+        if (inb(0x64) & 0x01) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+
+/* 排干输出缓冲区中所有残留数据（带超时） */
+static void ps2_drain(void) {
+    for (int i = 0; i < 16; i++) {
+        if (!(inb(0x64) & 0x01)) break;
+        inb(0x60);
+    }
+}
+
 static void ps2_mouse_init(void) {
-    /* 启用 AUX 设备 */
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    /* 1. 刷新固件/上一阶段留下的残留数据 */
+    ps2_drain();
+
+    /* 2. 启用 AUX（鼠标）端口 */
+    ps2_wait_write();
     outb(0x64, 0xA8);
-    /* 启用 AUX IRQ */
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+
+    /* 3. 读取控制器配置字节 */
+    ps2_wait_write();
     outb(0x64, 0x20);
-    for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
+    ps2_wait_read();
     u8 cfg = inb(0x60);
-    cfg |= 0x02;  /* enable AUX IRQ12 */
+
+    /* 4. 设置配置：bit5=0(启用 AUX 时钟), bit1=1(启用 AUX IRQ12), bit6=1(Set2→Set1 转换) */
     cfg &= ~0x20; /* enable AUX clock */
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    cfg |= 0x02;  /* enable AUX IRQ12 */
+    cfg |= 0x40;  /* enable Set2→Set1 translation */
+
+    /* 5. 写回控制器配置 */
+    ps2_wait_write();
     outb(0x64, 0x60);
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    ps2_wait_write();
     outb(0x60, cfg);
-    /* 复位鼠标 */
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+
+    /* 6. 复位鼠标 (0xFF) — 响应为 ACK(0xFA) + 自检(0xAA) + 设备ID(0x00)，共 3 字节 */
+    ps2_wait_write();
     outb(0x64, 0xD4);
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    ps2_wait_write();
     outb(0x60, 0xFF);
-    for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
-    inb(0x60); /* ACK */
-    /* 启用 streaming */
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    /* 排干所有复位响应字节（最多 8 字节，带超时） */
+    for (int i = 0; i < 8; i++) {
+        if (ps2_wait_read() != 0) break;
+        inb(0x60);
+    }
+
+    /* 7. 启用数据流模式 (0xF4) — 响应为 ACK(0xFA) */
+    ps2_wait_write();
     outb(0x64, 0xD4);
-    for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
+    ps2_wait_write();
     outb(0x60, 0xF4);
-    for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
-    inb(0x60); /* ACK */
+    /* 排干 ACK */
+    for (int i = 0; i < 4; i++) {
+        if (ps2_wait_read() != 0) break;
+        inb(0x60);
+    }
+
+    /* 8. 最终刷新：丢弃任何杂散字节，确保数据包从干净状态开始 */
+    ps2_drain();
+
+    /* 重置鼠标数据包解析状态 */
+    g_mouse_idx = 0;
+    g_mouse_has_pkt = 0;
+
     slog("mouse init ok");
 }
 
 static int ps2_mouse_poll(void) {
     u8 st = inb(0x64);
     if (!(st & 1)) return 0;
+    if (!(st & 0x20)) return 0; /* 不是鼠标数据（键盘数据留给键盘处理） */
     u8 data = inb(0x60);
-    if (!(st & 0x20)) return 0; /* 不是鼠标数据 */
 
     g_mouse_buf[g_mouse_idx++] = data;
     if (g_mouse_idx < 3) return 0;
@@ -578,11 +684,8 @@ static int ps2_mouse_poll(void) {
 
     int dx = (int)(i8)g_mouse_buf[1];
     int dy = (int)(i8)g_mouse_buf[2];
-    if (g_mouse_buf[0] & 0x10) dx = -dx; /* X sign */
-    /* 注意：Y 轴方向（鼠标 Y 向上为正，屏幕 Y 向下为正） */
-    if (!(g_mouse_buf[0] & 0x20)) dy = -dy; /* Y sign */
-    else dy = -dy;
-    dy = -dy; /* 鼠标 Y 翻转 */
+    /* (i8) 转换已处理符号位，无需再检查 sign bits */
+    dy = -dy; /* PS/2 Y 向上为正，屏幕 Y 向下为正，需翻转 */
 
     g_mouse_x += dx;
     g_mouse_y += dy;
@@ -591,7 +694,10 @@ static int ps2_mouse_poll(void) {
     if (g_mouse_x >= (int)g_fb_w - CURSOR_SIZE) g_mouse_x = (int)g_fb_w - CURSOR_SIZE;
     if (g_mouse_y >= (int)g_fb_h - CURSOR_SIZE) g_mouse_y = (int)g_fb_h - CURSOR_SIZE;
 
+    int old_btn = g_mouse_btn;
     g_mouse_btn = (g_mouse_buf[0] & 0x01) ? 1 : 0;
+    /* Only signal redraw if something visual changed */
+    if (dx == 0 && dy == 0 && g_mouse_btn == old_btn) return 0;
     g_mouse_has_pkt = 1;
     return 1;
 }
@@ -1210,6 +1316,24 @@ static void launch_app(int app_id) {
 
     win->app_state = app->on_create(&ctx);
     win->dirty = 1;
+
+    /* Window open animation - expanding rectangle */
+    for (int step = 0; step < 6; step++) {
+        int scale = (step + 1) * 100 / 6;
+        int aw = win->w * scale / 100;
+        int ah = win->h * scale / 100;
+        int ax = win->x + (win->w - aw) / 2;
+        int ay = win->y + (win->h - ah) / 2;
+        cursor_restore_bg();
+        redraw_all();
+        /* redraw_all 末尾已绘制光标，这里先擦除以保证保存的背景干净（不含光标像素） */
+        cursor_restore_bg();
+        du_rect_outline(&g_fb, ax, ay, aw, ah, DS_DARK_ACCENT, DU_RADIUS_SM);
+        cursor_save_bg(g_mouse_x, g_mouse_y);
+        cursor_draw(g_mouse_x, g_mouse_y);
+        anim_delay_poll_mouse(16);
+    }
+
     slog("app launched");
 }
 
@@ -1229,13 +1353,16 @@ static void redraw_all(void) {
         desktop_window *w = &g_windows[i];
         if (w->minimized || !w->visible) continue;
 
+        /* 窗口装饰（先画框架作为窗口背景：主体、标题栏、边框） */
+        draw_window_frame(w);
+
         /* 窗口客户区背景 */
         int cx = w->x + BORDER_W;
         int cy = w->y + TITLEBAR_H;
         int cw = w->w - 2 * BORDER_W;
         int ch = w->h - TITLEBAR_H - BORDER_W;
 
-        /* 调用应用绘制 */
+        /* 调用应用绘制（在框架之上绘制客户区内容） */
         if (w->app_id >= 0 && w->app_id < g_app_count && g_apps[w->app_id].on_draw && w->app_state) {
             app_ctx ctx;
             ctx.fb = &g_fb;
@@ -1247,9 +1374,6 @@ static void redraw_all(void) {
             ctx.kernel_api = g_kernel_api;
             g_apps[w->app_id].on_draw(w->app_state, &ctx);
         }
-
-        /* 窗口装饰（在应用内容之上） */
-        draw_window_frame(w);
     }
 
     /* 任务栏 */
@@ -1301,18 +1425,17 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
         /* 轮询 PS/2 鼠标 */
         if (ps2_mouse_poll()) {
-            need_redraw = 1;
-
-            /* 拖拽处理 */
+            /* 拖拽处理 - 需要全屏重绘 */
             if (g_dragging && g_drag_win >= 0) {
                 desktop_window *w = win_find(g_drag_win);
                 if (w) {
                     w->x = g_mouse_x - g_drag_off_x;
                     w->y = g_mouse_y - g_drag_off_y;
                 }
+                need_redraw = 1;
             }
 
-            /* 鼠标点击事件 */
+            /* 鼠标点击事件 - 需要全屏重绘 */
             if (g_mouse_btn) {
                 /* 检查任务栏点击 */
                 int tb_y = (int)g_fb_h - TASKBAR_H;
@@ -1431,6 +1554,11 @@ next:
         if (need_redraw) {
             cursor_restore_bg();
             redraw_all();
+        } else if (g_mouse_has_pkt) {
+            /* 鼠标移动但无需全屏重绘：只更新光标位置 */
+            cursor_restore_bg();
+            cursor_save_bg(g_mouse_x, g_mouse_y);
+            cursor_draw(g_mouse_x, g_mouse_y);
         }
 
         __asm__("pause");

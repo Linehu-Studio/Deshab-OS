@@ -4,100 +4,7 @@
  * and ports so later block I/O can be added safely.
  */
 
-#include <stdint.h>
-
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
-
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef long long          i64;
-
-#define NULL ((void *)0)
-
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_dma_buffer {
-    void *virt;
-    u64 phys;
-    u64 size;
-};
-
-struct dkm_dma_api {
-    int (*alloc_pages)(u64 page_count, u64 alignment, u64 max_phys, struct dkm_dma_buffer *out);
-};
-
-struct dkm_block_device_desc {
-    const char *name;
-    u64 sector_size;
-    u64 sector_count;
-    void *ctx;
-    int (*read)(void *ctx, u64 lba, u32 count, void *buffer);
-};
-
-struct dkm_block_api {
-    int (*register_device)(const struct dkm_block_device_desc *desc);
-    u32 (*device_count)(void);
-    int (*read)(u32 index, u64 lba, u32 count, void *buffer);
-    u64 (*sector_size)(u32 index);
-    const char *(*device_name)(u32 index);
-};
-
-struct dkm_kernel_api {
-    u32 version;
-    u32 size;
-    u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem;
-    const void *utsm;
-    const void *irq;
-    const void *pci;
-    const struct dkm_dma_api *dma;
-    const void *vfs;
-    const void *net;
-    const void *timer;
-    const void *drr;
-    const void *rsdp_address;
-    const void *fb_address;
-    u64 fb_width;
-    u64 fb_height;
-    u64 fb_pitch;
-    u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-    u64 hhdm_offset;
-    const struct dkm_block_api *block;
-};
-
-struct dkm_driver_handle;
-
-struct dkm_driver_desc {
-    u32 magic;
-    u16 abi_version;
-    u16 desc_size;
-    const char *name;
-    const char *version;
-    const char *vendor;
-    u32 driver_class;
-    u32 stage;
-    u32 flags;
-    u32 priority;
-    const char *const *depends;
-    u32 depends_count;
-    const char *const *provides;
-    u32 provides_count;
-    u64 min_kernel_abi;
-    u64 feature_bits;
-    u64 reserved0;
-    u64 reserved1;
-};
+#include "../dkm_shared.h"
 
 static const char *const g_depends[] = { "pci", "irq" };
 static const char *const g_provides[] = { "block" };
@@ -123,21 +30,6 @@ const struct dkm_driver_desc driver_desc = {
     .reserved0      = 0,
     .reserved1      = 0
 };
-
-#define PCI_ADDR       0xCF8
-#define PCI_DATA       0xCFC
-#define PCI_VENDOR_ID  0x00
-#define PCI_COMMAND    0x04
-#define PCI_PROG_IF    0x09
-#define PCI_SUBCLASS   0x0A
-#define PCI_CLASS      0x0B
-#define PCI_HEADER     0x0E
-#define PCI_BAR5       0x24
-#define PCI_IRQ_LINE   0x3C
-
-#define PCI_CMD_IO     (1u << 0)
-#define PCI_CMD_MEM    (1u << 1)
-#define PCI_CMD_BUSM   (1u << 2)
 
 #define AHCI_CLASS_STORAGE 0x01
 #define AHCI_SUBCLASS_SATA 0x06
@@ -170,12 +62,15 @@ const struct dkm_driver_desc driver_desc = {
 
 #define AHCI_CMD_ST    (1u << 0)
 #define AHCI_CMD_FRE   (1u << 4)
+#define AHCI_CMD_W     (1u << 6)
 #define AHCI_CMD_FR    (1u << 14)
 #define AHCI_CMD_CR    (1u << 15)
 #define AHCI_CMD_ICC_ACTIVE (1u << 28)
 
 #define ATA_CMD_IDENTIFY        0xEC
 #define ATA_CMD_IDENTIFY_PACKET 0xA1
+#define ATA_CMD_READ_DMA_EXT    0x25
+#define ATA_CMD_WRITE_DMA_EXT   0x35
 
 typedef struct __attribute__((packed)) ahci_cmd_header {
     u16 flags;
@@ -207,34 +102,12 @@ static ahci_cmd_header *g_cmd_header;
 static struct dkm_dma_buffer g_cmd_table;
 static struct dkm_dma_buffer g_data;
 
-static __inline__ void outl(u16 port, u32 value) {
-    __asm__ volatile ("outl %0, %1" :: "a"(value), "Nd"(port));
-}
-
-static __inline__ u32 inl(u16 port) {
-    u32 value;
-    __asm__ volatile ("inl %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
-    u32 addr = (1u << 31)
-             | ((u32)bus << 16)
-             | ((u32)dev << 11)
-             | ((u32)func << 8)
-             | ((u32)reg & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
+    return dkm_pci_read(bus, dev, func, reg);
 }
 
 static void pci_write(u8 bus, u8 dev, u8 func, u8 reg, u32 value) {
-    u32 addr = (1u << 31)
-             | ((u32)bus << 16)
-             | ((u32)dev << 11)
-             | ((u32)func << 8)
-             | ((u32)reg & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, value);
+    dkm_pci_write(bus, dev, func, reg, value);
 }
 
 static void log_hex(const char *prefix, u64 value) {
@@ -333,15 +206,21 @@ static int ahci_stop_port(u32 port) {
     u32 cmd = g_abar[(base + PxCMD) / 4];
     cmd &= ~AHCI_CMD_ST;
     g_abar[(base + PxCMD) / 4] = cmd;
-    for (u32 i = 0; i < 100000; i++) {
+    /* 实机: 500ms TSC 超时等待 CR 清除 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 500;
+    while (dkm_rdtsc() < deadline) {
         cmd = g_abar[(base + PxCMD) / 4];
         if (!(cmd & AHCI_CMD_CR)) break;
+        __asm__ volatile("pause");
     }
     cmd &= ~AHCI_CMD_FRE;
     g_abar[(base + PxCMD) / 4] = cmd;
-    for (u32 i = 0; i < 100000; i++) {
+    /* 实机: 500ms TSC 超时等待 FR 清除 */
+    deadline = dkm_rdtsc() + dkm_tsc_per_ms * 500;
+    while (dkm_rdtsc() < deadline) {
         cmd = g_abar[(base + PxCMD) / 4];
         if (!(cmd & AHCI_CMD_FR)) return 0;
+        __asm__ volatile("pause");
     }
     return -1;
 }
@@ -368,7 +247,23 @@ static void ahci_fill_read_fis(u8 *fis, u64 lba, u32 count) {
     ahci_zero(fis, 64);
     fis[0] = 0x27;
     fis[1] = 1u << 7;
-    fis[2] = 0x25;       /* READ DMA EXT */
+    fis[2] = ATA_CMD_READ_DMA_EXT;
+    fis[4] = (u8)(lba & 0xff);
+    fis[5] = (u8)((lba >> 8) & 0xff);
+    fis[6] = (u8)((lba >> 16) & 0xff);
+    fis[7] = (1u << 6) | (u8)((lba >> 24) & 0x0f);
+    fis[8] = (u8)((lba >> 24) & 0xff);
+    fis[9] = (u8)((lba >> 32) & 0xff);
+    fis[10] = (u8)((lba >> 40) & 0xff);
+    fis[12] = (u8)(count & 0xff);
+    fis[13] = (u8)((count >> 8) & 0xff);
+}
+
+static void ahci_fill_write_fis(u8 *fis, u64 lba, u32 count) {
+    ahci_zero(fis, 64);
+    fis[0] = 0x27;
+    fis[1] = 1u << 7;
+    fis[2] = ATA_CMD_WRITE_DMA_EXT;
     fis[4] = (u8)(lba & 0xff);
     fis[5] = (u8)((lba >> 8) & 0xff);
     fis[6] = (u8)((lba >> 16) & 0xff);
@@ -420,7 +315,81 @@ static int ahci_read_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm_
     return -3;
 }
 
+static int ahci_write_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm_dma_buffer *table, struct dkm_dma_buffer *data, u64 lba, u32 count, const void *buffer) {
+    if (!buffer || count == 0) return -1;
+    if (count > 8) return -2;
+    u32 base = HBA_PORT_BASE + port * HBA_PORT_SIZE;
+    ahci_cmd_table *tbl = (ahci_cmd_table *)table->virt;
+    u32 bytes = count * 512;
+    ahci_zero(tbl, sizeof(ahci_cmd_table));
+
+    /* copy data from user buffer into DMA buffer */
+    {
+        u8 *dst = (u8 *)data->virt;
+        const u8 *src = (const u8 *)buffer;
+        for (u32 j = 0; j < bytes; j++) dst[j] = src[j];
+    }
+
+    hdr[0].flags = 5 | (1u << 6);  /* CFL=5, W=1 (write) */
+    hdr[0].prdtl = 1;
+    hdr[0].prdbc = 0;
+    hdr[0].ctba = (u32)(table->phys & 0xffffffffu);
+    hdr[0].ctbau = (u32)(table->phys >> 32);
+
+    tbl->prdt[0].dba = (u32)(data->phys & 0xffffffffu);
+    tbl->prdt[0].dbau = (u32)(data->phys >> 32);
+    tbl->prdt[0].dbc_i = (bytes - 1) | (1u << 31);
+    ahci_fill_write_fis(tbl->cfis, lba, count);
+
+    /* set PxCMD.W to indicate write direction */
+    u32 cmd = g_abar[(base + PxCMD) / 4];
+    cmd |= AHCI_CMD_W;
+    g_abar[(base + PxCMD) / 4] = cmd;
+
+    g_abar[(base + PxIS) / 4] = 0xffffffffu;
+    g_abar[HBA_IS / 4] = (1u << port);
+    g_abar[(base + PxCI) / 4] = 1;
+    for (u32 i = 0; i < 5000000; i++) {
+        if ((g_abar[(base + PxCI) / 4] & 1u) == 0) {
+            /* clear PxCMD.W after write completes */
+            cmd = g_abar[(base + PxCMD) / 4];
+            cmd &= ~AHCI_CMD_W;
+            g_abar[(base + PxCMD) / 4] = cmd;
+            return 0;
+        }
+    }
+
+    /* timeout: clear PxCMD.W */
+    cmd = g_abar[(base + PxCMD) / 4];
+    cmd &= ~AHCI_CMD_W;
+    g_abar[(base + PxCMD) / 4] = cmd;
+
+    g_log->warn("[ahci] WRITE timeout");
+    log_hex("[ahci] WRITE lba=", lba);
+    log_hex("[ahci] WRITE count=", count);
+    log_hex("[ahci] WRITE CI=", g_abar[(base + PxCI) / 4]);
+    log_hex("[ahci] WRITE IS=", g_abar[(base + PxIS) / 4]);
+    log_hex("[ahci] WRITE TFD=", g_abar[(base + PxTFD) / 4]);
+    return -3;
+}
+
 static int ahci_block_read(void *ctx, u64 lba, u32 count, void *buffer) {
+    (void)ctx;
+    if (g_ready_port == 0xffffffffu || !g_cmd_header) return -1;
+    log_hex("[ahci] block_read lba=", lba);
+    log_hex("[ahci] block_read count=", count);
+    while (count > 0) {
+        u32 chunk = count > 8 ? 8 : count;
+        int status = ahci_read_blocks_internal(g_ready_port, g_cmd_header, &g_cmd_table, &g_data, lba, chunk, buffer);
+        if (status != 0) return status;
+        lba += chunk;
+        count -= chunk;
+        buffer = (void *)((u8 *)buffer + (chunk * 512));
+    }
+    return 0;
+}
+
+static int ahci_block_write(void *ctx, u64 lba, u32 count, const void *buffer) {
     (void)ctx;
     if (g_ready_port == 0xffffffffu || !g_cmd_header) return -1;
     /* ensure port is in ST+FRE state */
@@ -433,11 +402,11 @@ static int ahci_block_read(void *ctx, u64 lba, u32 count, void *buffer) {
     }
     while (count > 0) {
         u32 chunk = count > 8 ? 8 : count;
-        int status = ahci_read_blocks_internal(g_ready_port, g_cmd_header, &g_cmd_table, &g_data, lba, chunk, buffer);
+        int status = ahci_write_blocks_internal(g_ready_port, g_cmd_header, &g_cmd_table, &g_data, lba, chunk, buffer);
         if (status != 0) return status;
         lba += chunk;
         count -= chunk;
-        buffer = (void *)((u8 *)buffer + (chunk * 512));
+        buffer = (const void *)((const u8 *)buffer + (chunk * 512));
     }
     return 0;
 }
@@ -536,6 +505,8 @@ __attribute__((visibility("default")))
 int driver_init(const struct dkm_kernel_api *api,
                 struct dkm_driver_handle *handle) {
     (void)handle;
+    /* 实机要求: 先校准 TSC, 再使用基于 CPU 频率的延迟 */
+    dkm_tsc_calibrate();
 
     if (!api || !api->log) return -1;
     g_log = api->log;
@@ -628,6 +599,7 @@ int driver_init(const struct dkm_kernel_api *api,
         desc.sector_count = 0;
         desc.ctx = 0;
         desc.read = ahci_block_read;
+        desc.write = ahci_block_write;
         int index = api->block->register_device(&desc);
         log_hex("[ahci] block provider index=", (u64)(i64)index);
     } else if (identified) {

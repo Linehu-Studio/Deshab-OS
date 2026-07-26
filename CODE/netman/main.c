@@ -249,8 +249,48 @@ static u16 udp_checksum_ipv4(const u8 *ip, const u8 *udp, u32 udp_len) {
     return out ? out : 0xffff;
 }
 
+/* ---- TSC-based timing (实机要求: 用 CPU 频率计算, 不用循环) ---- */
+static u64 g_tsc_per_ms = 0;
+
+static inline u64 rdtsc_nm(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+static void tsc_calibrate_nm(void) {
+    outb(0x43, 0x30);       /* ch0, lo+hi, mode 0, binary */
+    outb(0x40, 0x7c);       /* 11932 low = ~10ms */
+    outb(0x40, 0x2e);       /* 11932 high */
+    u64 tsc_start = rdtsc_nm();
+    u16 prev = 0; u64 loops = 0;
+    for (;;) {
+        outb(0x43, 0x00);
+        u16 cur = (u16)inb(0x40) | ((u16)inb(0x40) << 8);
+        if (cur > prev && loops > 10) break;
+        prev = cur; loops++;
+    }
+    u64 tsc_end = rdtsc_nm();
+    g_tsc_per_ms = (tsc_end - tsc_start) / 10;
+}
+
+static void delay_ms_nm(u32 ms) {
+    if (!g_tsc_per_ms) {
+        for (volatile u32 i = 0; i < 100000 * ms; i++) __asm__ volatile("pause");
+        return;
+    }
+    u64 target = g_tsc_per_ms * ms;
+    u64 start = rdtsc_nm();
+    while (rdtsc_nm() - start < target) __asm__ volatile("pause");
+}
+
 static void delay_spin(u32 loops) {
-    for (volatile u32 i=0;i<loops;i++) { __asm__ volatile("pause"); }
+    /* 兼容旧调用: 粗略转换为 ms (实机以 TSC 为准) */
+    if (g_tsc_per_ms) {
+        delay_ms_nm(loops / 10000 + 1);
+    } else {
+        for (volatile u32 i=0;i<loops;i++) { __asm__ volatile("pause"); }
+    }
 }
 
 /* 构造并发送一个 DHCP 报文。type: 1=DISCOVER 3=REQUEST */
@@ -617,6 +657,8 @@ __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     logl("[netman] boot");
     if (!ctx || ctx->magic != DSK_BOOT_MAGIC) { logl("[netman] bad context"); return; }
+    logl("[netman] calibrating TSC (实机 CPU 频率计算)");
+    tsc_calibrate_nm();
     u64 api = ctx->dkm_kernel_api;
     if (api) {
         u64 block_api = *(u64 *)(api + 0xA8);

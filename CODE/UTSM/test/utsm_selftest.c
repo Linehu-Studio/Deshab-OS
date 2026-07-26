@@ -1,16 +1,25 @@
 #include <utsm/utsm.h>
 #include <utsm/log.h>
 #include <utsm/segment.h>
+#include <utsm/arena.h>
 
 int memcmp(const void *a, const void *b, usize len);
 usize strlen(const char *s);
 
 int utsm_selftest_run(void) {
-    utsm_process_context process;
-    utsm_process_create_test(&process, 1);
+    log_info("[UTSM] selftest enter");
+
+    /* utsm_process_context is ~8KB (256 capabilities × 32 bytes).
+     * Allocate from arena instead of stack to avoid kernel stack overflow. */
+    utsm_process_context *process = (utsm_process_context *)kmem_alloc(sizeof(utsm_process_context));
+    if (!process) {
+        log_error("[UTSM] selftest: failed to allocate process context");
+        return UTSM_ERR_NO_MEMORY;
+    }
+    utsm_process_create_test(process, 1);
 
     utsm_capability cap;
-    int status = utsm_create_segment(&process, UTSM_PAGE_SIZE, UTSM_SEG_F_READ | UTSM_SEG_F_WRITE | UTSM_SEG_F_STRONG_RECOVERY, &cap);
+    int status = utsm_create_segment(process, UTSM_PAGE_SIZE, UTSM_SEG_F_READ | UTSM_SEG_F_WRITE | UTSM_SEG_F_STRONG_RECOVERY, &cap);
     if (status != UTSM_OK) {
         log_error("[UTSM] selftest create segment failed");
         return status;

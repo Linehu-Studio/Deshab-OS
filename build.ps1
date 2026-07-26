@@ -93,12 +93,12 @@ function Get-Crc32([byte[]]$Data) {
 }
 
 function Test-ShortFatName([string]$Name) {
-    if ($Name -match '[a-z]') { return $false }
+    if ($Name -cmatch '[a-z]') { return $false }
     $parts = $Name.Split('.')
     if ($parts.Count -gt 2) { return $false }
     if ($parts[0].Length -lt 1 -or $parts[0].Length -gt 8) { return $false }
     if ($parts.Count -eq 2 -and $parts[1].Length -gt 3) { return $false }
-    return $Name -match '^[A-Z0-9_\$%''\-@~`!\(\)\{\}\^#&]+(\.[A-Z0-9_\$%''\-@~`!\(\)\{\}\^#&]+)?$'
+    return ($Name -cmatch '^[A-Z0-9_]+$') -or ($Name -cmatch '^[A-Z0-9_]+\.[A-Z0-9_]+$')
 }
 
 function New-ShortFatName([string]$LongName, $Used) {
@@ -513,6 +513,24 @@ if (-not (Test-Path $FirstInitOutput)) {
 }
 Write-Host "[build] FirstInit Output: $FirstInitOutput"
 
+$LoginDir = Join-Path $Root 'CODE\login'
+$LoginOutput = Join-Path $SystemDir 'system\user\use\login.elf'
+
+Write-Host '[build] Building login.elf...'
+try {
+    & $make -C "$LoginDir" -f MAKEFILE "CC=$clang" "LD=$lld"
+    if ($LASTEXITCODE -ne 0) {
+        throw "make login failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+}
+
+if (-not (Test-Path $LoginOutput)) {
+    throw "login build did not produce $LoginOutput"
+}
+Write-Host "[build] login Output: $LoginOutput"
+
 $MouseDir = Join-Path $Root 'CODE\mouse'
 $MouseOutput = Join-Path $SystemDir 'system\deshab64\mouse\mouseInit.elf'
 
@@ -589,7 +607,7 @@ Write-Host "[build] desktop Output: $DesktopOutput"
 $ToolsDir = Join-Path $Root 'CODE\tools'
 $ToolsOutDir = Join-Path $SystemDir 'system\deshab64\tools'
 
-$toolApps = @('bash', 'editor', 'fileman', 'browser', 'curl', 'ping')
+$toolApps = @('editor', 'fileman', 'browser', 'curl', 'ping')
 
 foreach ($tool in $toolApps) {
     $toolDir = Join-Path $ToolsDir $tool
@@ -606,6 +624,9 @@ foreach ($tool in $toolApps) {
         }
     }
 }
+
+Write-Host '[build] Building DKM framebuffer driver...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\console_fb\console_fb.c') (Join-Path $SystemDir 'driver\console\console_fb.drv')
 
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')

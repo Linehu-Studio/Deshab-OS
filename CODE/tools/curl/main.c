@@ -1,11 +1,11 @@
-/* Deshab curl — 终端风格 HTTP 客户端 stub
- * 命令行输入 URL，显示 HTTP GET 请求结果。
- * 当前为 stub，提示需要 TCP/IP 栈支持。
+/* Deshab curl — 终端风格 HTTP 客户端
+ * 命令行输入 URL，发送 HTTP/1.0 GET 请求并打印响应（net_stack.h 共享协议栈）。
  * Esc 键退出返回 DSK。
  */
 
 #include "../../firstInit/ascii_bitmaps.c"
 #include "../desktop_app.h"
+#include "../net_stack.h"
 
 /* ---- 终端参数 ---- */
 #define TERM_COLS  120
@@ -125,29 +125,121 @@ static void redraw_all(void) {
     da_draw_statusbar(&g_ac, status, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
 }
 
-/* ---- URL 请求模拟 ---- */
+/* ---- HTTP GET 实现（net_stack.h） ---- */
+static int g_ns_status = 0;  /* 0=未尝试, 1=就绪, <0=失败 */
+
+static int curl_net_ready(void) {
+    if (g_ns_status == 1) return 1;
+    if (g_ns_status < 0) return 0;
+    int rc = ns_init((u64)g_ac.kernel_api);
+    g_ns_status = (rc == 0) ? 1 : -1;
+    if (rc != 0) {
+        term_puts_color("  [错误] 网络初始化失败，无可用网卡或 net API\n", DA_ERROR);
+        return 0;
+    }
+    return 1;
+}
+
 static void do_http_get(const char *url) {
+    if (!curl_net_ready()) return;
+
+    const char *p = url;
+    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':'&&p[5]=='/'&&p[6]=='/') p += 7;
+
+    char host[128]; int hl = 0;
+    while (*p && *p != ':' && *p != '/' && hl < 127) host[hl++] = *p++;
+    host[hl] = 0;
+    if (!hl) { term_puts_color("  [错误] 缺少主机名\n", DA_ERROR); return; }
+
+    u16 port = 80;
+    if (*p == ':') {
+        p++;
+        u32 pv = 0; int digits = 0;
+        while (*p >= '0' && *p <= '9') { pv = pv * 10 + (u32)(*p - '0'); p++; digits++; }
+        if (digits && pv <= 65535) port = (u16)pv;
+    }
+    char path[128]; int pl = 0;
+    if (*p == '/') {
+        while (*p && *p != ' ' && pl < 127) path[pl++] = *p++;
+    }
+    if (!pl) { path[0] = '/'; pl = 1; }
+    path[pl] = 0;
+
     term_puts_color("GET ", DA_PROMPT_COLOR);
     term_puts_color(url, DA_ACCENT_LIGHT);
     term_putc('\n');
-    term_puts_color("  -> 解析主机...\n", DA_TEXT_DIM);
-    term_puts_color("  -> 建立 TCP 连接...\n", DA_TEXT_DIM);
 
-    /* stub: 检查 kernel_api 是否有 net 接口 */
-    if (!g_ac.kernel_api) {
-        term_puts_color("  [错误] 无内核 API\n", DA_ERROR);
+    /* 解析主机 */
+    term_puts_color("  -> 解析 ", DA_TEXT_DIM);
+    term_puts_color(host, DA_TEXT_DIM);
+    term_puts_color("...\n", DA_TEXT_DIM);
+    redraw_all();
+    u32 ip;
+    if (ns_dns_resolve(host, &ip) != 0) {
+        term_puts_color("  [错误] DNS 解析失败\n", DA_ERROR);
         return;
     }
-    /* 尝试读取 net API — 当前为 stub */
-    u64 net_api = *(u64 *)((u64)g_ac.kernel_api + 0xC0);
-    if (!net_api) {
-        term_puts_color("  [错误] 需要 TCP/IP 栈支持\n", DA_ERROR);
-        term_puts_color("  当前内核未实现网络协议栈。\n", DA_WARNING);
-        term_puts_color("  请等待后续版本更新。\n", DA_TEXT_DIM);
+    char ipstr[24]; ns_fmt_ip(ip, ipstr);
+    term_puts_color("  -> ", DA_TEXT_DIM);
+    term_puts_color(ipstr, DA_TEXT_DIM);
+    term_putc('\n');
+
+    /* TCP 连接 */
+    term_puts_color("  -> TCP 连接...\n", DA_TEXT_DIM);
+    redraw_all();
+    if (ns_tcp_connect(ip, port, 2000) != 0) {
+        term_puts_color("  [错误] TCP 连接失败（超时/RST）\n", DA_ERROR);
         return;
     }
-    /* 如果有 net API，此处应实现真正的 HTTP GET */
-    term_puts_color("  [stub] 网络功能尚未实现\n", DA_WARNING);
+
+    /* 构造 HTTP/1.0 请求 */
+    static char req[512];
+    int r = 0;
+    const char *m = "GET "; while (*m) req[r++] = *m++;
+    for (int i = 0; i < pl; i++) req[r++] = path[i];
+    m = " HTTP/1.0\r\nHost: "; while (*m) req[r++] = *m++;
+    for (int i = 0; i < hl; i++) req[r++] = host[i];
+    m = "\r\nConnection: close\r\n\r\n"; while (*m) req[r++] = *m++;
+    req[r] = 0;
+
+    term_puts_color("  -> 已连接，发送请求\n", DA_TEXT_DIM);
+    redraw_all();
+    if (ns_tcp_send((const u8 *)req, (u32)r) != 0) {
+        term_puts_color("  [错误] 发送失败\n", DA_ERROR);
+        ns_tcp_close();
+        return;
+    }
+
+    /* 收至 FIN */
+    term_puts_color("  -> 等待响应...\n", DA_TEXT_DIM);
+    redraw_all();
+    int n = ns_tcp_recv(0, 0, 5000);
+    ns_tcp_close();
+    if (n < 0) {
+        term_puts_color("  [错误] 连接被重置\n", DA_ERROR);
+        return;
+    }
+    if (n == 0) {
+        term_puts_color("  [错误] 无响应数据（超时）\n", DA_ERROR);
+        return;
+    }
+
+    term_puts_color("  -> 收到 ", DA_SUCCESS);
+    char nb[12]; ns_u32_dec(nb, (u32)n);
+    term_puts_color(nb, DA_SUCCESS);
+    term_puts_color(" 字节\n\n", DA_SUCCESS);
+
+    /* 打印 status line + body */
+    u32 total = ns_tcp_rx_len;
+    u32 show = (u32)n;
+    for (u32 i = 0; i < show; i++) term_putc((char)ns_tcp_rx[i]);
+    if (total > show) {
+        term_puts_color("\n[... 已截断，共 ", DA_TEXT_DIM);
+        ns_u32_dec(nb, total);
+        term_puts_color(nb, DA_TEXT_DIM);
+        term_puts_color(" 字节]\n", DA_TEXT_DIM);
+    }
+    term_putc('\n');
 }
 
 /* ---- 内置命令 ---- */
@@ -168,8 +260,8 @@ static void cmd_help(void) {
 static void cmd_clear(void) { term_clear(); }
 
 static void cmd_version(void) {
-    term_puts_color("Deshab curl v0.1 (stub)\n", DA_SUCCESS);
-    term_puts_color("  HTTP 客户端功能需要 TCP/IP 栈支持\n", DA_TEXT_DIM);
+    term_puts_color("Deshab curl v1.0\n", DA_SUCCESS);
+    term_puts_color("  HTTP/1.0 GET via net_stack (e1000 + slirp)\n", DA_TEXT_DIM);
 }
 
 static void execute_command(const char *cmd) {
@@ -231,10 +323,9 @@ void dsk_entry(const da_boot_context *ctx) {
     term_clear();
 
     /* 启动 banner */
-    term_puts_color("=== Deshab curl v0.1 (stub) ===\n", DA_ACCENT);
+    term_puts_color("=== Deshab curl v1.0 ===\n", DA_ACCENT);
     term_puts_color("HTTP 命令行客户端\n", DA_SUCCESS);
     term_puts_color("输入 URL 发送 GET 请求 | 输入 'help' 查看帮助 | Esc 退出\n", DA_TEXT_DIM);
-    term_puts_color("注意: 当前需要 TCP/IP 栈支持\n", DA_WARNING);
     term_putc('\n');
 
     redraw_all();

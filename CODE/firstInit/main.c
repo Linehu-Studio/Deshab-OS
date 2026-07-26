@@ -16,6 +16,42 @@ typedef long long          i64;
 static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
 static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
 
+/* ---- TSC-based timing (实机要求: 用 CPU 频率计算, 不用循环) ---- */
+static u64 g_tsc_per_ms = 0;
+
+static __inline__ u64 rdtsc_fi(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+/* 用 PIT (8254, 1.193182 MHz) 校准 TSC 频率 */
+static void tsc_calibrate_fi(void) {
+    outb(0x43, 0x30);       /* ch0, lo+hi, mode 0, binary */
+    outb(0x40, 0x7c);       /* 11932 low = ~10ms */
+    outb(0x40, 0x2e);       /* 11932 high */
+    u64 tsc_start = rdtsc_fi();
+    u16 prev = 0; u64 loops = 0;
+    for (;;) {
+        outb(0x43, 0x00);
+        u16 cur = (u16)inb(0x40) | ((u16)inb(0x40) << 8);
+        if (cur > prev && loops > 10) break;
+        prev = cur; loops++;
+    }
+    u64 tsc_end = rdtsc_fi();
+    g_tsc_per_ms = (tsc_end - tsc_start) / 10;
+}
+
+static void delay_ms_fi(u32 ms) {
+    if (!g_tsc_per_ms) {
+        for (volatile u32 i = 0; i < 100000 * ms; i++) __asm__ volatile("pause");
+        return;
+    }
+    u64 target = g_tsc_per_ms * ms;
+    u64 start = rdtsc_fi();
+    while (rdtsc_fi() - start < target) __asm__ volatile("pause");
+}
+
 static void sputc(char c) {
     for (unsigned int i=0; i<100000; i++) { if (inb(COM1+5)&0x20) break; }
     outb(COM1, (unsigned char)c);
@@ -23,16 +59,20 @@ static void sputc(char c) {
 static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static void logl(const char *s) { swrite(s); swrite("\n"); }
 
-/* ---- PS/2 controller / mouse helpers (timeout-protected) ---- */
+/* ---- PS/2 controller / mouse helpers (timeout-protected, TSC-based) ---- */
 static int ps2_wait_write(void) {
-    for (volatile u32 i = 0; i < 100000; i++) {
+    u64 deadline = rdtsc_fi() + g_tsc_per_ms * 100;  /* 100ms 超时 */
+    while (rdtsc_fi() < deadline) {
         if (!(inb(0x64) & 0x02)) return 0;  /* input buffer empty */
+        __asm__ volatile("pause");
     }
     return -1;
 }
 static int ps2_wait_read(void) {
-    for (volatile u32 i = 0; i < 100000; i++) {
+    u64 deadline = rdtsc_fi() + g_tsc_per_ms * 100;  /* 100ms 超时 */
+    while (rdtsc_fi() < deadline) {
         if (inb(0x64) & 0x01) return 0;     /* output buffer full */
+        __asm__ volatile("pause");
     }
     return -1;
 }
@@ -81,12 +121,12 @@ static void mouse_init(void) {
     logl("[mouse] init done");
 }
 
-#define BG_TOP    0xFFC8E0F0u
-#define BG_BOTTOM 0xFF49306Fu
-#define BG_MID    0xFF8888B0u
-#define CARD_BG   0xFFEAF5FBu
-#define INPUT_BG  0xFFF0F5FAu
-#define TEXT_FG   0xFF5F7FA6u
+#define BG_TOP    0xFF2D2D30u
+#define BG_BOTTOM 0xFF1A1A1Eu
+#define BG_MID    0xFF3C3C40u
+#define CARD_BG   0xFF353539u
+#define INPUT_BG  0xFF2A2A2Eu
+#define TEXT_FG   0xFFE0E0E0u
 #define WELCOME_FG 0xFFE8F2FCu
 
 static u64 fb_a, fb_w, fb_h, fb_p;
@@ -127,6 +167,38 @@ static void fb_text(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg) {
     for (i64 i=0; s[i]; i++) fb_char(fb, (u32)(u8)s[i], x+i*ASCII_STEP, y, fg, bg);
 }
 
+/* width of an ASCII string in pixels (used to center English subtitles) */
+static i64 fb_text_width(const char *s) {
+    i64 n = 0;
+    while (s[n]) n++;
+    return n * ASCII_STEP;
+}
+
+/* Alpha-blended ASCII text — same as fb_text but multiplied by a global alpha,
+ * used to fade English subtitles in/out alongside the Chinese bitmaps. */
+static void fb_text_alpha(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg, u32 global_alpha) {
+    for (i64 i=0; s[i]; i++) {
+        u32 ch = (u32)(u8)s[i];
+        if (ch < ' ' || ch > '~') ch = ' ';
+        u32 idx = ch - ' ';
+        const u8 *g = g_ascii[idx];
+        for (i64 r=0; r<ASCII_H; r++) {
+            i64 yy = y + r;
+            if (yy < 0 || (u64)yy >= fb_h) continue;
+            u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+            for (i64 c=0; c<ASCII_W; c++) {
+                u32 a = g[r * ASCII_W + c];
+                if (a == 0) continue;
+                u32 eff_a = ((u32)a * global_alpha) >> 8;
+                if (eff_a == 0) continue;
+                i64 xx = x + i*ASCII_STEP + c;
+                if (xx < 0 || (u64)xx >= fb_w) continue;
+                line[(u64)xx] = (eff_a == 255) ? fg : blend(bg, fg, eff_a);
+            }
+        }
+    }
+}
+
 /* draw pre-rendered grayscale bitmap – writes only, no framebuffer read */
 static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y, u32 fg, u32 bg, u32 global_alpha) {
     for (i64 r=0; r<h; r++) {
@@ -136,7 +208,9 @@ static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y,
         for (i64 c=0; c<w; c++) {
             i64 xx = x + c;
             if (xx < 0 || (u64)xx >= fb_w) continue;
-            u32 a = ((u32)data[r*(u64)w + (u64)c] * global_alpha) >> 8;
+            u8 val = data[r*(u64)w + (u64)c];
+            if (val == 0) continue;  /* skip transparent – let background show through */
+            u32 a = ((u32)val * global_alpha) >> 8;
             line[(u64)xx] = blend(bg, fg, a);
         }
     }
@@ -228,25 +302,21 @@ static void stroke_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius,
 }
 
 static void delay_frame(void) {
-    for (volatile u32 d=0; d<300000; d++) __asm__("pause");
+    delay_ms_fi(33);  /* 实机: 基于 TSC 的 33ms 帧间隔 (~30fps) */
 }
 
 #include "text_bitmaps.c"
 
 static void fade_ring(u32 *fb, i64 cx, i64 cy, u32 bg) {
-    /* Smoothly erase a square sprite area with the same vertical gradient as DSK. */
+    /* Erase the spinner sprite area with gradient background in one frame. */
     (void)bg;
     i64 r = 72;
-    for (int step=0; step<12; step++) {
-        (void)step;
-        fill_gradient_rect(fb, cx-r, cy-r, r*2+1, r*2+1);
-        delay_frame();
-    }
+    fill_gradient_rect(fb, cx-r, cy-r, r*2+1, r*2+1);
 }
 
 static void draw_card(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 card, u32 bg_color) {
     (void)bg_color;
-    fill_rounded_rect(fb, x, y, w, h, 12, card);
+    fill_rounded_rect(fb, x, y, w, h, 4, card);
 }
 
 /* Draw gradient background + card in a single pass — per-row blend eliminates flicker */
@@ -266,9 +336,9 @@ static void draw_card_fade(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, u32 
 }
 
 static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *value, int mask, u32 fg, u32 card_bg, int active) {
-    u32 fill = active ? 0xFFFFFFFF : INPUT_BG;
-    fill_rounded_rect(fb, x, y, w, h, 8, fill);
-    stroke_rounded_rect(fb, x, y, w, h, 8, 1, active ? 0xFFB6C9DD : card_bg);
+    u32 fill = active ? 0xFF45454Au : INPUT_BG;
+    fill_rounded_rect(fb, x, y, w, h, 2, fill);
+    stroke_rounded_rect(fb, x, y, w, h, 2, 1, active ? 0xFF6C6C72 : 0xFF404044);
     char out[64]; int i=0;
     while(value[i] && i<60) { out[i] = mask ? '*' : value[i]; i++; }
     out[i]=0;
@@ -387,17 +457,35 @@ static void cursor_draw(u32 *fb, i64 mx, i64 my) {
 
 static void redraw_setup_card(u32 *fb, i64 card_x, i64 card_y, char *pc, char *user, char *pass, int active, u32 bg, u32 fg, i64 mx, i64 my) {
     u32 card = CARD_BG;
+    u32 sub_fg = 0xFF9098A0;  /* dimmer English subtitle color on card */
     cursor_erase(fb);
     fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_title, g_txt_title_w, g_txt_title_h, card_x+40, card_y+40, fg, card, 255);
+    fb_text(fb, "Account Setup", card_x+40, card_y+40+g_txt_title_h+2, sub_fg, card);
     fb_bitmap_alpha(fb, g_txt_computer, g_txt_computer_w, g_txt_computer_h, card_x+40, card_y+130, fg, card, 255);
+    fb_text(fb, "Computer Name", card_x+40, card_y+130+g_txt_computer_h+2, sub_fg, card);
     draw_rounded_input(fb, card_x+40, card_y+180, 820, 44, pc, 0, fg, card, active==0);
     fb_bitmap_alpha(fb, g_txt_username, g_txt_username_w, g_txt_username_h, card_x+40, card_y+280, fg, card, 255);
+    fb_text(fb, "Username", card_x+40, card_y+280+g_txt_username_h+2, sub_fg, card);
     draw_rounded_input(fb, card_x+40, card_y+330, 820, 44, user, 0, fg, card, active==1);
     fb_bitmap_alpha(fb, g_txt_password, g_txt_password_w, g_txt_password_h, card_x+40, card_y+430, fg, card, 255);
+    fb_text(fb, "Password", card_x+40, card_y+430+g_txt_password_h+2, sub_fg, card);
     draw_rounded_input(fb, card_x+40, card_y+480, 820, 44, pass, 1, fg, card, active==2);
     fb_bitmap_alpha(fb, g_txt_hint, g_txt_hint_w, g_txt_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
+    fb_text(fb, "Press Enter to confirm each field", card_x+40, card_y+555+g_txt_hint_h+2, 0xFF6F7F8C, card);
+    cursor_draw(fb, mx, my);
+}
+
+/* 仅重绘当前活动输入框，避免每次按键重绘整个卡片导致闪烁 */
+static void redraw_input_only(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char *user, char *pass, i64 mx, i64 my, u32 fg) {
+    u32 card = CARD_BG;
+    char *buf = field==0 ? pc : (field==1 ? user : pass);
+    int mask = (field == 2) ? 1 : 0;
+    i64 fy = card_y + 180 + (i64)field * 150;
+    cursor_erase(fb);
+    fill_rect(fb, card_x + 40, fy, 820, 44, card);
+    draw_rounded_input(fb, card_x+40, fy, 820, 44, buf, mask, fg, card, 1);
     cursor_draw(fb, mx, my);
 }
 
@@ -474,7 +562,7 @@ static int read_field(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char
             buf[len++] = c;
             buf[len] = 0;
         }
-        redraw_setup_card(fb, card_x, card_y, pc, user, pass, field, bg, fg, *mx, *my);
+        redraw_input_only(fb, card_x, card_y, field, pc, user, pass, *mx, *my, fg);
     }
 }
 
@@ -486,13 +574,62 @@ typedef struct {
     int theme;
 } setup_prefs;
 
-static const char *pref_value(int row, int val) {
-    if (row == 0) return val ? "English" : "Simplified Chinese";
-    if (row == 1) return val ? "Global" : "China Mainland";
-    if (row == 2) return val ? "UTC" : "Asia/Shanghai";
-    if (row == 3) return val ? "CN-QWERTY" : "US-QWERTY";
-    if (row == 4) return val ? "Dark" : "Light";
+/* 语言选项: 索引 0-11 */
+static const char *lang_names[] = {
+    "Simplified Chinese", "English (US)", "English (UK)", "Japanese",
+    "Korean", "French", "German", "Spanish",
+    "Portuguese", "Russian", "Arabic", "Hindi"
+};
+#define LANG_COUNT 12
+
+/* 键盘布局选项: 索引 0-8 */
+static const char *kb_names[] = {
+    "US-QWERTY", "CN-QWERTY", "UK-QWERTY", "JP-JIS",
+    "KR-104", "FR-AZERTY", "DE-QWERTZ", "ES-QWERTY",
+    "RU-JCUKEN"
+};
+#define KB_COUNT 9
+
+/* 区域选项 */
+static const char *region_names[] = {
+    "China Mainland", "Global", "United States", "United Kingdom",
+    "Japan", "Korea", "France", "Germany",
+    "Spain", "Russia"
+};
+#define REGION_COUNT 10
+
+/* 时区选项 */
+static const char *tz_names[] = {
+    "Asia/Shanghai", "UTC", "America/New_York", "America/Los_Angeles",
+    "Europe/London", "Asia/Tokyo", "Asia/Seoul", "Europe/Paris",
+    "Europe/Berlin", "Europe/Moscow"
+};
+#define TZ_COUNT 10
+
+/* 主题选项 */
+static const char *theme_names[] = { "Light", "Dark", "Auto" };
+#define THEME_COUNT 3
+
+static int pref_option_count(int row) {
+    if (row == 0) return LANG_COUNT;
+    if (row == 1) return REGION_COUNT;
+    if (row == 2) return TZ_COUNT;
+    if (row == 3) return KB_COUNT;
+    if (row == 4) return THEME_COUNT;
+    return 2;
+}
+
+static const char *pref_option_name(int row, int opt) {
+    if (row == 0) return lang_names[opt];
+    if (row == 1) return region_names[opt];
+    if (row == 2) return tz_names[opt];
+    if (row == 3) return kb_names[opt];
+    if (row == 4) return theme_names[opt];
     return "";
+}
+
+static const char *pref_value(int row, int val) {
+    return pref_option_name(row, val);
 }
 
 static int pref_get(const setup_prefs *p, int row) {
@@ -504,22 +641,41 @@ static int pref_get(const setup_prefs *p, int row) {
     return 0;
 }
 
+static void pref_set(setup_prefs *p, int row, int val) {
+    if (row == 0) p->language = val;
+    else if (row == 1) p->region = val;
+    else if (row == 2) p->timezone = val;
+    else if (row == 3) p->keyboard = val;
+    else if (row == 4) p->theme = val;
+}
+
 static void pref_toggle(setup_prefs *p, int row) {
-    if (row == 0) p->language ^= 1;
-    else if (row == 1) p->region ^= 1;
-    else if (row == 2) p->timezone ^= 1;
-    else if (row == 3) p->keyboard ^= 1;
-    else if (row == 4) p->theme ^= 1;
+    int count = pref_option_count(row);
+    int cur = pref_get(p, row);
+    pref_set(p, row, (cur + 1) % count);
 }
 
 static void draw_option_row(u32 *fb, i64 x, i64 y, i64 w, i64 h,
                             const u8 *label, i64 lw, i64 lh,
-                            const char *value, int active, u32 fg, u32 card) {
-    u32 fill = active ? 0xFFFFFFFF : INPUT_BG;
+                            const char *value, int active, u32 fg, u32 card,
+                            const char *en) {
+    u32 fill = active ? 0xFF45454Au : INPUT_BG;
     fb_bitmap_alpha(fb, label, lw, lh, x, y + 4, fg, card, 255);
-    fill_rounded_rect(fb, x + 220, y, w - 220, h, 8, fill);
-    stroke_rounded_rect(fb, x + 220, y, w - 220, h, 8, 1, active ? 0xFFB6C9DD : card);
+    if (en) fb_text(fb, en, x, y + 4 + lh + 1, 0xFF9098A0, card);
+    fill_rounded_rect(fb, x + 220, y, w - 220, h, 2, fill);
+    stroke_rounded_rect(fb, x + 220, y, w - 220, h, 2, 1, active ? 0xFF6C6C72 : 0xFF404044);
     fb_text(fb, value, x + 238, y + (h - ASCII_H) / 2, fg, fill);
+    /* dropdown arrow */
+    {
+        i64 ax = x + w - 22;
+        i64 ay = y + (h - 6) / 2;
+        fill_rect(fb, ax,     ay,     11, 1, fg);
+        fill_rect(fb, ax + 1, ay + 1,  9, 1, fg);
+        fill_rect(fb, ax + 2, ay + 2,  7, 1, fg);
+        fill_rect(fb, ax + 3, ay + 3,  5, 1, fg);
+        fill_rect(fb, ax + 4, ay + 4,  3, 1, fg);
+        fill_rect(fb, ax + 5, ay + 5,  1, 1, fg);
+    }
 }
 
 static void redraw_prefs_card(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, int active, i64 mx, i64 my, u32 bg, u32 fg) {
@@ -528,12 +684,14 @@ static void redraw_prefs_card(u32 *fb, i64 card_x, i64 card_y, setup_prefs *pref
     fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_prefs_title, g_txt_prefs_title_w, g_txt_prefs_title_h, card_x+40, card_y+40, fg, card, 255);
-    draw_option_row(fb, card_x+40, card_y+120, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card);
-    draw_option_row(fb, card_x+40, card_y+200, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card);
-    draw_option_row(fb, card_x+40, card_y+280, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card);
-    draw_option_row(fb, card_x+40, card_y+360, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card);
-    draw_option_row(fb, card_x+40, card_y+440, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card);
+    fb_text(fb, "Preferences", card_x+40, card_y+40+g_txt_prefs_title_h+2, 0xFF9098A0, card);
+    draw_option_row(fb, card_x+40, card_y+120, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card, "Language");
+    draw_option_row(fb, card_x+40, card_y+200, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card, "Region");
+    draw_option_row(fb, card_x+40, card_y+280, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card, "Timezone");
+    draw_option_row(fb, card_x+40, card_y+360, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card, "Keyboard");
+    draw_option_row(fb, card_x+40, card_y+440, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card, "Theme");
     fb_bitmap_alpha(fb, g_txt_prefs_hint, g_txt_prefs_hint_w, g_txt_prefs_hint_h, card_x+40, card_y+555, 0xFF7F97AC, card, 255);
+    fb_text(fb, "Tab/arrows to navigate, Enter to confirm", card_x+40, card_y+555+g_txt_prefs_hint_h+2, 0xFF6F7F8C, card);
     cursor_draw(fb, mx, my);
 }
 
@@ -541,13 +699,43 @@ static void redraw_prefs_row(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs
     u32 card = CARD_BG;
     i64 ry = card_y + 120 + (i64)row * 80;
     cursor_erase(fb);
-    fill_rect(fb, card_x + 36, ry - 8, 832, 58, card);
-    if (row == 0) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card);
-    else if (row == 1) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card);
-    else if (row == 2) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card);
-    else if (row == 3) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card);
-    else if (row == 4) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card);
+    fill_rounded_rect(fb, card_x + 36, ry - 8, 832, 58, 2, card);
+    if (row == 0) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_language, g_txt_prefs_language_w, g_txt_prefs_language_h, pref_value(0, pref_get(prefs, 0)), active==0, fg, card, "Language");
+    else if (row == 1) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_region, g_txt_prefs_region_w, g_txt_prefs_region_h, pref_value(1, pref_get(prefs, 1)), active==1, fg, card, "Region");
+    else if (row == 2) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_timezone, g_txt_prefs_timezone_w, g_txt_prefs_timezone_h, pref_value(2, pref_get(prefs, 2)), active==2, fg, card, "Timezone");
+    else if (row == 3) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_keyboard, g_txt_prefs_keyboard_w, g_txt_prefs_keyboard_h, pref_value(3, pref_get(prefs, 3)), active==3, fg, card, "Keyboard");
+    else if (row == 4) draw_option_row(fb, card_x+40, ry, 820, 42, g_txt_prefs_theme, g_txt_prefs_theme_w, g_txt_prefs_theme_h, pref_value(4, pref_get(prefs, 4)), active==4, fg, card, "Theme");
     cursor_draw(fb, mx, my);
+}
+
+/* 绘制下拉菜单：最多显示 6 项，超出时显示滚动指示 */
+static void draw_dropdown_menu(u32 *fb, i64 card_x, i64 card_y, int row, const setup_prefs *prefs, u32 fg) {
+    i64 dd_x = card_x + 260;
+    i64 dd_y = card_y + 120 + (i64)row * 80 + 42;
+    i64 dd_w = 600;
+    int current = pref_get(prefs, row);
+    int opt_count = pref_option_count(row);
+    int visible = opt_count > 6 ? 6 : opt_count;
+    i64 opt_h = 32;
+    i64 total_h = visible * opt_h + (opt_count > 6 ? 20 : 0);
+    /* 深色背景 */
+    fill_rect(fb, dd_x, dd_y, dd_w, total_h, 0xFF2A2A2E);
+    /* 选项 */
+    for (int opt = 0; opt < visible; opt++) {
+        u32 bg_opt = (opt == current) ? 0xFF45454A : 0xFF2A2A2E;
+        fill_rect(fb, dd_x, dd_y + opt * opt_h, dd_w, opt_h, bg_opt);
+        fb_text(fb, pref_option_name(row, opt), dd_x + 18, dd_y + opt * opt_h + (opt_h - ASCII_H) / 2, fg, bg_opt);
+    }
+    /* 超过 6 项时显示滚动指示 */
+    if (opt_count > 6) {
+        fill_rect(fb, dd_x, dd_y + visible * opt_h, dd_w, 20, 0xFF252528);
+        fb_text(fb, "...more", dd_x + 18, dd_y + visible * opt_h + 1, 0xFF808088, 0xFF252528);
+    }
+    /* 边框 */
+    fill_rect(fb, dd_x, dd_y, dd_w, 1, 0xFF505055);
+    fill_rect(fb, dd_x, dd_y + total_h - 1, dd_w, 1, 0xFF505055);
+    fill_rect(fb, dd_x, dd_y, 1, total_h, 0xFF505055);
+    fill_rect(fb, dd_x + dd_w - 1, dd_y, 1, total_h, 0xFF505055);
 }
 
 static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, i64 *mx, i64 *my, u32 bg, u32 fg) {
@@ -556,6 +744,7 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
     u8 mpkt[3];
     u8 prev_btns = 0;
     int e0 = 0;
+    int dropdown_open = -1;
     redraw_prefs_card(fb, card_x, card_y, prefs, active, *mx, *my, bg, fg);
     for (;;) {
         u8 st = inb(0x64);
@@ -579,14 +768,40 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
                 cursor_draw(fb, *mx, *my);
             }
             if ((btns & 1) && !(prev_btns & 1)) {
-                for (int r = 0; r < 5; r++) {
-                    i64 ry = card_y + 120 + (i64)r * 80;
-                    if (*mx >= card_x + 260 && *mx < card_x + 860 && *my >= ry && *my < ry + 42) {
-                        int old = active;
-                        active = r;
-                        pref_toggle(prefs, active);
-                        if (old != active) redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg);
-                        redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg);
+                if (dropdown_open >= 0) {
+                    /* 检查点击是否在下拉选项上 */
+                    i64 dd_x = card_x + 260;
+                    i64 dd_y = card_y + 120 + (i64)dropdown_open * 80 + 42;
+                    i64 dd_w = 600;
+                    int opt_count = pref_option_count(dropdown_open);
+                    int visible = opt_count > 6 ? 6 : opt_count;
+                    i64 opt_h = 32;
+                    int clicked_opt = -1;
+                    for (int opt = 0; opt < visible; opt++) {
+                        i64 opt_y = dd_y + opt * opt_h;
+                        if (*mx >= dd_x && *mx < dd_x + dd_w && *my >= opt_y && *my < opt_y + opt_h) {
+                            clicked_opt = opt;
+                            break;
+                        }
+                    }
+                    if (clicked_opt >= 0) {
+                        pref_set(prefs, dropdown_open, clicked_opt);
+                    }
+                    dropdown_open = -1;
+                    redraw_prefs_card(fb, card_x, card_y, prefs, active, *mx, *my, bg, fg);
+                } else {
+                    /* No dropdown open - check for value area clicks */
+                    for (int r = 0; r < 5; r++) {
+                        i64 ry = card_y + 120 + (i64)r * 80;
+                        if (*mx >= card_x + 260 && *mx < card_x + 860 && *my >= ry && *my < ry + 42) {
+                            active = r;
+                            dropdown_open = r;
+                            redraw_prefs_card(fb, card_x, card_y, prefs, active, *mx, *my, bg, fg);
+                            cursor_erase(fb);
+                            draw_dropdown_menu(fb, card_x, card_y, r, prefs, fg);
+                            cursor_draw(fb, *mx, *my);
+                            break;
+                        }
                     }
                 }
             }
@@ -596,6 +811,13 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
         u8 sc = data;
         if (sc == 0xE0) { e0 = 1; continue; }
         if (sc & 0x80) { e0 = 0; continue; }
+        /* Close dropdown on any real key press */
+        if (dropdown_open >= 0) {
+            dropdown_open = -1;
+            redraw_prefs_card(fb, card_x, card_y, prefs, active, *mx, *my, bg, fg);
+            e0 = 0;
+            continue;
+        }
         if (e0 && sc == 0x48) {
             if (active > 0) { int old = active; active--; redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg); redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg); }
             e0 = 0; continue;
@@ -617,6 +839,9 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
                 redraw_prefs_row(fb, card_x, card_y, prefs, old, active, *mx, *my, fg);
                 redraw_prefs_row(fb, card_x, card_y, prefs, active, active, *mx, *my, fg);
             } else {
+                cursor_bg_valid = 0;
+                cursor_cur_x = -100;
+                cursor_cur_y = -100;
                 return;
             }
         }
@@ -710,10 +935,11 @@ static void wifi_query_scan(u64 kernel_api) {
     net_scan_count_fn   scount = (net_scan_count_fn)*(u64 *)(net_api + 48);
     net_scan_result_fn  sresult = (net_scan_result_fn)*(u64 *)(net_api + 56);
     net_is_wireless_fn  iswl = (net_is_wireless_fn)*(u64 *)(net_api + 64);
-    if (!dcount || !iswl || !scount || !sresult) {
-        logl("[FirstInit] net scan api incomplete");
-        return;
-    }
+    if (!dcount) { logl("[FirstInit] net device_count fn is null"); return; }
+    if (!sstart) { logl("[FirstInit] net scan_start fn is null"); return; }
+    if (!scount) { logl("[FirstInit] net scan_count fn is null"); return; }
+    if (!sresult) { logl("[FirstInit] net scan_result fn is null"); return; }
+    if (!iswl) { logl("[FirstInit] net is_wireless fn is null"); return; }
     u32 ndev = dcount();
     /* 串口日志：设备数 */
     {
@@ -723,11 +949,21 @@ static void wifi_query_scan(u64 kernel_api) {
         b[p++]='0'+(ndev/10); b[p++]='0'+(ndev%10); b[p]=0;
         logl(b);
     }
-    /* 找第一个无线设备 */
+    /* 找第一个无线设备 - 通过 device_info 检查 flags 而非调用 is_wireless */
     int wifi_idx = -1;
     for (u32 i = 0; i < ndev; i++) {
-        int rc = iswl(i);
-        if (rc == 1) { wifi_idx = (int)i; break; }
+        /* 使用 device_info 获取 flags，避免直接调用 is_wireless 导致崩溃 */
+        u64 devinfo_fn = *(u64 *)(net_api + 16);
+        if (devinfo_fn) {
+            /* dkm_net_device_info 布局: name(8) + mac(6) + pad(2) + flags(4) = 20 字节 */
+            u8 info[24];
+            for (int k = 0; k < 24; k++) info[k] = 0;
+            int rc = ((int (*)(u32, void *))devinfo_fn)(i, info);
+            if (rc == 0) {
+                u32 flags = *(u32 *)(info + 16);
+                if (flags & 8) { wifi_idx = (int)i; break; }  /* DKM_NET_F_WIRELESS = (1<<3) */
+            }
+        }
     }
     if (wifi_idx < 0) {
         logl("[FirstInit] no wireless device found");
@@ -806,21 +1042,28 @@ static void net_select(setup_net *net, int idx) {
 static void draw_wifi_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int row, int active, u32 fg) {
     u32 card = CARD_BG;
     i64 x = card_x + 40;
-    i64 y = card_y + 132 + (i64)row * 64;
-    u32 fill = active == row ? 0xFFFFFFFF : (net->selected == row ? 0xFFDCECF8 : INPUT_BG);
-    fill_rounded_rect(fb, x, y, 390, 50, 9, fill);
-    stroke_rounded_rect(fb, x, y, 390, 50, 9, 1, active == row ? 0xFF7FA7C8 : card);
-    fb_text(fb, net->selected == row ? ">" : " ", x + 12, y + 16, fg, fill);
+    i64 y = card_y + 132 + (i64)row * 56;
+    u32 fill = active == row ? 0xFF45454A : (net->selected == row ? 0xFF3A3A3E : INPUT_BG);
+    fill_rounded_rect(fb, x, y, 390, 46, 3, fill);
+    stroke_rounded_rect(fb, x, y, 390, 46, 3, 1, active == row ? 0xFF6C6C72 : 0xFF404044);
+    fb_text(fb, net->selected == row ? ">" : " ", x + 12, y + 14, fg, fill);
     if (row < g_wifi_scan_count) {
-        fb_text(fb, g_wifi_ssids[row], x + 42, y + 8, fg, fill);
-        fb_text(fb, g_wifi_meta[row], x + 42, y + 28, 0xFF7F97AC, fill);
+        fb_text(fb, g_wifi_ssids[row], x + 42, y + 6, fg, fill);
+        fb_text(fb, g_wifi_meta[row], x + 42, y + 26, 0xFF808088, fill);
     } else {
-        /* 无扫描结果时的占位行 */
         const char *placeholder = (g_wifi_scan_tried && g_wifi_scan_count == 0)
             ? "No networks found" : "(empty)";
-        fb_text(fb, placeholder, x + 42, y + 16, 0xFF9AACC0, fill);
+        fb_text(fb, placeholder, x + 42, y + 14, 0xFF606068, fill);
     }
 }
+
+/* 网络页面活跃元素索引 */
+#define NET_ACT_WIFI_BASE 0
+#define NET_ACT_SSID      4
+#define NET_ACT_PASS      5
+#define NET_ACT_SAVE      6
+#define NET_ACT_CONNECT   7
+#define NET_ACT_COUNT     8
 
 static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int active, i64 mx, i64 my, u32 bg, u32 fg) {
     u32 card = CARD_BG;
@@ -828,41 +1071,55 @@ static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net,
     fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_network_title, g_txt_network_title_w, g_txt_network_title_h, card_x+40, card_y+40, fg, card, 255);
-    fb_text(fb, "Choose a network", card_x + 40, card_y + 88, 0xFF7F97AC, card);
+    fb_text(fb, "Network", card_x+40, card_y+40+g_txt_network_title_h+2, 0xFF9098A0, card);
+    fb_text(fb, "Choose or enter network", card_x + 40, card_y + 92, 0xFF808088, card);
+
+    /* 左侧: WiFi 列表 */
     for (int r=0; r<WIFI_SCAN_COUNT; r++) draw_wifi_row(fb, card_x, card_y, net, r, active, fg);
 
-    fill_rounded_rect(fb, card_x + 470, card_y + 120, 390, 260, 12, INPUT_BG);
-    stroke_rounded_rect(fb, card_x + 470, card_y + 120, 390, 260, 12, 1, 0xFFD2E3F0);
-    fb_text(fb, "Highlighted network", card_x + 494, card_y + 148, 0xFF7F97AC, INPUT_BG);
-    int preview = active < WIFI_SCAN_COUNT ? active : net->selected;
-    if (preview < g_wifi_scan_count) {
-        fb_text(fb, g_wifi_ssids[preview], card_x + 494, card_y + 182, fg, INPUT_BG);
-        fb_text(fb, g_wifi_meta[preview], card_x + 494, card_y + 210, 0xFF7F97AC, INPUT_BG);
-    } else {
-        fb_text(fb, g_wifi_scan_tried ? "No networks found" : "WiFi not initialized",
-                card_x + 494, card_y + 182, 0xFF9AACC0, INPUT_BG);
-        fb_text(fb, g_wifi_scan_tried ? "Check ath9k driver" : "Run ath9k driver first",
-                card_x + 494, card_y + 210, 0xFF9AACC0, INPUT_BG);
-    }
-    fb_text(fb, "Use Up/Down or click menu", card_x + 494, card_y + 260, 0xFF7F97AC, INPUT_BG);
-    fb_text(fb, "Enter selects highlighted item", card_x + 494, card_y + 288, 0xFF7F97AC, INPUT_BG);
+    /* 右侧: 手动输入区 */
+    fb_text(fb, "Network name (SSID)", card_x + 470, card_y + 120, 0xFF808088, card);
+    draw_rounded_input(fb, card_x + 470, card_y + 148, 390, 44, net->ssid, 0, fg, card, active == NET_ACT_SSID);
 
-    fb_text(fb, "Password", card_x + 470, card_y + 400, fg, card);
-    draw_rounded_input(fb, card_x + 470, card_y + 430, 390, 44, net->password, 1, fg, card, active == WIFI_SCAN_COUNT);
-    u32 btn = active == WIFI_SCAN_COUNT + 1 ? 0xFFFFFFFF : 0xFFDCECF8;
-    fill_rounded_rect(fb, card_x + 620, card_y + 500, 240, 48, 10, btn);
-    stroke_rounded_rect(fb, card_x + 620, card_y + 500, 240, 48, 10, 1, active == WIFI_SCAN_COUNT + 1 ? 0xFFB6C9DD : card);
-    fb_text(fb, "Connect", card_x + 690, card_y + 516, fg, btn);
-    if (net->connected) fb_text(fb, "Connection profile saved", card_x + 40, card_y + 515, 0xFF4F8A5F, card);
-    else fb_text(fb, "Select SSID, enter password, then Connect", card_x + 40, card_y + 555, 0xFF7F97AC, card);
+    fb_text(fb, "Password", card_x + 470, card_y + 210, 0xFF808088, card);
+    draw_rounded_input(fb, card_x + 470, card_y + 238, 390, 44, net->password, 1, fg, card, active == NET_ACT_PASS);
+
+    /* 保存按钮 */
+    {
+        u32 btn_bg = active == NET_ACT_SAVE ? 0xFF45454A : 0xFF3A3A3E;
+        fill_rounded_rect(fb, card_x + 470, card_y + 310, 180, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 470, card_y + 310, 180, 44, 3, 1, active == NET_ACT_SAVE ? 0xFF6C6C72 : 0xFF404044);
+        fb_text(fb, "Save", card_x + 530, card_y + 322, fg, btn_bg);
+    }
+    /* 连接按钮 */
+    {
+        u32 btn_bg = active == NET_ACT_CONNECT ? 0xFF4A6A8A : 0xFF3A5070;
+        fill_rounded_rect(fb, card_x + 680, card_y + 310, 180, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 680, card_y + 310, 180, 44, 3, 1, active == NET_ACT_CONNECT ? 0xFF6A8AAA : 0xFF404060);
+        fb_text(fb, "Connect", card_x + 725, card_y + 322, 0xFFE0E0E0, btn_bg);
+    }
+
+    /* 状态提示 */
+    if (net->connected) {
+        fb_text(fb, "Network profile saved", card_x + 470, card_y + 380, 0xFF5FAF6F, card);
+    } else if (net->ssid[0]) {
+        fb_text(fb, "Press Save or Connect", card_x + 470, card_y + 380, 0xFF808088, card);
+    } else {
+        fb_text(fb, "Select network or type SSID", card_x + 470, card_y + 380, 0xFF606068, card);
+    }
+    fb_text(fb, "Save=save config only", card_x + 470, card_y + 510, 0xFF606068, card);
+    fb_text(fb, "Connect=save and connect", card_x + 470, card_y + 535, 0xFF606068, card);
+
     cursor_draw(fb, mx, my);
 }
 
 static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i64 *mx, i64 *my, u32 bg, u32 fg) {
     int active = 0, mcnt = 0, e0 = 0, shift = 0;
     u8 mpkt[3]; u8 prev_btns = 0;
-    int len = 0;
-    while (net->password[len]) len++;
+    int plen = 0;
+    int slen = 0;
+    while (net->password[plen]) plen++;
+    while (net->ssid[slen]) slen++;
     net_select(net, net->selected);
     redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
     for (;;) {
@@ -885,23 +1142,41 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 cursor_draw(fb, *mx, *my);
             }
             if ((btns & 1) && !(prev_btns & 1)) {
+                /* WiFi 列表点击 */
                 for (int r=0; r<WIFI_SCAN_COUNT; r++) {
-                    i64 ry = card_y + 132 + (i64)r * 64;
-                    if (*mx >= card_x + 40 && *mx < card_x + 430 && *my >= ry && *my < ry + 50) {
+                    i64 ry = card_y + 132 + (i64)r * 56;
+                    if (*mx >= card_x + 40 && *mx < card_x + 430 && *my >= ry && *my < ry + 46) {
                         active = r;
                         net_select(net, r);
-                        len = 0;
+                        slen = 0;
+                        while (net->ssid[slen]) slen++;
+                        plen = 0;
                         redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                     }
                 }
-                if (*mx >= card_x + 470 && *mx < card_x + 860 && *my >= card_y + 430 && *my < card_y + 474) {
-                    active = WIFI_SCAN_COUNT;
+                /* SSID 输入框 */
+                if (*mx >= card_x + 470 && *mx < card_x + 860 && *my >= card_y + 148 && *my < card_y + 192) {
+                    active = NET_ACT_SSID;
                     redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                 }
-                if (*mx >= card_x + 620 && *mx < card_x + 860 && *my >= card_y + 500 && *my < card_y + 548) {
+                /* 密码输入框 */
+                if (*mx >= card_x + 470 && *mx < card_x + 860 && *my >= card_y + 238 && *my < card_y + 282) {
+                    active = NET_ACT_PASS;
+                    redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+                }
+                /* 保存按钮 */
+                if (*mx >= card_x + 470 && *mx < card_x + 650 && *my >= card_y + 310 && *my < card_y + 354) {
                     net->connected = 1;
-                    logl("[FirstInit] wireless profile selected");
-                    redraw_network_card(fb, card_x, card_y, net, WIFI_SCAN_COUNT + 1, *mx, *my, bg, fg);
+                    logl("[FirstInit] network profile saved");
+                    redraw_network_card(fb, card_x, card_y, net, NET_ACT_SAVE, *mx, *my, bg, fg);
+                    for (int i=0;i<30;i++) delay_frame();
+                    return;
+                }
+                /* 连接按钮 */
+                if (*mx >= card_x + 680 && *mx < card_x + 860 && *my >= card_y + 310 && *my < card_y + 354) {
+                    net->connected = 1;
+                    logl("[FirstInit] network connect requested");
+                    redraw_network_card(fb, card_x, card_y, net, NET_ACT_CONNECT, *mx, *my, bg, fg);
                     for (int i=0;i<30;i++) delay_frame();
                     return;
                 }
@@ -920,7 +1195,7 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
             e0=0; continue;
         }
         if (e0 && sc == 0x50) {
-            if (active < WIFI_SCAN_COUNT + 1) active++;
+            if (active < NET_ACT_COUNT - 1) active++;
             redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
             e0=0; continue;
         }
@@ -930,13 +1205,22 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
         if (c == '\n') {
             if (active < WIFI_SCAN_COUNT) {
                 net_select(net, active);
-                len = 0;
-                active = WIFI_SCAN_COUNT;
-            } else if (active == WIFI_SCAN_COUNT) {
-                active = WIFI_SCAN_COUNT + 1;
-            } else {
+                slen = 0;
+                while (net->ssid[slen]) slen++;
+                active = NET_ACT_PASS;
+            } else if (active == NET_ACT_SSID) {
+                active = NET_ACT_PASS;
+            } else if (active == NET_ACT_PASS) {
+                active = NET_ACT_CONNECT;
+            } else if (active == NET_ACT_SAVE) {
                 net->connected = 1;
-                logl("[FirstInit] wireless profile selected");
+                logl("[FirstInit] network profile saved");
+                redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+                for (int i=0;i<30;i++) delay_frame();
+                return;
+            } else if (active == NET_ACT_CONNECT) {
+                net->connected = 1;
+                logl("[FirstInit] network connect requested");
                 redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                 for (int i=0;i<30;i++) delay_frame();
                 return;
@@ -945,16 +1229,28 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
             continue;
         }
         if (c == '\t') {
-            active = (active + 1) % (WIFI_SCAN_COUNT + 2);
+            active = (active + 1) % NET_ACT_COUNT;
             redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
             continue;
         }
-        if (active == WIFI_SCAN_COUNT) {
+        /* SSID 输入 */
+        if (active == NET_ACT_SSID) {
             if (c == 8) {
-                if (len > 0) net->password[--len] = 0;
-            } else if (len < 63 && c >= 32 && c <= 126) {
-                net->password[len++] = c;
-                net->password[len] = 0;
+                if (slen > 0) net->ssid[--slen] = 0;
+            } else if (slen < 31 && c >= 32 && c <= 126) {
+                net->ssid[slen++] = c;
+                net->ssid[slen] = 0;
+            }
+            net->connected = 0;
+            redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+        }
+        /* 密码输入 */
+        if (active == NET_ACT_PASS) {
+            if (c == 8) {
+                if (plen > 0) net->password[--plen] = 0;
+            } else if (plen < 63 && c >= 32 && c <= 126) {
+                net->password[plen++] = c;
+                net->password[plen] = 0;
             }
             net->connected = 0;
             redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
@@ -981,9 +1277,12 @@ static void sha256(const char *msg, u8 out[32]) {
     for(int i=0;i<8;i++){out[i*4]=(u8)(h[i]>>24);out[i*4+1]=(u8)(h[i]>>16);out[i*4+2]=(u8)(h[i]>>8);out[i*4+3]=(u8)h[i];}
 }
 
+static u8 g_conf_data[1024];
+static u32 g_conf_size;
+
 static void build_user_conf(const char *pc, const char *user, const char *pass, const setup_prefs *prefs, const setup_net *net) {
     u8 hash[32]; sha256(pass, hash);
-    static char conf[1024]; int p=0;
+    char *conf = (char *)g_conf_data; int p=0;
     const char *pre="DESHAB_USERCONF_V1\ncomputer=";
     for(int i=0;pre[i];i++) conf[p++]=pre[i];
     for(int i=0;pc[i]&&p<740;i++) conf[p++]=pc[i];
@@ -1011,15 +1310,18 @@ static void build_user_conf(const char *pc, const char *user, const char *pass, 
     const char *ni="\nnetwork.ip=dhcp"; for(int i=0;ni[i];i++) conf[p++]=ni[i];
     const char *dns="\nnetwork.dns=auto"; for(int i=0;dns[i];i++) conf[p++]=dns[i];
     conf[p++]='\n';
-    /* XOR encrypt buffer with hash-derived stream; real disk write waits for FAT32 write support. */
+    /* XOR encrypt buffer with hash-derived stream; DSK writes to FAT32 after return. */
     for(int i=0;i<p;i++) conf[i]^=hash[i&31];
-    logl("[FirstInit] user.conf encrypted in memory (disk write pending)");
+    g_conf_size = (u32)p;
+    logl("[FirstInit] user.conf built and encrypted");
 }
 
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[FirstInit] boot");
+    logl("[FirstInit] calibrating TSC (实机 CPU 频率计算)");
+    tsc_calibrate_fi();
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         logl("[FirstInit] bad context");
@@ -1049,13 +1351,20 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fade_ring(fb, cx, cy, bg);
     logl("[FirstInit] ring faded");
 
-    /* center text: Chinese bitmaps */
+    /* center text: Chinese bitmaps + English subtitle below */
     i64 tw = g_txt_welcome_w, tx = cx - tw/2, ty = cy - g_txt_welcome_h/2;
+    /* English subtitle sits below the Chinese bitmap, centered independently */
+    const char *welcome_en = "Welcome to Deshab";
+    i64 en_w = fb_text_width(welcome_en);
+    i64 en_x = cx - en_w/2, en_y = ty + g_txt_welcome_h + 6;
+    /* subtitle color: dimmer than WELCOME_FG so it reads as secondary */
+    u32 sub_fg = 0xFFA8B8C8;
 
     logl("[FirstInit] fading in welcome");
     for (u32 a=0; a<=255; a+=17) {
-        fill_gradient_rect(fb, tx-4, ty-4, tw+8, g_txt_welcome_h+8);
+        fill_gradient_rect(fb, tx-4, ty-4, tw+8, g_txt_welcome_h + 6 + ASCII_H + 4);
         fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a);
+        fb_text_alpha(fb, welcome_en, en_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a);
         delay_frame();
     }
     logl("[FirstInit] welcome drawn");
@@ -1064,16 +1373,26 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     logl("[FirstInit] cross-fading to setup message");
     i64 tw2 = g_txt_setup_w, tx2 = cx - tw2/2;
-    i64 area_x = tx2 < tx ? tx2 : tx;
-    i64 area_w = (tx2 + tw2 > tx + tw ? tx2 + tw2 : tx + tw) - area_x;
-    i64 area_h = (g_txt_setup_h > g_txt_welcome_h ? g_txt_setup_h : g_txt_welcome_h) + 8;
+    const char *setup_en = "Let's set up your system";
+    i64 en2_w = fb_text_width(setup_en);
+    i64 en2_x = cx - en2_w/2;
+    i64 area_x = (tx2 < tx ? tx2 : tx);
+    if (en_x < area_x) area_x = en_x;
+    if (en2_x < area_x) area_x = en2_x;
+    i64 area_right = tx + tw; if (tx2 + tw2 > area_right) area_right = tx2 + tw2;
+    if (en_x + en_w > area_right) area_right = en_x + en_w;
+    if (en2_x + en2_w > area_right) area_right = en2_x + en2_w;
+    i64 area_w = area_right - area_x;
+    i64 area_h = (g_txt_setup_h > g_txt_welcome_h ? g_txt_setup_h : g_txt_welcome_h) + 6 + ASCII_H + 8;
 
     for (u32 step=0; step<=15; step++) {
         u32 a2 = step * 17;
         u32 a1 = 255 - a2;
         fill_gradient_rect(fb, area_x-4, ty-4, area_w+8, area_h);
         fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a1);
+        fb_text_alpha(fb, welcome_en, en_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a1);
         fb_bitmap_alpha(fb, g_txt_setup, tw2, g_txt_setup_h, tx2, ty, WELCOME_FG, bg_at_y(ty + g_txt_setup_h / 2), a2);
+        fb_text_alpha(fb, setup_en, en2_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a2);
         delay_frame();
     }
     logl("[FirstInit] setup message drawn");
@@ -1089,13 +1408,14 @@ void dsk_entry(const dsk_boot_context *ctx) {
     logl("[FI] fadein start");
     /* Phase 1: fade in card background only (no title) — avoids title/card color mismatch flicker */
     for (u32 a=0; a<=255; a+=17) {
-        draw_card_fade(fb, card_x, card_y, 900, 600, 12, a);
+        draw_card_fade(fb, card_x, card_y, 900, 600, 4, a);
         delay_frame();
     }
     /* Phase 2: draw title once on fully-rendered card */
     {
         u32 title_bg = blend(bg_at_y(card_y + 40 + g_txt_title_h/2), CARD_BG, 255);
         fb_bitmap_alpha(fb, g_txt_title, g_txt_title_w, g_txt_title_h, card_x+40, card_y+40, fg, title_bg, 255);
+        fb_text(fb, "Account Setup", card_x+40, card_y+40+g_txt_title_h+2, 0xFF9098A0, title_bg);
     }
     logl("[FI] fadein done");
     logl("[FirstInit] initializing PS/2 mouse");
@@ -1103,10 +1423,89 @@ void dsk_entry(const dsk_boot_context *ctx) {
     i64 mx = cx, my = cy;
     {
         int field = 0;
-        while (field < 3) {
-            field = read_field(fb, card_x, card_y, field, pc, user, pass, &mx, &my, bg, fg);
+        for (;;) {
+            while (field < 3) {
+                field = read_field(fb, card_x, card_y, field, pc, user, pass, &mx, &my, bg, fg);
+            }
+            /* Validate: all fields must be non-empty */
+            if (pc[0] != 0 && user[0] != 0 && pass[0] != 0) break;
+            /* Show warning message on card (overwrite hint area) */
+            cursor_erase(fb);
+            {
+                u32 card = CARD_BG;
+                fill_rect(fb, card_x + 40, card_y + 550, 820, 45, card);
+                fb_text(fb, "Please fill in all fields", card_x + 40, card_y + 555, 0xFFFF6B6B, card);
+                fb_text(fb, "Press Enter to continue", card_x + 40, card_y + 575, 0xFFC0C0C0, card);
+            }
+            cursor_draw(fb, mx, my);  /* 重绘鼠标光标，避免校验失败时光标消失 */
+            logl("[FI] validation failed: empty field(s)");
+            /* 等待用户确认:Enter/任意键回到 field 0，或点击输入框切换字段。
+             * 避免死等 Enter 导致用户点击/输入无响应。 */
+            int next_field = 0;
+            {
+                int release = 0;
+                int mcnt = 0;
+                u8 mpkt[3];
+                u8 prev_btns = 0;
+                int done = 0;
+                while (!done) {
+                    u8 st = inb(0x64);
+                    if (!(st & 1)) { __asm__("pause"); continue; }
+                    u8 data = inb(0x60);
+                    if (st & 0x20) {
+                        /* 鼠标数据:组装 3 字节包，同步位 bit 3 */
+                        if (mcnt == 0 && !(data & 0x08)) continue;
+                        mpkt[mcnt++] = data;
+                        if (mcnt < 3) continue;
+                        mcnt = 0;
+                        i64 dx = (i64)(i8)mpkt[1];
+                        i64 dy = (i64)(i8)mpkt[2];
+                        u8 btns = mpkt[0] & 0x07;
+                        if (dx != 0 || dy != 0) {
+                            cursor_erase(fb);
+                            mx += dx;
+                            my -= dy;  /* invert Y: 鼠标上移 = 屏幕上移 */
+                            if (mx < 0) mx = 0;
+                            if (my < 0) my = 0;
+                            if ((u64)mx >= fb_w) mx = (i64)fb_w - 1;
+                            if ((u64)my >= fb_h) my = (i64)fb_h - 1;
+                            cursor_draw(fb, mx, my);
+                        }
+                        /* 左键点击输入框:切换到该字段重新输入 */
+                        if ((btns & 1) && !(prev_btns & 1)) {
+                            for (int f = 0; f < 3; f++) {
+                                i64 fy = card_y + 180 + (i64)f * 150;
+                                if (my >= fy && my < fy + 44 && mx >= card_x + 40 && mx < card_x + 860) {
+                                    next_field = f;
+                                    done = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        prev_btns = btns;
+                        continue;
+                    }
+                    u8 sc = data;
+                    if (sc == 0xF0) { release = 1; continue; }
+                    if (release) { release = 0; continue; }
+                    if (sc & 0x80) continue;  /* Set 1 release code */
+                    /* Enter 或任意按键:退出等待，回到 field 0 重新输入 */
+                    next_field = 0;
+                    done = 1;
+                }
+            }
+            /* Reset all fields and restart input from next_field.
+             * read_field() will call redraw_setup_card() which fully
+             * redraws the card (title, labels, inputs, hint) and cursor. */
+            pc[0] = 0; user[0] = 0; pass[0] = 0;
+            field = next_field;
         }
     }
+    logl("[FI] all fields done");
+    /* 重置光标状态，避免页面切换时崩溃 */
+    cursor_bg_valid = 0;
+    cursor_cur_x = -100;
+    cursor_cur_y = -100;
     setup_prefs prefs;
     prefs.language = 0;  /* zh-CN */
     prefs.region = 0;    /* CN */
@@ -1114,6 +1513,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
     prefs.keyboard = 0;  /* US-QWERTY */
     prefs.theme = 0;     /* Light */
     read_prefs_page(fb, card_x, card_y, &prefs, &mx, &my, bg, fg);
+    /* 重置光标状态，避免页面切换时崩溃 */
+    cursor_bg_valid = 0;
+    cursor_cur_x = -100;
+    cursor_cur_y = -100;
     /* 查询真实 WiFi 扫描结果（来自 ath9k 驱动通过 kernel_api.net.scan_*） */
     wifi_query_scan(ctx->dkm_kernel_api);
     setup_net net;
@@ -1121,23 +1524,36 @@ void dsk_entry(const dsk_boot_context *ctx) {
     net.connected = 0;
     net.ssid[0] = 0;
     net.password[0] = 0;
-    if (g_no_wireless_device) {
-        /* QEMU 或无无线网卡场景：跳过 WiFi 设置页面，network.mode=disabled */
-        logl("[FirstInit] no wireless device, skipping WiFi setup page");
-        net.connected = 0;
-    } else {
-        cursor_bg_valid = 0;
-        cursor_cur_x = -100;
-        cursor_cur_y = -100;
-        logl("[FirstInit] entering wireless setup page");
-        read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
-        logl("[FirstInit] wireless setup page returned");
-    }
+    /* 始终显示网络设置页面，即使无无线设备也展示页面让用户确认 */
+    cursor_bg_valid = 0;
+    cursor_cur_x = -100;
+    cursor_cur_y = -100;
+    logl("[FirstInit] entering network setup page");
+    read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+    logl("[FirstInit] network setup page returned");
     build_user_conf(pc, user, pass, &prefs, &net);
+
+    /* Pass config buffer to DSK via boot context reserved fields */
+    {
+        dsk_boot_context *ctx_mut = (dsk_boot_context *)ctx;
+        ctx_mut->reserved[0] = (u64)(u64*)g_conf_data;
+        ctx_mut->reserved[1] = (u64)g_conf_size;
+    }
+    logl("[FirstInit] config ready for DSK to write");
 
     cursor_erase(fb);
     fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
-    fb_bitmap_alpha(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 20, fg, bg_at_y(cy), 255);
+    fb_bitmap_alpha(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 30, fg, bg_at_y(cy), 255);
+    /* English subtitle below the Chinese done bitmap */
+    {   const char *done_en = "Setup Complete";
+        i64 dw = fb_text_width(done_en);
+        fb_text(fb, done_en, cx - dw/2, cy + 2, 0xFFA8B8C8, bg_at_y(cy + 10));
+    }
+    /* status line below the subtitle */
+    {   const char *status = "System starting...";
+        i64 sw = fb_text_width(status);
+        fb_text(fb, status, cx - sw/2, cy + 28, 0xFF808088, bg_at_y(cy + 36));
+    }
     logl("[FirstInit] user setup finished");
 
     /* 短暂停留后返回，由 DSK 接管加载 shell */

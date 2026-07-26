@@ -35,6 +35,13 @@ static int block_read_impl(u32 index, u64 lba, u32 count, void *buffer) {
     return dev->read(dev->ctx, lba, count, buffer);
 }
 
+static int block_write_impl(u32 index, u64 lba, u32 count, const void *buffer) {
+    if (index >= g_device_count || !buffer || count == 0) return -1;
+    dkm_block_device_desc *dev = &g_devices[index];
+    if (!dev->write) return -2;
+    return dev->write(dev->ctx, lba, count, buffer);
+}
+
 static u64 block_sector_size_impl(u32 index) {
     if (index >= g_device_count) return 0;
     return g_devices[index].sector_size;
@@ -45,12 +52,20 @@ static const char *block_device_name_impl(u32 index) {
     return g_devices[index].name;
 }
 
+static int block_set_write_fn_impl(u32 index, dkm_block_write_fn fn) {
+    if (index >= g_device_count) return -1;
+    g_devices[index].write = fn;
+    return 0;
+}
+
 static const dkm_block_api g_block_api = {
     .register_device = block_register_device_impl,
     .device_count = block_device_count_impl,
     .read = block_read_impl,
+    .write = block_write_impl,
     .sector_size = block_sector_size_impl,
-    .device_name = block_device_name_impl
+    .device_name = block_device_name_impl,
+    .set_write_fn = block_set_write_fn_impl
 };
 
 const dkm_block_api *block_get_api(void) {

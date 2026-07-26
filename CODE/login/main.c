@@ -1,0 +1,565 @@
+/* login.elf — Deshab login screen
+ * Shown on non-first boot (firstInit=1) before loading desktop.
+ * Reads USER.CONF via boot context (ctx->reserved[0/1]),
+ * extracts username + password hash, prompts for password,
+ * verifies via SHA256 comparison, sets ctx->reserved[2]=1 on success.
+ *
+ * Returns to DSK in all cases (success, skip via Esc, or fatal error).
+ * DSK loads desktop.elf after this returns.
+ */
+
+#include "../UTSM/include/utsm/dsk.h"
+
+typedef signed char        i8;
+typedef unsigned char      u8;
+typedef unsigned short     u16;
+typedef unsigned int       u32;
+typedef unsigned long long u64;
+typedef long long          i64;
+
+#define COM1 0x3F8
+
+static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
+static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+
+/* ---- TSC-based timing (PIT-calibrated) ---- */
+static u64 g_tsc_per_ms = 0;
+
+static __inline__ u64 rdtsc_fi(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+static void tsc_calibrate_fi(void) {
+    outb(0x43, 0x30);       /* ch0, lo+hi, mode 0, binary */
+    outb(0x40, 0x7c);       /* 11932 low = ~10ms */
+    outb(0x40, 0x2e);       /* 11932 high */
+    u64 tsc_start = rdtsc_fi();
+    u16 prev = 0; u64 loops = 0;
+    for (;;) {
+        outb(0x43, 0x00);
+        u16 cur = (u16)inb(0x40) | ((u16)inb(0x40) << 8);
+        if (cur > prev && loops > 10) break;
+        prev = cur; loops++;
+    }
+    u64 tsc_end = rdtsc_fi();
+    g_tsc_per_ms = (tsc_end - tsc_start) / 10;
+}
+
+static void delay_ms_fi(u32 ms) {
+    if (!g_tsc_per_ms) {
+        for (volatile u32 i = 0; i < 100000 * ms; i++) __asm__ volatile("pause");
+        return;
+    }
+    u64 target = g_tsc_per_ms * ms;
+    u64 start = rdtsc_fi();
+    while (rdtsc_fi() - start < target) __asm__ volatile("pause");
+}
+
+static void delay_frame(void) { delay_ms_fi(33); }
+
+/* ---- Serial logging (COM1) ---- */
+static void sputc(char c) {
+    for (unsigned int i=0; i<100000; i++) { if (inb(COM1+5)&0x20) break; }
+    outb(COM1, (unsigned char)c);
+}
+static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
+static void logl(const char *s) { swrite(s); swrite("\n"); }
+
+/* ---- Colors (dark theme matching FirstInit) ---- */
+#define BG_TOP    0xFF2D2D30u
+#define BG_BOTTOM 0xFF1A1A1Eu
+#define CARD_BG   0xFF353539u
+#define INPUT_BG  0xFF2A2A2Eu
+#define TEXT_FG   0xFFE0E0E0u
+#define ACCENT    0xFF5A8AC8u
+#define ERROR_FG  0xFFE05050u
+#define DIM_FG    0xFF808088u
+
+static u64 fb_a, fb_w, fb_h, fb_p;
+
+static u32 blend(u32 c1, u32 c2, u32 a) {
+    u32 na=256-a;
+    u32 r=((c1&0xFF)*na+(c2&0xFF)*a)>>8;
+    u32 g=(((c1>>8)&0xFF)*na+((c2>>8)&0xFF)*a)>>8;
+    u32 b=(((c1>>16)&0xFF)*na+((c2>>16)&0xFF)*a)>>8;
+    return 0xFF000000|(b<<16)|(g<<8)|r;
+}
+
+/* ---- ASCII font (Consolas 18px grayscale) — shared from firstInit ---- */
+#include "../firstInit/ascii_bitmaps.c"
+#define ASCII_W  11
+#define ASCII_H  18
+#define ASCII_STEP 11
+
+static void fb_char(u32 *fb, u32 ch, i64 x, i64 y, u32 fg, u32 bg) {
+    if (ch < ' ' || ch > '~') ch = ' ';
+    u32 idx = (u32)(ch - ' ');
+    const u8 *g = g_ascii[idx];
+    for (i64 r=0; r<ASCII_H; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<ASCII_W; c++) {
+            u32 a = g[r * ASCII_W + c];
+            if (a == 0) continue;
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = (a == 255) ? fg : blend(bg, fg, a);
+        }
+    }
+}
+
+static void fb_text(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg) {
+    for (i64 i=0; s[i]; i++) fb_char(fb, (u32)(u8)s[i], x+i*ASCII_STEP, y, fg, bg);
+}
+
+static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = color;
+        }
+    }
+}
+
+static u32 bg_at_y(i64 y) {
+    if (fb_h <= 1) return BG_TOP;
+    if (y < 0) y = 0;
+    if ((u64)y >= fb_h) y = (i64)fb_h - 1;
+    return blend(BG_TOP, BG_BOTTOM, (u32)(((u64)y * 255ULL) / (fb_h - 1)));
+}
+
+static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 color = bg_at_y(yy);
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = color;
+        }
+    }
+}
+
+static int rounded_rect_contains(i64 px, i64 py, i64 x, i64 y, i64 w, i64 h, i64 radius) {
+    if (px < x || py < y || px >= x + w || py >= y + h) return 0;
+    if (radius <= 0) return 1;
+    if (radius * 2 > w) radius = w / 2;
+    if (radius * 2 > h) radius = h / 2;
+    i64 left = x + radius;
+    i64 right = x + w - radius - 1;
+    i64 top = y + radius;
+    i64 bottom = y + h - radius - 1;
+    if (px >= left && px <= right) return 1;
+    if (py >= top && py <= bottom) return 1;
+    i64 cx = px < left ? left : right;
+    i64 cy = py < top ? top : bottom;
+    i64 dx = px - cx;
+    i64 dy = py - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static void fill_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, u32 color) {
+    if (w <= 0 || h <= 0) return;
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            if (rounded_rect_contains(xx, yy, x, y, w, h, radius)) line[(u64)xx] = color;
+        }
+    }
+}
+
+static void stroke_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 thickness, u32 color) {
+    if (w <= 0 || h <= 0 || thickness <= 0) return;
+    for (i64 r=0; r<h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c=0; c<w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            int outer = rounded_rect_contains(xx, yy, x, y, w, h, radius);
+            int inner = rounded_rect_contains(xx, yy, x + thickness, y + thickness, w - thickness * 2, h - thickness * 2, radius - thickness);
+            if (outer && !inner) line[(u64)xx] = color;
+        }
+    }
+}
+
+static void draw_card(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 card) {
+    fill_rounded_rect(fb, x, y, w, h, 4, card);
+}
+
+static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *value, int mask, u32 fg, u32 card_bg, int active) {
+    (void)card_bg;
+    u32 fill = active ? 0xFF45454Au : INPUT_BG;
+    fill_rounded_rect(fb, x, y, w, h, 2, fill);
+    stroke_rounded_rect(fb, x, y, w, h, 2, 1, active ? 0xFF6C6C72 : 0xFF404044);
+    char out[80]; int i=0;
+    while(value[i] && i<76) { out[i] = mask ? '*' : value[i]; i++; }
+    out[i]=0;
+    if (out[0]) fb_text(fb, out, x+14, y+(h-ASCII_H)/2, fg, fill);
+    if (active) {
+        i64 cx2 = x + 14 + i * ASCII_STEP;
+        fill_rect(fb, cx2, y+10, 2, h-20, fg);
+    }
+}
+
+/* ---- PS/2 scan code set 1 → ASCII ---- */
+static char scan_to_ascii(u8 sc, int shift) {
+    static const char normal[58] = {
+        0, 27, '1','2','3','4','5','6','7','8','9','0','-','=', 8, '\t',
+        'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
+        'a','s','d','f','g','h','j','k','l',';','\'', '`',0,'\\',
+        'z','x','c','v','b','n','m',',','.','/',0,'*',0,' '
+    };
+    static const char shifted[58] = {
+        0, 27, '!','@','#','$','%','^','&','*','(',')','_','+', 8, '\t',
+        'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
+        'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
+        'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' '
+    };
+    if (sc >= 58) return 0;
+    return shift ? shifted[sc] : normal[sc];
+}
+
+/* ---- SHA-256 (compact, copied from FirstInit) ---- */
+#define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static const u32 K256[64] = {0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+static void sha256(const char *msg, u8 out[32]) {
+    u32 h[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    u8 block[64]; u64 len=0; while(msg[len]) len++;
+    for(int i=0;i<64;i++) block[i]=0;
+    for(u64 i=0;i<len && i<55;i++) block[i]=(u8)msg[i];
+    block[len]=0x80; u64 bit=len*8;
+    for(int i=0;i<8;i++) block[63-i]=(u8)(bit>>(i*8));
+    u32 w[64];
+    for(int i=0;i<16;i++) w[i]=((u32)block[i*4]<<24)|((u32)block[i*4+1]<<16)|((u32)block[i*4+2]<<8)|block[i*4+3];
+    for(int i=16;i<64;i++){u32 s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3);u32 s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);w[i]=w[i-16]+s0+w[i-7]+s1;}
+    u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(int i=0;i<64;i++){u32 S1=ROR(e,6)^ROR(e,11)^ROR(e,25);u32 ch=(e&f)^((~e)&g);u32 t1=hh+S1+ch+K256[i]+w[i];u32 S0=ROR(a,2)^ROR(a,13)^ROR(a,22);u32 maj=(a&b)^(a&c)^(b&c);u32 t2=S0+maj;hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+    for(int i=0;i<8;i++){out[i*4]=(u8)(h[i]>>24);out[i*4+1]=(u8)(h[i]>>16);out[i*4+2]=(u8)(h[i]>>8);out[i*4+3]=(u8)h[i];}
+}
+
+/* ---- conf parsing ----
+ * USER.CONF format (built by FirstInit's build_user_conf, but stored unencrypted
+ * on disk for login.elf to parse):
+ *   DESHAB_USERCONF_V1
+ *   computer=<pc>
+ *   username=<user>
+ *   passwordSha256=<64 hex chars>
+ *   ...
+ *
+ * If the buffer does NOT start with "DESHAB_USERCONF_V1", it may be XOR-encrypted
+ * with the password hash stream. In that case, the user's entered password is
+ * used to decrypt: SHA256(password) → hash, then buf[i] ^= hash[i & 31].
+ * If the decrypted buffer starts with the magic, the password is correct.
+ */
+
+static int streq_n(const char *a, const char *b, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+/* Find "key=" in buf, copy value (up to newline) into out (NUL-terminated).
+ * Returns 0 on success, -1 if key not found. */
+static int conf_get_value(const u8 *buf, u32 size, const char *key, char *out, u32 out_cap) {
+    u32 klen = 0; while (key[klen]) klen++;
+    for (u32 i = 0; i + klen + 1 < size; i++) {
+        /* Match key at start of line (or start of buffer) */
+        if (i > 0 && buf[i-1] != '\n') continue;
+        if (buf[i + klen] != '=') continue;
+        if (!streq_n((const char *)buf + i, key, klen)) continue;
+        /* Found key=, copy value until newline or end */
+        u32 vstart = i + klen + 1;
+        u32 j = 0;
+        while (vstart + j < size && buf[vstart + j] != '\n' && buf[vstart + j] != '\r' && j + 1 < out_cap) {
+            out[j] = (char)buf[vstart + j];
+            j++;
+        }
+        out[j] = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int starts_with(const u8 *buf, u32 size, const char *prefix) {
+    u32 i = 0;
+    while (prefix[i]) {
+        if (i >= size) return 0;
+        if (buf[i] != (u8)prefix[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+/* ---- hex string comparison ---- */
+static int hexeq(const u8 *hash32, const char *hex64) {
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        if (hex64[i*2] != hx[hash32[i] >> 4]) return 0;
+        if (hex64[i*2+1] != hx[hash32[i] & 0xf]) return 0;
+    }
+    return 1;
+}
+
+/* ---- login state ---- */
+static char g_username[64];
+static char g_password_hash[80];   /* 64 hex chars + NUL */
+static int  g_has_user;            /* 1 if username extracted */
+static int  g_has_hash;            /* 1 if passwordSha256 extracted */
+static int  g_is_encrypted;        /* 1 if conf buffer is XOR-encrypted */
+
+/* ---- UI layout ---- */
+#define CARD_W  560
+#define CARD_H  400
+
+static void draw_login_card(u32 *fb, i64 card_x, i64 card_y, const char *pass, int active,
+                            const char *msg, u32 msg_color, u32 fg) {
+    u32 card = CARD_BG;
+    u32 sub_fg = 0xFF9098A0;
+    /* Background + card */
+    fill_gradient_rect(fb, card_x - 24, card_y - 24, CARD_W + 48, CARD_H + 48);
+    draw_card(fb, card_x, card_y, CARD_W, CARD_H, card);
+    /* Title */
+    fb_text(fb, "Deshab Login", card_x + 40, card_y + 40, fg, card);
+    fb_text(fb, "Enter your password to continue", card_x + 40, card_y + 70, sub_fg, card);
+    /* Username field */
+    fb_text(fb, "Username", card_x + 40, card_y + 120, sub_fg, card);
+    draw_rounded_input(fb, card_x + 40, card_y + 150, CARD_W - 80, 44,
+                       g_has_user ? g_username : "(unknown)", 0, fg, card, 0);
+    /* Password field */
+    fb_text(fb, "Password", card_x + 40, card_y + 210, sub_fg, card);
+    draw_rounded_input(fb, card_x + 40, card_y + 240, CARD_W - 80, 44, pass, 1, fg, card, active);
+    /* Login button */
+    {
+        u32 btn_bg = ACCENT;
+        fill_rounded_rect(fb, card_x + 40, card_y + 310, 160, 44, 3, btn_bg);
+        fb_text(fb, "Login", card_x + 40 + 56, card_y + 310 + (44 - ASCII_H) / 2,
+                0xFFFFFFFFu, btn_bg);
+    }
+    /* Status / error message */
+    if (msg && msg[0]) {
+        fb_text(fb, msg, card_x + 220, card_y + 322, msg_color, card);
+    }
+    /* Bottom hint */
+    fb_text(fb, "Enter=login  Esc=skip  Backspace=delete",
+            card_x + 40, card_y + CARD_H - 28, DIM_FG, card);
+}
+
+/* Redraw only the password input field (avoids full card redraw on each keystroke) */
+static void redraw_password_only(u32 *fb, i64 card_x, i64 card_y, const char *pass, u32 fg) {
+    u32 card = CARD_BG;
+    i64 fy = card_y + 240;
+    fill_rect(fb, card_x + 40, fy, CARD_W - 80, 44, card);
+    draw_rounded_input(fb, card_x + 40, fy, CARD_W - 80, 44, pass, 1, fg, card, 1);
+}
+
+/* ---- verify password against stored hash or encrypted conf ----
+ * Returns 1 if password is correct, 0 otherwise.
+ * For encrypted conf: XOR-decrypt with SHA256(password); if magic matches, correct.
+ * For unencrypted conf: SHA256(password) == stored passwordSha256 hex string.
+ */
+static int verify_password(const u8 *conf_buf, u32 conf_size, const char *password) {
+    if (g_is_encrypted) {
+        /* Decrypt a copy and check magic */
+        u8 hash[32];
+        sha256(password, hash);
+        static u8 scratch[2048];
+        u32 sz = conf_size;
+        if (sz > sizeof(scratch)) sz = sizeof(scratch);
+        for (u32 i = 0; i < sz; i++) scratch[i] = conf_buf[i] ^ hash[i & 31];
+        if (starts_with(scratch, sz, "DESHAB_USERCONF_V1")) {
+            /* Also extract username from decrypted buffer for display */
+            if (!g_has_user) {
+                conf_get_value(scratch, sz, "username", g_username, sizeof(g_username));
+                if (g_username[0]) g_has_user = 1;
+            }
+            return 1;
+        }
+        return 0;
+    } else if (g_has_hash) {
+        u8 hash[32];
+        sha256(password, hash);
+        return hexeq(hash, g_password_hash);
+    }
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void dsk_entry(const dsk_boot_context *ctx) {
+    __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
+    logl("[login] boot");
+    logl("[login] calibrating TSC");
+    tsc_calibrate_fi();
+
+    if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
+        logl("[login] bad context");
+        return;
+    }
+
+    fb_a = ctx->framebuffer_address;
+    fb_w = ctx->framebuffer_width;
+    fb_h = ctx->framebuffer_height;
+    fb_p = ctx->framebuffer_pitch;
+
+    logl("[login] framebuffer ready");
+
+    /* Get conf data from boot context (passed by DSK) */
+    const u8 *conf_buf = (const u8 *)(u64)ctx->reserved[0];
+    u32 conf_size = (u32)ctx->reserved[1];
+    if (!conf_buf || conf_size == 0) {
+        logl("[login] no conf data, cannot login");
+        /* Mark as skipped (reserved[2]=0) and return */
+        ((dsk_boot_context *)ctx)->reserved[2] = 0;
+        return;
+    }
+    logl("[login] conf data received");
+
+    /* Initialize state */
+    g_username[0] = 0;
+    g_password_hash[0] = 0;
+    g_has_user = 0;
+    g_has_hash = 0;
+    g_is_encrypted = 0;
+
+    /* Check if conf is unencrypted (starts with magic) or encrypted */
+    if (starts_with(conf_buf, conf_size, "DESHAB_USERCONF_V1")) {
+        logl("[login] conf is plaintext, parsing");
+        g_is_encrypted = 0;
+        if (conf_get_value(conf_buf, conf_size, "username", g_username, sizeof(g_username)) == 0) {
+            g_has_user = 1;
+            logl("[login] username found");
+        } else {
+            logl("[login] username not found in conf");
+        }
+        if (conf_get_value(conf_buf, conf_size, "passwordSha256", g_password_hash, sizeof(g_password_hash)) == 0) {
+            g_has_hash = 1;
+            logl("[login] password hash found");
+        } else {
+            logl("[login] passwordSha256 not found in conf");
+        }
+    } else {
+        logl("[login] conf appears encrypted, will verify by password decryption");
+        g_is_encrypted = 1;
+        /* Username will be extracted after successful decryption */
+    }
+
+    u32 fg = TEXT_FG;
+    u32 *fb = (u32 *)(u64)fb_a;
+
+    /* Fill background */
+    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
+
+    /* Card position (centered) */
+    i64 card_x = ((i64)fb_w - CARD_W) / 2;
+    i64 card_y = ((i64)fb_h - CARD_H) / 2;
+
+    /* Initial message */
+    const char *msg = "Enter password and press Enter";
+    u32 msg_color = DIM_FG;
+
+    /* Password input buffer */
+    char pass[64];
+    pass[0] = 0;
+    int plen = 0;
+
+    /* Draw initial UI */
+    draw_login_card(fb, card_x, card_y, pass, 1, msg, msg_color, fg);
+
+    /* Input loop */
+    int shift = 0;
+    int release = 0;
+    for (;;) {
+        u8 st = inb(0x64);
+        if (!(st & 1)) { __asm__("pause"); continue; }
+        u8 data = inb(0x60);
+        /* Skip mouse data (bit 5 of status) */
+        if (st & 0x20) continue;
+
+        u8 sc = data;
+        /* Handle extended (E0) sequences — ignore (no arrow keys needed for login) */
+        if (sc == 0xE0) { continue; }
+        /* Handle release (F0 in Set 2, or high bit in Set 1) */
+        if (sc == 0xF0) { release = 1; continue; }
+        if (release) { release = 0; /* track shift release below */ }
+
+        /* Shift press/release */
+        if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
+        if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
+
+        /* Ignore high-bit (release in Set 1) */
+        if (sc & 0x80) continue;
+
+        /* Escape (sc 0x01) — skip login */
+        if (sc == 0x01) {
+            logl("[login] Esc pressed, skipping login");
+            ((dsk_boot_context *)ctx)->reserved[2] = 0;
+            return;
+        }
+
+        char c = scan_to_ascii(sc, shift);
+        if (!c) continue;
+
+        if (c == '\n') {
+            /* Submit password */
+            if (plen == 0) {
+                /* Empty password — show hint, don't verify */
+                msg = "Password is empty";
+                msg_color = ERROR_FG;
+                draw_login_card(fb, card_x, card_y, pass, 1, msg, msg_color, fg);
+                continue;
+            }
+            logl("[login] verifying password");
+            int ok = verify_password(conf_buf, conf_size, pass);
+            if (ok) {
+                logl("[login] password correct");
+                ((dsk_boot_context *)ctx)->reserved[2] = 1;
+                /* Show success message briefly */
+                draw_login_card(fb, card_x, card_y, pass, 0,
+                                "Login successful", 0xFF5FAF6Fu, fg);
+                for (int i = 0; i < 30; i++) delay_frame();
+                return;
+            } else {
+                logl("[login] password wrong");
+                msg = "Wrong password, try again";
+                msg_color = ERROR_FG;
+                /* Clear password */
+                pass[0] = 0;
+                plen = 0;
+                draw_login_card(fb, card_x, card_y, pass, 1, msg, msg_color, fg);
+                continue;
+            }
+        }
+
+        if (c == 8) {
+            /* Backspace */
+            if (plen > 0) {
+                pass[--plen] = 0;
+                redraw_password_only(fb, card_x, card_y, pass, fg);
+            }
+            continue;
+        }
+
+        /* Regular character */
+        if (plen < 62 && c >= 32 && c <= 126) {
+            pass[plen++] = c;
+            pass[plen] = 0;
+            redraw_password_only(fb, card_x, card_y, pass, fg);
+        }
+    }
+}

@@ -4,110 +4,23 @@
  * it does not negotiate features, create virtqueues, or transmit packets.
  */
 
-#include <stdint.h>
+#include "../dkm_shared.h"
 
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
+/* virtio-specific PCI IDs and capability types (driver-local) */
+#define PCI_CLASS_REG  0x08   /* 32-bit class/subclass/prog_if/revision */
 
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef signed char        i8;
-typedef long long          i64;
+#define PCI_VENDOR_VIRTIO       0x1AF4u
+#define VIRTIO_TRANS_DEVICE_MIN 0x1000u
+#define VIRTIO_TRANS_DEVICE_MAX 0x103Fu
+#define VIRTIO_MODERN_DEVICE_MIN 0x1040u
+#define VIRTIO_MODERN_DEVICE_MAX 0x107Fu
+#define VIRTIO_NET_DEVICE_ID    1u
 
-#define NULL ((void *)0)
-
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_net_scan_result {
-    char ssid[33];
-    u8 bssid[6];
-    u8 channel;
-    i8 rssi;
-    u8 security;
-};
-
-struct dkm_net_device_desc {
-    const char *name;
-    u8 mac[6];
-    u32 flags;
-    void *ctx;
-    int (*tx)(void *ctx, const void *packet, u32 length);
-    int (*rx_poll)(void *ctx, void *buffer, u32 capacity, u32 *out_length);
-    /* 无线扩展回调（有线驱动置 NULL，向后兼容）。 */
-    int (*scan_start)(void *ctx);
-    int (*scan_count)(void *ctx);
-    int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(void *ctx);
-};
-
-struct dkm_net_api {
-    int (*register_device)(const struct dkm_net_device_desc *desc);
-    u32 (*device_count)(void);
-    int (*device_info)(u32 index, void *out);
-    int (*tx)(u32 index, const void *packet, u32 length);
-    int (*rx_poll)(u32 index, void *buffer, u32 capacity, u32 *out_length);
-    int (*scan_start)(u32 index);
-    int (*scan_count)(u32 index);
-    int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
-    int (*is_wireless)(u32 index);
-};
-
-#define DKM_NET_F_LINK_UP (1u << 0)
-
-struct dkm_kernel_api {
-    u32 version;
-    u32 size;
-    u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem;
-    const void *utsm;
-    const void *irq;
-    const void *pci;
-    const void *dma;
-    const void *vfs;
-    const struct dkm_net_api *net;
-    const void *timer;
-    const void *drr;
-    const void *rsdp_address;
-    const void *fb_address;
-    u64 fb_width;
-    u64 fb_height;
-    u64 fb_pitch;
-    u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-    u64 hhdm_offset;
-};
-
-struct dkm_driver_handle;
-
-struct dkm_driver_desc {
-    u32 magic;
-    u16 abi_version;
-    u16 desc_size;
-    const char *name;
-    const char *version;
-    const char *vendor;
-    u32 driver_class;
-    u32 stage;
-    u32 flags;
-    u32 priority;
-    const char *const *depends;
-    u32 depends_count;
-    const char *const *provides;
-    u32 provides_count;
-    u64 min_kernel_abi;
-    u64 feature_bits;
-    u64 reserved0;
-    u64 reserved1;
-};
+#define VIRTIO_PCI_CAP_COMMON_CFG  1u
+#define VIRTIO_PCI_CAP_NOTIFY_CFG  2u
+#define VIRTIO_PCI_CAP_ISR_CFG     3u
+#define VIRTIO_PCI_CAP_DEVICE_CFG  4u
+#define VIRTIO_PCI_CAP_PCI_CFG     5u
 
 static const char *const g_depends[] = { "pci", "irq" };
 static const char *const g_provides[] = { "netdev" };
@@ -134,73 +47,18 @@ const struct dkm_driver_desc driver_desc = {
     .reserved1      = 0
 };
 
-#define PCI_ADDR       0xCF8
-#define PCI_DATA       0xCFC
-#define PCI_VENDOR_ID  0x00
-#define PCI_COMMAND    0x04
-#define PCI_CLASS_REG  0x08
-#define PCI_HEADER     0x0E
-#define PCI_CAP_PTR    0x34
-#define PCI_IRQ_LINE   0x3C
-#define PCI_BAR0       0x10
-#define PCI_BAR1       0x14
-#define PCI_BAR2       0x18
-#define PCI_BAR3       0x1C
-#define PCI_BAR4       0x20
-#define PCI_BAR5       0x24
-
-#define PCI_CMD_IO     (1u << 0)
-#define PCI_CMD_MEM    (1u << 1)
-#define PCI_CMD_BUSM   (1u << 2)
-
-#define PCI_VENDOR_VIRTIO       0x1AF4u
-#define VIRTIO_TRANS_DEVICE_MIN 0x1000u
-#define VIRTIO_TRANS_DEVICE_MAX 0x103Fu
-#define VIRTIO_MODERN_DEVICE_MIN 0x1040u
-#define VIRTIO_MODERN_DEVICE_MAX 0x107Fu
-#define VIRTIO_NET_DEVICE_ID    1u
-
-#define VIRTIO_PCI_CAP_COMMON_CFG  1u
-#define VIRTIO_PCI_CAP_NOTIFY_CFG  2u
-#define VIRTIO_PCI_CAP_ISR_CFG     3u
-#define VIRTIO_PCI_CAP_DEVICE_CFG  4u
-#define VIRTIO_PCI_CAP_PCI_CFG     5u
-
 static const struct dkm_log_api *g_log;
 
-static __inline__ void outl(u16 port, u32 value) {
-    __asm__ volatile ("outl %0, %1" :: "a"(value), "Nd"(port));
-}
-
-static __inline__ u32 inl(u16 port) {
-    u32 value;
-    __asm__ volatile ("inl %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
-    u32 addr = (1u << 31)
-             | ((u32)bus << 16)
-             | ((u32)dev << 11)
-             | ((u32)func << 8)
-             | ((u32)reg & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
+    return dkm_pci_read(bus, dev, func, reg);
 }
 
 static void pci_write(u8 bus, u8 dev, u8 func, u8 reg, u32 value) {
-    u32 addr = (1u << 31)
-             | ((u32)bus << 16)
-             | ((u32)dev << 11)
-             | ((u32)func << 8)
-             | ((u32)reg & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, value);
+    dkm_pci_write(bus, dev, func, reg, value);
 }
 
 static u8 pci_read8(u8 bus, u8 dev, u8 func, u8 reg) {
-    u32 v = pci_read(bus, dev, func, reg);
-    return (u8)((v >> ((reg & 3) * 8)) & 0xff);
+    return dkm_pci_read8(bus, dev, func, reg);
 }
 
 static void log_hex(const char *prefix, u64 value) {
@@ -320,6 +178,28 @@ static void log_virtio_caps(u8 bus, u8 dev, u8 func) {
     }
 }
 
+/* ---- tx/rx_poll stub: 安全占位, 不实际收发, 防止 netdev 调用 NULL ---- */
+static int virtio_net_tx(void *ctx, const void *packet, u32 length) {
+    (void)ctx;
+    (void)packet;
+    /* 仅记录日志, 避免每次发包刷屏: 仅记录长度 */
+    static u32 s_tx_log_guard = 0;
+    if (s_tx_log_guard < 4) {
+        g_log->info("[virtio_net] tx stub: packet dropped (virtqueues not enabled)");
+        log_hex("[virtio_net] tx stub len=", length);
+        s_tx_log_guard++;
+    }
+    return 0;
+}
+
+static int virtio_net_rx_poll(void *ctx, void *buffer, u32 capacity, u32 *out_length) {
+    (void)ctx;
+    (void)buffer;
+    (void)capacity;
+    if (out_length) *out_length = 0;
+    return 0;  /* 无数据, virtqueues 未启用 */
+}
+
 __attribute__((visibility("default")))
 int driver_init(const struct dkm_kernel_api *api,
                 struct dkm_driver_handle *handle) {
@@ -327,6 +207,9 @@ int driver_init(const struct dkm_kernel_api *api,
 
     if (!api || !api->log) return -1;
     g_log = api->log;
+
+    /* 实机要求: 在驱动初始化开头校准 TSC, 为后续时序提供准确计时 */
+    dkm_tsc_calibrate();
 
     g_log->info("[virtio_net] init begin");
 
@@ -379,8 +262,8 @@ int driver_init(const struct dkm_kernel_api *api,
         for (int i = 0; i < 6; i++) netdev.mac[i] = 0;
         netdev.flags = DKM_NET_F_LINK_UP;
         netdev.ctx = 0;
-        netdev.tx = 0;
-        netdev.rx_poll = 0;
+        netdev.tx = virtio_net_tx;        /* stub: 安全占位, 不 NULL */
+        netdev.rx_poll = virtio_net_rx_poll;
         int net_index = api->net->register_device(&netdev);
         log_hex("[virtio_net] netdev register rc=", (u64)(i64)net_index);
     } else {

@@ -14,13 +14,13 @@ CODE/dsk  -> SYSTEM/system/deshab64/deshab.elf
 DSK 主内核（`deshab.elf`）当前已实现：
 - 内嵌 FAT32 只读解析器（256 扇区批量读取 + 内存内文件查找）
 - PIE ELF loader（PT_LOAD + PT_DYNAMIC + R_X86_64_RELATIVE 重定位）
-- 旋转加载动画（双缓冲精灵、顺时针、comet-tail 渐变弧）
+- 静态启动 Logo（嵌入 Logo.png RGBA 数据，居中 alpha 混合绘制于渐变背景上，取代原旋转加载动画）
 - 首次启动检测：读取 `firstInit.txt`，值为 `0` 则触发首次启动流程
 - 系统初始化调度：DSK 直接加载并调用 `mouseInit.elf`（PS/2 鼠标安全初始化）
 - 用户设置向导：DSK 加载并跳转 `FirstInit.elf`（圆角卡片 UI、键盘输入、SHA256 密码、加密配置缓冲）
 
 FirstInit（`CODE/firstInit`）只负责用户级设置向导：
-- 淡蓝背景 → 旋转环淡出 → "欢迎使用 Deshab" → 设置提示 → 账户设置卡片
+- 淡蓝背景 → "欢迎使用 Deshab"（中英双语，英文小字副标题）→ 设置提示 → 账户设置卡片
 - PS/2 键盘轮询输入：计算机名、用户名、密码
 - SHA256 密码摘要 + XOR 加密配置缓冲（user.conf 格式已定义，写盘待 FAT32 write API）
 - 18px 黑体中文位图（预渲染嵌入 ELF）
@@ -126,7 +126,7 @@ DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解
 - **apic** (stage0): CPUID Local APIC 探测, IA32_APIC_BASE MSR, ACPI MADT 枚举, LAPIC MMIO 只读寄存器验证；当前保留 PIC IRQ 路由
 - **acpi** (stage0): Limine RSDP → XSDT, ACPI 表枚举
 - **pci** (stage0): PCI config space 扫描, 设备枚举
-- **console_fb** (stage1): Limine framebuffer, 淡蓝色背景 + 居中四色圆弧加载环（纯整数运算，无浮点依赖）
+- **console_fb** (stage1): Limine framebuffer, 淡蓝色背景清屏（原四色圆弧加载环已移除，启动画面改由 DSK 静态 Logo 接管）
 - **ahci** (stage1): PCI AHCI `8086:2922` 探测, BAR5/ABAR HHDM MMIO 映射, HBA CAP/GHC/PI/VS 与 port 枚举；已接入 `kernel_api.dma`，支持 SATA disk IDENTIFY 与 LBA0 READ 最小 DMA 路径；可向 `kernel_api.block` 注册 `ahci0` block provider；默认无 SATA 盘/ATAPI 场景会跳过命令
 - **nvme** (stage1): PCI NVMe `1b36:0010` 探测, BAR0/BAR1 解析, IRQ line 读取；当前 QEMU BAR0 位于 4G 以上，MMIO register 读取等待高位 PCI MMIO 映射能力
 - **bootfs** (stage1): Limine boot module 内存文件系统

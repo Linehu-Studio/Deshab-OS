@@ -1,11 +1,11 @@
-/* Deshab ping — 终端风格 ICMP Echo 工具 stub
- * 命令行输入 IP 地址，发送 ICMP Echo Request。
- * 当前为 stub，提示需要 TCP/IP 栈支持。
+/* Deshab ping — 终端风格 ICMP Echo 工具
+ * 命令行输入 IP 地址，发送 ICMP Echo Request（net_stack.h 共享协议栈）。
  * Esc 键退出返回 DSK。
  */
 
 #include "../../firstInit/ascii_bitmaps.c"
 #include "../desktop_app.h"
+#include "../net_stack.h"
 
 /* ---- 终端参数 ---- */
 #define TERM_COLS  120
@@ -137,32 +137,84 @@ static int is_valid_ip(const char *s) {
     return dots == 3;
 }
 
-/* ---- Ping 模拟 ---- */
-static void do_ping(const char *ip) {
+/* ---- Ping 实现（net_stack.h） ---- */
+static int g_ns_status = 0;  /* 0=未尝试, 1=就绪, <0=失败 */
+
+static int ping_net_ready(void) {
+    if (g_ns_status == 1) return 1;
+    if (g_ns_status < 0) return 0;
+    int rc = ns_init((u64)g_ac.kernel_api);
+    g_ns_status = (rc == 0) ? 1 : -1;
+    if (rc != 0) {
+        term_puts_color("  [错误] 网络初始化失败，无可用网卡或 net API\n", DA_ERROR);
+        return 0;
+    }
+    return 1;
+}
+
+static void do_ping(const char *ip_str) {
+    u32 ip;
+    if (ns_parse_ip(ip_str, &ip) != 0) {
+        term_puts_color("  [错误] 无法解析 IP\n", DA_ERROR);
+        return;
+    }
+    if (!ping_net_ready()) return;
+
+    char ipstr[24];
+    ns_fmt_ip(ip, ipstr);
     term_puts_color("PING ", DA_PROMPT_COLOR);
-    term_puts_color(ip, DA_ACCENT_LIGHT);
-    term_puts_color(" 56(84) bytes of data.\n", DA_TEXT_DIM);
+    term_puts_color(ipstr, DA_ACCENT_LIGHT);
+    term_puts_color(" 32 data bytes\n", DA_TEXT_DIM);
 
-    /* stub: 检查 kernel_api 是否有 net 接口 */
-    if (!g_ac.kernel_api) {
-        term_puts_color("  [错误] 无内核 API\n", DA_ERROR);
-        return;
+    int sent = 0, recv = 0;
+    u32 sum = 0, min = 0xFFFFFFFFu, max = 0;
+    for (u16 seq = 1; seq <= 4; seq++) {
+        u32 rtt = 0; u8 ttl = 0;
+        int rc = ns_ping(ip, seq, 2000, &rtt, &ttl);
+        sent++;
+        if (rc == 0) {
+            recv++;
+            sum += rtt;
+            if (rtt < min) min = rtt;
+            if (rtt > max) max = rtt;
+            term_puts("reply from ");
+            term_puts(ipstr);
+            term_puts(": bytes=32 time=");
+            char nb[12]; ns_u32_dec(nb, rtt);
+            term_puts(nb);
+            term_puts("ms TTL=");
+            ns_u32_dec(nb, ttl);
+            term_puts(nb);
+            term_putc('\n');
+        } else if (rc == -1) {
+            term_puts_color("ARP 解析失败，目标不可达\n", DA_ERROR);
+            break;
+        } else {
+            term_puts_color("request timed out\n", DA_TEXT_DIM);
+        }
+        redraw_all();
     }
-    u64 net_api = *(u64 *)((u64)g_ac.kernel_api + 0xC0);
-    if (!net_api) {
-        term_puts_color("  [错误] 需要 TCP/IP 栈支持\n", DA_ERROR);
-        term_puts_color("  当前内核未实现 ICMP 协议栈。\n", DA_WARNING);
-        term_puts_color("  请等待后续版本更新。\n", DA_TEXT_DIM);
-        term_putc('\n');
-        term_puts_color("--- ", DA_TEXT_DIM);
-        term_puts_color(ip, DA_TEXT_DIM);
-        term_puts_color(" ping statistics ---\n", DA_TEXT_DIM);
-        term_puts_color("  0 packets transmitted, 0 received, 100% packet loss\n", DA_ERROR);
-        return;
+    char nb[12];
+    ns_u32_dec(nb, (u32)sent);
+    term_puts_color("--- ", DA_TEXT_DIM);
+    term_puts_color(ipstr, DA_TEXT_DIM);
+    term_puts_color(" ping statistics ---\n  ", DA_TEXT_DIM);
+    term_puts(nb);
+    term_puts(" transmitted, ");
+    ns_u32_dec(nb, (u32)recv);
+    term_puts(nb);
+    term_puts(" received, ");
+    u32 loss = sent ? (u32)(sent - recv) * 100 / (u32)sent : 100;
+    ns_u32_dec(nb, loss);
+    term_puts(nb);
+    term_puts("% loss");
+    if (recv > 0) {
+        term_puts(", min/avg/max = ");
+        ns_u32_dec(nb, min); term_puts(nb); term_puts("/");
+        ns_u32_dec(nb, sum / (u32)recv); term_puts(nb); term_puts("/");
+        ns_u32_dec(nb, max); term_puts(nb); term_puts(" ms");
     }
-
-    /* 如果有 net API，此处应实现真正的 ICMP Echo */
-    term_puts_color("  [stub] 网络功能尚未实现\n", DA_WARNING);
+    term_putc('\n');
 }
 
 /* ---- 内置命令 ---- */
@@ -183,8 +235,8 @@ static void cmd_help(void) {
 static void cmd_clear(void) { term_clear(); }
 
 static void cmd_version(void) {
-    term_puts_color("Deshab ping v0.1 (stub)\n", DA_SUCCESS);
-    term_puts_color("  ICMP Echo 功能需要 TCP/IP 栈支持\n", DA_TEXT_DIM);
+    term_puts_color("Deshab ping v1.0\n", DA_SUCCESS);
+    term_puts_color("  ICMP Echo via net_stack (e1000 + slirp)\n", DA_TEXT_DIM);
 }
 
 static void execute_command(const char *cmd) {
@@ -246,10 +298,9 @@ void dsk_entry(const da_boot_context *ctx) {
     term_clear();
 
     /* 启动 banner */
-    term_puts_color("=== Deshab ping v0.1 (stub) ===\n", DA_ACCENT);
+    term_puts_color("=== Deshab ping v1.0 ===\n", DA_ACCENT);
     term_puts_color("ICMP Echo 请求工具\n", DA_SUCCESS);
     term_puts_color("输入 IP 地址发送 ping | 输入 'help' 查看帮助 | Esc 退出\n", DA_TEXT_DIM);
-    term_puts_color("注意: 当前需要 TCP/IP 栈支持\n", DA_WARNING);
     term_putc('\n');
 
     redraw_all();

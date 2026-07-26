@@ -7,7 +7,10 @@ OUT := $(ROOT)/SYSTEM/system/deshab64/deshab.elf
 CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I../UTSM/include -O2
 LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
 
-C_SOURCES := $(wildcard *.c)
+# logo_data.c is #included directly into main.c (the DSK PIE loader only
+# handles R_X86_64_RELATIVE, so the logo array must be file-local to main.o
+# rather than a cross-unit symbol). Exclude it from standalone compilation.
+C_SOURCES := $(filter-out logo_data.c, $(wildcard *.c))
 OBJECTS := $(C_SOURCES:.c=.o)
 
 .PHONY: all clean

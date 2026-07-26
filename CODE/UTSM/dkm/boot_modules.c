@@ -248,6 +248,9 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
     const elf64_ehdr *ehdr = (const elf64_ehdr *)address;
     const elf64_shdr *sections = (const elf64_shdr *)((const u8 *)address + ehdr->shoff);
     u64 image_offset[64];
+    /* Zero the entire array so non-ALLOC section indices yield offset 0
+     * instead of stack garbage. */
+    for (int zi = 0; zi < 64; zi++) image_offset[zi] = 0;
     u64 total_size = 0;
     u64 max_align = 16;
     u16 alloc_count = 0;
@@ -353,7 +356,9 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
                 return -1;
             }
 
-            if (rela->offset + 8 <= target->size) {
+            /* Bounds check: use the actual write width, not always 8. */
+            u32 reloc_width = (reloc_type == R_X86_64_64) ? 8 : 4;
+            if (rela->offset + reloc_width <= target->size) {
                 if (reloc_type == R_X86_64_32 || reloc_type == R_X86_64_32S || reloc_type == R_X86_64_PC32) {
                     *(u32 *)(target_base + rela->offset) = (u32)patch;
                 } else {

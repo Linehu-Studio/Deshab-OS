@@ -15,9 +15,55 @@ typedef long long          i64;
 
 static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
 static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+static __inline__ void outl(u16 port, u32 value) { __asm__ volatile("outl %0,%1"::"a"(value),"Nd"(port)); }
+static __inline__ u32 inl(u16 port) { u32 v; __asm__ volatile("inl %1,%0":"=a"(v):"Nd"(port)); return v; }
+
+/* ---- TSC-based timing (实机要求: 用 CPU 频率计算, 不用循环) ---- */
+static u64 g_tsc_per_ms = 0;
+
+static __inline__ u64 rdtsc_shell(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+/* 通过 PIT ch0 (16-bit mode 0) 校准 TSC ~10ms 计数 */
+static void tsc_calibrate_shell(void) {
+    outb(0x43, 0x30);       /* ch0, lo+hi, mode 0, binary */
+    outb(0x40, 0x7c);       /* 11932 low = ~10ms */
+    outb(0x40, 0x2e);       /* 11932 high */
+    u64 tsc_start = rdtsc_shell();
+    u16 prev = 0; u64 loops = 0;
+    for (;;) {
+        outb(0x43, 0x00);
+        u16 cur = (u16)inb(0x40) | ((u16)inb(0x40) << 8);
+        if (cur > prev && loops > 10) break;
+        prev = cur; loops++;
+    }
+    u64 tsc_end = rdtsc_shell();
+    g_tsc_per_ms = (tsc_end - tsc_start) / 10;
+}
+
+/* 串口发送等待: TSC 100us 超时, 校准失败时回退到循环 */
+static void serial_wait_tx_shell(void) {
+    if (g_tsc_per_ms == 0) {
+        tsc_calibrate_shell();
+    }
+    if (g_tsc_per_ms == 0) {
+        for (u32 i = 0; i < 100000; i++) {
+            if (inb(COM1 + 5) & 0x20) break;
+        }
+        return;
+    }
+    u64 deadline = rdtsc_shell() + g_tsc_per_ms / 10;  /* 100us 超时 */
+    while (rdtsc_shell() < deadline) {
+        if (inb(COM1 + 5) & 0x20) break;
+        __asm__ volatile("pause");
+    }
+}
 
 static void sputc(char c) {
-    for (unsigned int i=0; i<100000; i++) { if (inb(COM1+5)&0x20) break; }
+    serial_wait_tx_shell();
     outb(COM1, (unsigned char)c);
 }
 static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
@@ -26,6 +72,430 @@ static void logl(const char *s) { swrite(s); swrite("\n"); }
 /* ASCII 字体 — 必须在 deshab_ui.h 之前包含，因为 du_draw_char 引用 g_ascii */
 #include "../firstInit/ascii_bitmaps.c"
 #include "../UTSM/include/utsm/deshab_ui.h"
+/* 用户态共享协议栈（ping/curl 内建命令使用） */
+#include "../tools/net_stack.h"
+
+/* ============================================================
+ *  Block 设备 + FAT32 读写（移植自 DSK，支持 cp/mv/cat/ls）
+ * ============================================================ */
+
+typedef int (*shell_block_read_fn)(u32 index, u64 lba, u32 count, void *buf);
+typedef int (*shell_block_write_fn)(u32 index, u64 lba, u32 count, const void *buf);
+
+static shell_block_read_fn  g_block_read;
+static shell_block_write_fn g_block_write;
+
+/* FAT32 BPB / 目录项结构（与 DSK 一致，packed） */
+typedef struct __attribute__((packed)) {
+    u8 jmp[3]; char oem[8]; u16 bps; u8 spc; u16 rsvd; u8 fc; u16 root_ent;
+    u16 ts16; u8 media; u16 spf16; u16 spt; u16 heads; u32 hidden; u32 ts32;
+    u32 spf; u16 flags; u16 ver; u32 root_clus; u16 fsi; u16 bkboot;
+    u8 res[12]; u8 drv; u8 ntfl; u8 sig; u32 ser; char lbl[11]; char typ[8];
+    u8 code[420]; u16 boot_sig;
+} shell_fat32_bpb;
+
+typedef struct __attribute__((packed)) {
+    char name[11]; u8 attr; u8 ntr; u8 ctenth;
+    u16 ctime; u16 cdate; u16 adate; u16 chigh;
+    u16 wtime; u16 wdate; u16 clow; u32 fsize;
+} shell_fat32_de;
+
+static u32 sh_r32(const u8 *p) { return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24); }
+static u16 sh_r16(const u8 *p) { return (u16)p[0]|((u16)p[1]<<8); }
+static int sh_neq11(const char *a, const char *b) { for(int i=0;i<11;i++) if(a[i]!=b[i]) return 0; return 1; }
+
+/* 批量读写缓冲区（与 DSK 对齐：256 扇区覆盖 BPB+FAT+根目录+小文件） */
+static u8 g_disk[131072];      /* 256 扇区 BPB+FAT+根目录缓存 */
+static u8 g_cluster[4096];     /* 单簇缓冲 */
+static u8 g_fdata[262144];     /* 文件数据缓冲（最大 256KB） */
+static int g_disk_loaded = 0;  /* g_disk 是否已加载 BPB+FAT */
+
+static int sh_read_sectors(u32 lba, u32 count, u8 *out) { return g_block_read ? g_block_read(0,lba,count,out) : -1; }
+static int sh_write_sectors(u32 lba, u32 count, const u8 *buf) { return g_block_write ? g_block_write(0,lba,count,buf) : -1; }
+
+/* 确保 g_disk 已加载 BPB+FAT+根目录（256 扇区） */
+static int sh_disk_load(void) {
+    if (g_disk_loaded) return 0;
+    if (sh_read_sectors(0, 256, g_disk) != 0) return -1;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bps != 512) return -2;
+    if (bpb->spf == 0 || bpb->root_clus < 2) return -3;
+    g_disk_loaded = 1;
+    return 0;
+}
+
+/* 把 "file.txt" / "NAME" 转为 11 字符 8.3 名（大写，空格填充）
+ * 返回 0 成功，-1 失败（过长或非法字符） */
+static int name_to_83(const char *in, char out[11]) {
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int inlen = 0;
+    while (in[inlen] && inlen < 13) inlen++;
+    if (inlen == 0 || inlen > 12) return -1;
+    int dot = -1;
+    for (int i = 0; i < inlen; i++) if (in[i] == '.') dot = i;
+    int base_end = (dot >= 0) ? dot : inlen;
+    if (base_end == 0 || base_end > 8) return -1;
+    for (int j = 0; j < base_end; j++) {
+        char c = in[j];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if (c == '.' || c == ' ' || c == '/' || c == '\\') return -1;
+        out[j] = c;
+    }
+    if (dot >= 0) {
+        int extlen = inlen - dot - 1;
+        if (extlen > 3) return -1;
+        for (int j = 0; j < extlen; j++) {
+            char c = in[dot + 1 + j];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c == '.' || c == ' ' || c == '/' || c == '\\') return -1;
+            out[8 + j] = c;
+        }
+    }
+    return 0;
+}
+
+/* 把 11 字符 8.3 名转为可显示字符串（如 "README.TXT"） */
+static void name_from_83(const char in[11], char out[13]) {
+    int p = 0;
+    for (int j = 0; j < 8; j++) {
+        if (in[j] == ' ') break;
+        out[p++] = in[j];
+    }
+    if (in[8] != ' ') {
+        out[p++] = '.';
+        for (int j = 8; j < 11; j++) {
+            if (in[j] == ' ') break;
+            out[p++] = in[j];
+        }
+    }
+    out[p] = 0;
+}
+
+/* 在根目录簇链中查找 11 字符名，输出首簇号与文件大小 */
+static int fat32_find_in_root(const u8 *clus, u32 clus_sectors, const char *target,
+                              u32 *out_clus, u32 *out_size, u32 *out_idx) {
+    const shell_fat32_de *dir = (const shell_fat32_de *)clus;
+    for (u32 e = 0; e * 32 < clus_sectors * 512; e++) {
+        if (dir[e].name[0] == 0) break;
+        if ((u8)dir[e].name[0] == 0xE5) continue;
+        if (dir[e].attr == 0x0F) continue;
+        if (dir[e].attr & 0x08) continue;
+        if (sh_neq11(dir[e].name, target)) {
+            *out_clus = (u32)sh_r16((const u8*)&dir[e].clow) | ((u32)sh_r16((const u8*)&dir[e].chigh) << 16);
+            *out_size = dir[e].fsize;
+            if (out_idx) *out_idx = e;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* 读取根目录下指定 8.3 名文件到 g_fdata。
+ * 返回 0 成功，*out_data 指向 g_fdata，*out_size 为字节数；非 0 失败。 */
+static int fat32_read_root_file(const char *name11, u8 **out_data, u32 *out_size) {
+    if (sh_disk_load() != 0) return -1;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 spc = bpb->spc;
+
+    u32 clus = bpb->root_clus;
+    u32 found_clus = 0, found_size = 0;
+    int found = 0;
+    while (clus >= 2 && clus < 0x0FFFFFF8 && !found) {
+        u32 lba = data_lba + (clus - 2) * spc;
+        const u8 *cb;
+        if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
+            cb = g_disk + (u64)lba * 512;
+        else {
+            if (sh_read_sectors(lba, 8, g_cluster) != 0) return -4;
+            cb = g_cluster;
+        }
+        if (fat32_find_in_root(cb, spc, name11, &found_clus, &found_size, 0) == 0) { found = 1; break; }
+        u32 fo = fat_byte_off + clus * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+    if (!found) return -5;
+    if (found_size > sizeof(g_fdata)) return -6;
+
+    u8 *dst = g_fdata; u32 remaining = found_size; u32 fc = found_clus;
+    while (fc >= 2 && fc < 0x0FFFFFF8 && remaining > 0) {
+        u32 fc_lba = data_lba + (fc - 2) * spc;
+        u32 fc_bytes = spc * 512;
+        if (fc_bytes > remaining) fc_bytes = remaining;
+        const u8 *fb;
+        if ((u64)fc_lba * 512 + (u64)spc * 512 <= 256ULL * 512)
+            fb = g_disk + (u64)fc_lba * 512;
+        else {
+            if (sh_read_sectors(fc_lba, 8, g_cluster) != 0) return -7;
+            fb = g_cluster;
+        }
+        for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
+        dst += fc_bytes; remaining -= fc_bytes;
+        u32 fo = fat_byte_off + fc * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        fc = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+    *out_data = g_fdata; *out_size = found_size;
+    return 0;
+}
+
+/* 写入根目录下指定 8.3 名文件（存在则替换，不存在则新建）。
+ * 依赖 g_disk 已加载 BPB+FAT。返回 0 成功。 */
+static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
+    if (sh_disk_load() != 0) return -1;
+    /* 写入前重新加载 BPB+FAT，保证与盘上一致 */
+    if (sh_read_sectors(0, 256, g_disk) != 0) return -2;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 spc = bpb->spc;
+    u32 fat_lba = bpb->rsvd;
+    u32 fat_sectors = bpb->spf;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 root_clus = bpb->root_clus;
+    u32 cluster_bytes = spc * 512;
+
+    u32 root_lba = data_lba + (root_clus - 2) * spc;
+    u8 *root_buf = g_disk + (u64)root_lba * 512;
+    u32 max_entries = cluster_bytes / 32;
+    shell_fat32_de *dir = (shell_fat32_de *)root_buf;
+    int free_entry = -1;
+    u32 existing_clus = 0;
+    int found = 0;
+    u32 existing_idx = 0;
+    for (u32 e = 0; e < max_entries; e++) {
+        if (dir[e].name[0] == 0) { if (free_entry < 0) free_entry = (int)e; break; }
+        if ((u8)dir[e].name[0] == 0xE5) { if (free_entry < 0) free_entry = (int)e; continue; }
+        if (dir[e].attr == 0x0F) continue;
+        if (dir[e].attr & 0x08) continue;
+        if (sh_neq11(dir[e].name, name11)) {
+            existing_clus = (u32)sh_r16((const u8*)&dir[e].clow) | ((u32)sh_r16((const u8*)&dir[e].chigh) << 16);
+            found = 1; existing_idx = e;
+            if (free_entry < 0) free_entry = (int)e;
+            break;
+        }
+    }
+
+    u32 bytes_needed = size > 0 ? size : 1;
+    u32 clusters_needed = (bytes_needed + cluster_bytes - 1) / cluster_bytes;
+    u32 first_clus = 0;
+    u32 prev_clus = 0;
+
+    if (found && existing_clus >= 2) {
+        first_clus = existing_clus;
+        u32 cur = existing_clus;
+        u32 count = 0;
+        while (cur >= 2 && cur < 0x0FFFFFF8 && count < clusters_needed) {
+            prev_clus = cur;
+            u32 fo = fat_byte_off + cur * 4;
+            if (fo + 4 > sizeof(g_disk)) break;
+            cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+            count++;
+        }
+        while (count < clusters_needed) {
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) return -3;
+            u32 pfo = fat_byte_off + prev_clus * 4;
+            if (pfo + 4 <= sizeof(g_disk)) {
+                g_disk[pfo] = (u8)(newc & 0xFF);
+                g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                g_disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+            }
+            prev_clus = newc;
+            count++;
+        }
+        if (prev_clus >= 2) {
+            u32 fo = fat_byte_off + prev_clus * 4;
+            if (fo + 4 <= sizeof(g_disk)) {
+                g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = 0x0F;
+            }
+        }
+        /* 释放多余旧簇 */
+        u32 next = 0;
+        u32 fo = fat_byte_off + prev_clus * 4;
+        if (fo + 4 <= sizeof(g_disk)) next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        while (next >= 2 && next < 0x0FFFFFF8) {
+            u32 nfo = fat_byte_off + next * 4;
+            u32 nn = 0;
+            if (nfo + 4 <= sizeof(g_disk)) nn = sh_r32(g_disk + nfo) & 0x0FFFFFFF;
+            g_disk[nfo] = 0; g_disk[nfo+1] = 0; g_disk[nfo+2] = 0; g_disk[nfo+3] = 0;
+            next = nn;
+        }
+    } else {
+        if (free_entry < 0) return -4;
+        for (u32 i = 0; i < clusters_needed; i++) {
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) return -3;
+            if (i == 0) first_clus = newc;
+            if (prev_clus >= 2) {
+                u32 pfo = fat_byte_off + prev_clus * 4;
+                g_disk[pfo] = (u8)(newc & 0xFF);
+                g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                g_disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+            }
+            prev_clus = newc;
+        }
+        if (prev_clus >= 2) {
+            u32 fo = fat_byte_off + prev_clus * 4;
+            g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = 0x0F;
+        }
+    }
+
+    /* 写数据到簇 */
+    u32 remaining = size;
+    const u8 *src = data;
+    u32 cur = first_clus;
+    u32 ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        u32 chunk = remaining < cluster_bytes ? remaining : cluster_bytes;
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            u8 *dst = g_disk + (u64)clba * 512;
+            for (u32 b = 0; b < chunk; b++) dst[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) dst[b] = 0;
+        } else {
+            if (sh_read_sectors(clba, spc, g_cluster) != 0) return -5;
+            for (u32 b = 0; b < chunk; b++) g_cluster[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) g_cluster[b] = 0;
+            if (sh_write_sectors(clba, spc, g_cluster) != 0) return -6;
+        }
+        src += chunk; remaining -= chunk; ci++;
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+
+    /* 更新目录项 */
+    u32 entry_idx = found ? existing_idx : (u32)free_entry;
+    shell_fat32_de *e = &dir[entry_idx];
+    if (!found) {
+        for (int i = 0; i < 11; i++) e->name[i] = name11[i];
+        e->attr = 0x20; e->ntr = 0; e->ctenth = 0; e->ctime = 0; e->cdate = 0; e->adate = 0;
+    }
+    e->chigh = (u16)((first_clus >> 16) & 0xFFFF);
+    e->clow = (u16)(first_clus & 0xFFFF);
+    e->fsize = size;
+
+    /* 回写 FAT（两份）+ 根目录 + 缓冲区内的数据簇 */
+    for (u32 f = 0; f < bpb->fc; f++) {
+        u32 flba = fat_lba + f * fat_sectors;
+        if (sh_write_sectors(flba, fat_sectors, g_disk + (u64)flba * 512) != 0) return -7;
+    }
+    u32 root_dir_lba = data_lba + (root_clus - 2) * spc;
+    if ((u64)root_dir_lba * 512 + cluster_bytes <= 256ULL * 512) {
+        if (sh_write_sectors(root_dir_lba, spc, g_disk + (u64)root_dir_lba * 512) != 0) return -8;
+    }
+    cur = first_clus; ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            if (sh_write_sectors(clba, spc, g_disk + (u64)clba * 512) != 0) return -9;
+        }
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        ci++;
+    }
+    g_disk_loaded = 0;  /* 下次操作重新加载，避免使用脏缓存 */
+    return 0;
+}
+
+/* 删除根目录下指定 8.3 名文件：清空簇链 + 标记目录项为 0xE5。
+ * 返回 0 成功，-1 未找到，其他负值失败。 */
+static int fat32_delete_root_file(const char *name11) {
+    if (sh_disk_load() != 0) return -2;
+    if (sh_read_sectors(0, 256, g_disk) != 0) return -3;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 spc = bpb->spc;
+    u32 fat_lba = bpb->rsvd;
+    u32 fat_sectors = bpb->spf;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 root_clus = bpb->root_clus;
+
+    u32 root_lba = data_lba + (root_clus - 2) * spc;
+    u8 *root_buf = g_disk + (u64)root_lba * 512;
+    u32 max_entries = (spc * 512) / 32;
+    shell_fat32_de *dir = (shell_fat32_de *)root_buf;
+    u32 found_idx = 0xFFFFFFFFu;
+    for (u32 e = 0; e < max_entries; e++) {
+        if (dir[e].name[0] == 0) break;
+        if ((u8)dir[e].name[0] == 0xE5) continue;
+        if (dir[e].attr == 0x0F) continue;
+        if (dir[e].attr & 0x08) continue;
+        if (sh_neq11(dir[e].name, name11)) { found_idx = e; break; }
+    }
+    if (found_idx == 0xFFFFFFFFu) return -1;
+
+    /* 释放簇链 */
+    u32 cur = (u32)sh_r16((const u8*)&dir[found_idx].clow) | ((u32)sh_r16((const u8*)&dir[found_idx].chigh) << 16);
+    while (cur >= 2 && cur < 0x0FFFFFF8) {
+        u32 fo = fat_byte_off + cur * 4;
+        u32 next = 0;
+        if (fo + 4 <= sizeof(g_disk)) next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        g_disk[fo] = 0; g_disk[fo+1] = 0; g_disk[fo+2] = 0; g_disk[fo+3] = 0;
+        cur = next;
+    }
+    /* 标记目录项为已删除 */
+    dir[found_idx].name[0] = (char)0xE5;
+
+    /* 回写 FAT + 根目录 */
+    for (u32 f = 0; f < bpb->fc; f++) {
+        u32 flba = fat_lba + f * fat_sectors;
+        if (sh_write_sectors(flba, fat_sectors, g_disk + (u64)flba * 512) != 0) return -4;
+    }
+    if (sh_write_sectors(root_lba, spc, g_disk + (u64)root_lba * 512) != 0) return -5;
+    g_disk_loaded = 0;
+    return 0;
+}
+
+/* 列出根目录所有文件/目录，调用回调输出 */
+static int fat32_list_root(int (*emit)(const char *name, u32 size, u8 attr, void *u), void *u) {
+    if (sh_disk_load() != 0) return -1;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 spc = bpb->spc;
+    u32 clus = bpb->root_clus;
+    while (clus >= 2 && clus < 0x0FFFFFF8) {
+        u32 lba = data_lba + (clus - 2) * spc;
+        const u8 *cb;
+        if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
+            cb = g_disk + (u64)lba * 512;
+        else {
+            if (sh_read_sectors(lba, 8, g_cluster) != 0) return -4;
+            cb = g_cluster;
+        }
+        const shell_fat32_de *dir = (const shell_fat32_de *)cb;
+        for (u32 e = 0; e * 32 < spc * 512; e++) {
+            if (dir[e].name[0] == 0) goto done;
+            if ((u8)dir[e].name[0] == 0xE5) continue;
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            char disp[13];
+            name_from_83(dir[e].name, disp);
+            if (emit(disp, dir[e].fsize, dir[e].attr, u) != 0) goto done;
+        }
+        u32 fo = fat_byte_off + clus * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+done:
+    return 0;
+}
 
 /* ---- 风格令牌（引用 deshab_ui.h 语义色） ---- */
 #define BG_COLOR      DS_DARK_BG_PRIMARY
@@ -114,7 +584,11 @@ static void term_newline(void) {
     if (cur_row >= term_h) term_scroll();
 }
 
+/* dev_mode 串口镜像：reserved[3]=1 时终端输出同步写 COM1，便于自动化验证 */
+static int g_serial_mirror = 0;
+
 static void term_putc_color(char c, u32 color) {
+    if (g_serial_mirror) { if (c == '\n') sputc('\r'); sputc(c); }
     if (c == '\n') { term_newline(); return; }
     if (c == '\r') { cur_col = 0; return; }
     if (c == '\t') {
@@ -220,6 +694,74 @@ static char input_buf[256];
 static int input_len = 0;
 static int input_cursor = 0;
 
+/* ---- 命令历史（上下箭头浏览） ---- */
+/* 前向声明: redraw_input_line 在下方定义 */
+static void redraw_input_line(void);
+
+#define HISTORY_MAX 32
+static char g_history[HISTORY_MAX][256];
+static int g_history_count = 0;   /* 已记录命令条数 (0..HISTORY_MAX) */
+static int g_history_view = -1;  /* 当前浏览索引, -1 表示正在编辑新输入 */
+
+/* 将命令推入历史。空字符串或纯空白不入历史；与最近一条相同时跳过。 */
+static void history_push(const char *cmd) {
+    const char *p = cmd;
+    while (*p == ' ') p++;
+    if (*p == 0) return;
+    /* 与最近一条相同则跳过 */
+    if (g_history_count > 0) {
+        const char *latest = g_history[(g_history_count - 1) % HISTORY_MAX];
+        const char *a = latest;
+        const char *b = p;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) return;
+    }
+    int idx = g_history_count % HISTORY_MAX;
+    int i = 0;
+    while (p[i] && i < 255) { g_history[idx][i] = p[i]; i++; }
+    g_history[idx][i] = 0;
+    if (g_history_count < HISTORY_MAX) g_history_count++;
+}
+
+/* 加载历史条目到 input_buf 并刷新显示 */
+static void history_load(int idx) {
+    const char *src = g_history[idx % HISTORY_MAX];
+    int i = 0;
+    while (src[i] && i < 255) { input_buf[i] = src[i]; i++; }
+    input_buf[i] = 0;
+    input_len = i;
+    input_cursor = i;
+    redraw_input_line();
+}
+
+/* 上箭头: 浏览更早的命令 */
+static void history_prev(void) {
+    if (g_history_count == 0) return;
+    if (g_history_view == -1) {
+        g_history_view = g_history_count - 1;
+    } else if (g_history_view > 0) {
+        g_history_view--;
+    } else {
+        return;  /* 已到达最早一条 */
+    }
+    history_load(g_history_view);
+}
+
+/* 下箭头: 浏览更新的命令; 超过最新则回到空输入 */
+static void history_next(void) {
+    if (g_history_view == -1) return;
+    g_history_view++;
+    if (g_history_view >= g_history_count) {
+        g_history_view = -1;
+        input_len = 0;
+        input_cursor = 0;
+        input_buf[0] = 0;
+        redraw_input_line();
+        return;
+    }
+    history_load(g_history_view);
+}
+
 /* ---- 键盘扫描码 → ASCII（Set 1） ---- */
 static char scan_to_ascii(u8 sc, int shift) {
     static const char normal[58] = {
@@ -248,16 +790,25 @@ static void cmd_help(void) {
     term_puts_color("Deshab Shell — 内置命令列表:\n", PROMPT_FG);
     term_puts("  help          显示此帮助\n");
     term_puts("  clear         清屏\n");
-    term_puts("  echo <text>   显示文本\n");
-    term_puts("  version       显示系统版本\n");
+    term_puts("  echo <text>   显示文本（-n 不换行, > file 重定向写盘）\n");
+    term_puts("  ls / dir      列出根目录文件\n");
+    term_puts("  cat <file>    显示文件内容\n");
+    term_puts("  cp <s> <d>    复制文件\n");
+    term_puts("  mv <s> <d>    移动/重命名文件\n");
+    term_puts("  rm <file>     删除文件\n");
+    term_puts("  pwd           显示当前目录\n");
+    term_puts("  whoami        显示当前用户\n");
+    term_puts("  id            显示用户ID\n");
+    term_puts("  version/ver   显示系统版本\n");
     term_puts("  uname         显示系统名称\n");
     term_puts("  date          显示当前日期\n");
-    term_puts("  ver           显示内核版本（同 version）\n");
     term_puts("  about         关于 Deshab\n");
+    term_puts("  pci           列出 PCI 设备\n");
+    term_puts("  ping [ip]     ICMP echo 测试（缺省网关 10.0.2.2）\n");
+    term_puts("  curl <url>    HTTP GET 请求（http://host[:port]/path）\n");
+    term_puts("  run <NAME.ELF> 运行根目录下的工具程序\n");
     term_puts("  reboot        重启系统\n");
     term_puts("  halt          关机（停止 CPU）\n");
-    term_puts("  ls            列出根目录文件（暂未实现，需要 VFS）\n");
-    term_puts("  pci           列出 PCI 设备（暂未实现）\n");
 }
 
 static void cmd_version(void) {
@@ -301,9 +852,45 @@ static void cmd_halt(void) {
     for(;;) __asm__("hlt");
 }
 
+/* echo：支持 -n（不换行）和 " > file" 重定向写盘 */
 static void cmd_echo(const char *args) {
+    int newline = 1;
+    if (args && args[0] == '-' && args[1] == 'n' && (args[2] == ' ' || args[2] == 0)) {
+        newline = 0;
+        args += 2;
+        while (*args == ' ') args++;
+    }
+    /* 检测 " > file" 重定向 */
+    const char *redir = 0;
+    if (args) {
+        const char *p = args;
+        while (*p) { if (*p == '>') { redir = p; break; } p++; }
+    }
+    if (redir) {
+        int text_len = (int)(redir - args);
+        while (text_len > 0 && args[text_len-1] == ' ') text_len--;
+        const char *fname = redir + 1;
+        while (*fname == ' ') fname++;
+        char fnbuf[64]; int fl = 0;
+        while (*fname && *fname != ' ' && fl < 63) fnbuf[fl++] = *fname++;
+        fnbuf[fl] = 0;
+        if (fl == 0) { term_puts_color("echo: 重定向缺少文件名\n", ERROR_FG); return; }
+        char n83[11];
+        if (name_to_83(fnbuf, n83) != 0) { term_puts_color("echo: 无效文件名\n", ERROR_FG); return; }
+        static char echo_buf[4096];
+        int el = 0;
+        for (int i = 0; i < text_len && el < 4095; i++) echo_buf[el++] = args[i];
+        if (newline) echo_buf[el++] = '\n';
+        if (!g_block_write) { term_puts_color("echo: 无块设备写能力\n", ERROR_FG); return; }
+        int rc = fat32_write_root_file(n83, (const u8 *)echo_buf, (u32)el);
+        if (rc != 0) { term_puts_color("echo: 写入失败\n", ERROR_FG); return; }
+        term_puts_color("echo: 已写入 ", OK_FG);
+        term_puts_color(fnbuf, OK_FG);
+        term_putc('\n');
+        return;
+    }
     if (args && *args) term_puts_color(args, TEXT_FG);
-    term_putc('\n');
+    if (newline) term_putc('\n');
 }
 
 static u8 read_rtc_reg(u8 reg);
@@ -347,6 +934,598 @@ static void cmd_not_impl(const char *cmd) {
     term_puts_color(": 此命令尚未实现\n", ERROR_FG);
 }
 
+/* ============================================================
+ *  文件命令：ls / cat / cp / mv / rm（FAT32 根目录）
+ * ============================================================ */
+
+/* 从 args 解析一个空白分隔 token 到 out(最多 max-1 字符)，返回剩余 args 指针 */
+static const char *parse_token(const char *args, char *out, int max) {
+    int n = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && n < max - 1) out[n++] = *args++;
+    out[n] = 0;
+    return args;
+}
+
+/* u32 → 十进制字符串 */
+static void u32_to_dec(char *buf, u32 v) {
+    char tmp[12]; int n = 0;
+    if (v == 0) { buf[0] = '0'; buf[1] = 0; return; }
+    while (v && n < 11) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    buf[n] = 0;
+}
+
+/* ls 回调：每行打印一个条目 */
+static int ls_emit(const char *name, u32 size, u8 attr, void *u) {
+    (void)u;
+    if (attr & 0x10) term_puts_color("[DIR] ", ACCENT_FG);
+    else             term_puts_color("      ", TEXT_FG);
+    term_puts_color(name, TEXT_FG);
+    /* 名字对齐填充 */
+    int nl = 0; while (name[nl]) nl++;
+    for (int i = nl; i < 14; i++) term_putc(' ');
+    if (!(attr & 0x10)) {
+        char sz[12]; u32_to_dec(sz, size);
+        term_puts_color(sz, DIM_FG);
+        term_puts_color(" B", DIM_FG);
+    }
+    term_putc('\n');
+    return 0;
+}
+
+static void cmd_ls(void) {
+    if (!g_block_read) { term_puts_color("ls: 无块设备\n", ERROR_FG); return; }
+    if (fat32_list_root(ls_emit, 0) != 0) {
+        term_puts_color("ls: 读取根目录失败\n", ERROR_FG);
+    }
+}
+
+static void cmd_cat(const char *args) {
+    if (!g_block_read) { term_puts_color("cat: 无块设备\n", ERROR_FG); return; }
+    char fn[64];
+    parse_token(args, fn, 64);
+    if (fn[0] == 0) { term_puts_color("用法: cat <文件>\n", ERROR_FG); return; }
+    char n83[11];
+    if (name_to_83(fn, n83) != 0) { term_puts_color("cat: 无效文件名\n", ERROR_FG); return; }
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_root_file(n83, &data, &size) != 0) {
+        term_puts_color("cat: 文件不存在\n", ERROR_FG);
+        return;
+    }
+    for (u32 i = 0; i < size; i++) term_putc((char)data[i]);
+}
+
+static void cmd_cp(const char *args) {
+    if (!g_block_read || !g_block_write) { term_puts_color("cp: 需要块设备读写能力\n", ERROR_FG); return; }
+    char src[64], dst[64];
+    args = parse_token(args, src, 64);
+    parse_token(args, dst, 64);
+    if (src[0] == 0 || dst[0] == 0) {
+        term_puts_color("用法: cp <源文件> <目标文件>\n", ERROR_FG);
+        return;
+    }
+    char s83[11], d83[11];
+    if (name_to_83(src, s83) != 0) { term_puts_color("cp: 无效源文件名\n", ERROR_FG); return; }
+    if (name_to_83(dst, d83) != 0) { term_puts_color("cp: 无效目标文件名\n", ERROR_FG); return; }
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_root_file(s83, &data, &size) != 0) {
+        term_puts_color("cp: 源文件不存在或读取失败\n", ERROR_FG);
+        return;
+    }
+    if (fat32_write_root_file(d83, data, size) != 0) {
+        term_puts_color("cp: 写入目标失败\n", ERROR_FG);
+        return;
+    }
+    term_puts_color("cp: ", OK_FG);
+    term_puts_color(src, OK_FG);
+    term_puts_color(" -> ", OK_FG);
+    term_puts_color(dst, OK_FG);
+    term_puts_color(" (", DIM_FG);
+    char sz[12]; u32_to_dec(sz, size);
+    term_puts_color(sz, DIM_FG);
+    term_puts_color(" bytes)\n", DIM_FG);
+}
+
+static void cmd_mv(const char *args) {
+    if (!g_block_read || !g_block_write) { term_puts_color("mv: 需要块设备读写能力\n", ERROR_FG); return; }
+    char src[64], dst[64];
+    args = parse_token(args, src, 64);
+    parse_token(args, dst, 64);
+    if (src[0] == 0 || dst[0] == 0) {
+        term_puts_color("用法: mv <源文件> <目标文件>\n", ERROR_FG);
+        return;
+    }
+    char s83[11], d83[11];
+    if (name_to_83(src, s83) != 0) { term_puts_color("mv: 无效源文件名\n", ERROR_FG); return; }
+    if (name_to_83(dst, d83) != 0) { term_puts_color("mv: 无效目标文件名\n", ERROR_FG); return; }
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_root_file(s83, &data, &size) != 0) {
+        term_puts_color("mv: 源文件不存在或读取失败\n", ERROR_FG);
+        return;
+    }
+    if (fat32_write_root_file(d83, data, size) != 0) {
+        term_puts_color("mv: 写入目标失败\n", ERROR_FG);
+        return;
+    }
+    /* 写入后 g_disk 缓存已失效，delete 会重新加载 BPB+FAT */
+    if (fat32_delete_root_file(s83) != 0) {
+        term_puts_color("mv: 警告 — 源文件删除失败，目标已写入\n", DP_WARNING);
+        return;
+    }
+    term_puts_color("mv: ", OK_FG);
+    term_puts_color(src, OK_FG);
+    term_puts_color(" -> ", OK_FG);
+    term_puts_color(dst, OK_FG);
+    term_putc('\n');
+}
+
+static void cmd_rm(const char *args) {
+    if (!g_block_write) { term_puts_color("rm: 需要块设备写能力\n", ERROR_FG); return; }
+    char fn[64];
+    parse_token(args, fn, 64);
+    if (fn[0] == 0) { term_puts_color("用法: rm <文件>\n", ERROR_FG); return; }
+    char n83[11];
+    if (name_to_83(fn, n83) != 0) { term_puts_color("rm: 无效文件名\n", ERROR_FG); return; }
+    int rc = fat32_delete_root_file(n83);
+    if (rc == -1) { term_puts_color("rm: 文件不存在\n", ERROR_FG); return; }
+    if (rc != 0) { term_puts_color("rm: 删除失败\n", ERROR_FG); return; }
+    term_puts_color("rm: 已删除 ", OK_FG);
+    term_puts_color(fn, OK_FG);
+    term_putc('\n');
+}
+
+/* ---- PCI 设备列表 ---- */
+static u32 pci_config_read(u8 bus, u8 dev, u8 func, u8 reg) {
+    u32 addr = 0x80000000u | ((u32)bus << 16) | ((u32)dev << 11)
+             | ((u32)func << 8) | ((u32)reg & 0xFCu);
+    outl(0xCF8, addr);
+    return inl(0xCFC);
+}
+
+static void hex_nibble(char *buf, u8 v) {
+    v = (u8)(v & 0x0F);
+    buf[0] = (char)(v < 10 ? '0' + v : 'A' + (v - 10));
+}
+
+static void u8_to_hex(char *buf, u8 v) {
+    hex_nibble(buf, (u8)(v >> 4));
+    hex_nibble(buf + 1, v);
+    buf[2] = 0;
+}
+
+static void u16_to_hex(char *buf, u16 v) {
+    hex_nibble(buf,   (u8)(v >> 12));
+    hex_nibble(buf+1, (u8)(v >> 8));
+    hex_nibble(buf+2, (u8)(v >> 4));
+    hex_nibble(buf+3, v);
+    buf[4] = 0;
+}
+
+static void u8_to_dec(char *buf, u8 v) {
+    if (v >= 100) {
+        buf[0] = (char)('0' + v / 100);
+        buf[1] = (char)('0' + (v / 10) % 10);
+        buf[2] = (char)('0' + v % 10);
+        buf[3] = 0;
+    } else if (v >= 10) {
+        buf[0] = (char)('0' + v / 10);
+        buf[1] = (char)('0' + v % 10);
+        buf[2] = 0;
+    } else {
+        buf[0] = (char)('0' + v);
+        buf[1] = 0;
+    }
+}
+
+static const char *pci_vendor_name(u16 vendor) {
+    switch (vendor) {
+        case 0x8086: return "Intel";
+        case 0x1234: return "Bochs/QEMU";
+        case 0x1AF4: return "Virtio";
+        case 0x168C: return "Atheros";
+        case 0x10DE: return "NVIDIA";
+        case 0x1002: return "AMD";
+        case 0x10EC: return "Realtek";
+        case 0x14E4: return "Broadcom";
+        case 0x1B36: return "Red Hat";
+        case 0x1022: return "AMD-x86";
+        case 0x106B: return "Apple";
+        default: return "";
+    }
+}
+
+static const char *pci_class_name(u8 class_code) {
+    switch (class_code) {
+        case 0x00: return "Unclassified";
+        case 0x01: return "Mass storage";
+        case 0x02: return "Network";
+        case 0x03: return "Display";
+        case 0x04: return "Multimedia";
+        case 0x05: return "Memory";
+        case 0x06: return "Bridge";
+        case 0x07: return "Comm";
+        case 0x08: return "Sys peripheral";
+        case 0x09: return "Input";
+        case 0x0C: return "Serial bus";
+        case 0x0D: return "Wireless";
+        case 0x10: return "Encryption";
+        case 0x11: return "Signal proc";
+        case 0x40: return "Coprocessor";
+        default: return "Other";
+    }
+}
+
+static void cmd_pci(void) {
+    int count = 0;
+    term_puts_color("PCI 设备列表:\n", PROMPT_FG);
+    for (u8 bus = 0; bus < 1; bus++) {
+        for (u8 dev = 0; dev < 32; dev++) {
+            u32 vd = pci_config_read(bus, dev, 0, 0x00);
+            if ((vd & 0xFFFFu) == 0xFFFFu) continue;
+            u32 hdr_class = pci_config_read(bus, dev, 0, 0x0C);
+            u8 header_type = (u8)((hdr_class >> 16) & 0xFF);
+            u8 func_count = (u8)((header_type & 0x80) ? 8 : 1);
+            for (u8 func = 0; func < func_count; func++) {
+                u32 vdf = pci_config_read(bus, dev, func, 0x00);
+                u16 vendor = (u16)(vdf & 0xFFFFu);
+                u16 device = (u16)(vdf >> 16);
+                if (vendor == 0xFFFFu) continue;
+                u32 cls = pci_config_read(bus, dev, func, 0x08);
+                u8 rev = (u8)(cls & 0xFF);
+                u8 prog_if = (u8)((cls >> 8) & 0xFF);
+                u8 subclass = (u8)((cls >> 16) & 0xFF);
+                u8 class_code = (u8)((cls >> 24) & 0xFF);
+
+                char line[80];
+                int p = 0;
+                /* "00:00.0 " */
+                u8_to_hex(line + p, bus); p += 2;
+                line[p++] = ':';
+                u8_to_hex(line + p, dev); p += 2;
+                line[p++] = '.';
+                u8_to_hex(line + p, func); p += 2;
+                line[p++] = ' ';
+                /* "VEN:DEV " */
+                u16_to_hex(line + p, vendor); p += 4;
+                line[p++] = ':';
+                u16_to_hex(line + p, device); p += 4;
+                line[p++] = ' ';
+                /* "rev NN " */
+                line[p++] = 'r'; line[p++] = 'e'; line[p++] = 'v';
+                line[p++] = ' ';
+                u8_to_hex(line + p, rev); p += 2;
+                line[p++] = ' ';
+                /* "class CC:SS:PP" */
+                line[p++] = 'c'; line[p++] = 'l'; line[p++] = 'a';
+                line[p++] = 's'; line[p++] = 's'; line[p++] = ' ';
+                u8_to_hex(line + p, class_code); p += 2;
+                line[p++] = ':';
+                u8_to_hex(line + p, subclass); p += 2;
+                line[p++] = ':';
+                u8_to_hex(line + p, prog_if); p += 2;
+                line[p++] = ' ';
+                line[p++] = '[';
+                const char *cn = pci_class_name(class_code);
+                while (*cn) line[p++] = *cn++;
+                line[p++] = ']';
+                const char *vn = pci_vendor_name(vendor);
+                if (*vn) {
+                    line[p++] = ' ';
+                    while (*vn) line[p++] = *vn++;
+                }
+                line[p] = 0;
+                term_puts(line);
+                term_putc('\n');
+                count++;
+            }
+        }
+    }
+    char tail[32];
+    int q = 0;
+    const char *prefix = "Total: ";
+    while (prefix[q]) { tail[q] = prefix[q]; q++; }
+    u8_to_dec(tail + q, (u8)(count > 255 ? 255 : count));
+    while (tail[q]) q++;
+    const char *suffix = " device(s)\n";
+    int s = 0;
+    while (suffix[s]) { tail[q++] = suffix[s++]; }
+    tail[q] = 0;
+    term_puts_color(tail, DIM_FG);
+}
+
+/* ============================================================
+ *  网络命令：ping / curl（共享协议栈 net_stack.h）
+ * ============================================================ */
+
+static u64 g_kernel_api = 0;
+static const dsk_boot_context *g_boot_ctx = 0;
+static int g_ns_status = 0;  /* 0=未尝试, 1=就绪, <0=初始化失败 */
+
+static int shell_net_ready(void) {
+    if (g_ns_status == 1) return 1;
+    if (g_ns_status < 0) return 0;
+    int rc = ns_init(g_kernel_api);
+    g_ns_status = (rc == 0) ? 1 : -1;
+    if (rc != 0) {
+        logl("[shell] ns_init failed");
+        term_puts_color("网络初始化失败 (rc=", ERROR_FG);
+        char rcbuf[4];
+        rcbuf[0] = (char)('0' + (-rc % 10));
+        rcbuf[1] = 0;
+        term_puts_color(rcbuf, ERROR_FG);
+        term_puts_color(")，无可用网卡或 net API\n", ERROR_FG);
+        return 0;
+    }
+    logl("[shell] ns_init ok");
+    return 1;
+}
+
+/* ping [a.b.c.d] — 缺省网关 10.0.2.2，4 次 echo */
+static void cmd_ping(const char *args) {
+    u32 ip;
+    if (!args || !*args) {
+        ip = NS_GATEWAY_IP;
+    } else if (ns_parse_ip(args, &ip) != 0) {
+        term_puts_color("用法: ping [a.b.c.d]\n", ERROR_FG);
+        return;
+    }
+    if (!shell_net_ready()) return;
+
+    char ipstr[24];
+    ns_fmt_ip(ip, ipstr);
+    term_puts_color("PING ", PROMPT_FG);
+    term_puts_color(ipstr, ACCENT_FG);
+    term_puts_color(" 32 data bytes\n", DIM_FG);
+
+    int sent = 0, recv = 0;
+    u32 sum = 0, min = 0xFFFFFFFFu, max = 0;
+    for (u16 seq = 1; seq <= 4; seq++) {
+        u32 rtt = 0; u8 ttl = 0;
+        int rc = ns_ping(ip, seq, 2000, &rtt, &ttl);
+        sent++;
+        if (rc == 0) {
+            recv++;
+            sum += rtt;
+            if (rtt < min) min = rtt;
+            if (rtt > max) max = rtt;
+            term_puts("reply from ");
+            term_puts(ipstr);
+            term_puts(": bytes=32 time=");
+            char nb[12]; ns_u32_dec(nb, rtt);
+            term_puts(nb);
+            term_puts("ms TTL=");
+            ns_u32_dec(nb, ttl);
+            term_puts(nb);
+            term_putc('\n');
+        } else if (rc == -1) {
+            term_puts_color("ARP 解析失败，目标不可达\n", ERROR_FG);
+            break;
+        } else {
+            term_puts_color("request timed out\n", DIM_FG);
+        }
+    }
+    /* 统计行 */
+    char nb[12];
+    ns_u32_dec(nb, (u32)sent);
+    term_puts_color("--- ", DIM_FG);
+    term_puts_color(ipstr, DIM_FG);
+    term_puts_color(" ping statistics ---\n  ", DIM_FG);
+    term_puts(nb);
+    term_puts(" transmitted, ");
+    ns_u32_dec(nb, (u32)recv);
+    term_puts(nb);
+    term_puts(" received, ");
+    u32 loss = sent ? (u32)(sent - recv) * 100 / (u32)sent : 100;
+    ns_u32_dec(nb, loss);
+    term_puts(nb);
+    term_puts("% loss");
+    if (recv > 0) {
+        term_puts(", min/avg/max = ");
+        ns_u32_dec(nb, min); term_puts(nb); term_puts("/");
+        ns_u32_dec(nb, sum / (u32)recv); term_puts(nb); term_puts("/");
+        ns_u32_dec(nb, max); term_puts(nb); term_puts(" ms");
+    }
+    term_putc('\n');
+}
+
+/* curl http://host[:port][/path] — HTTP/1.0 GET，打印 status + body */
+static void cmd_curl(const char *args) {
+    if (!args || !*args) {
+        term_puts_color("用法: curl http://host[:port][/path]\n", ERROR_FG);
+        return;
+    }
+    if (!shell_net_ready()) return;
+
+    const char *p = args;
+    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':'&&p[5]=='/'&&p[6]=='/') p += 7;
+
+    char host[128]; int hl = 0;
+    while (*p && *p != ':' && *p != '/' && hl < 127) host[hl++] = *p++;
+    host[hl] = 0;
+    if (!hl) { term_puts_color("curl: 缺少主机名\n", ERROR_FG); return; }
+
+    u16 port = 80;
+    if (*p == ':') {
+        p++;
+        u32 pv = 0; int digits = 0;
+        while (*p >= '0' && *p <= '9') { pv = pv * 10 + (u32)(*p - '0'); p++; digits++; }
+        if (digits && pv <= 65535) port = (u16)pv;
+    }
+    char path[128]; int pl = 0;
+    if (*p == '/') {
+        while (*p && *p != ' ' && pl < 127) path[pl++] = *p++;
+    }
+    if (!pl) { path[0] = '/'; pl = 1; }
+    path[pl] = 0;
+
+    /* 解析主机 */
+    u32 ip;
+    term_puts_color("-> 解析 ", DIM_FG);
+    term_puts_color(host, DIM_FG);
+    term_puts_color("...\n", DIM_FG);
+    if (ns_dns_resolve(host, &ip) != 0) {
+        term_puts_color("curl: DNS 解析失败\n", ERROR_FG);
+        return;
+    }
+    char ipstr[24]; ns_fmt_ip(ip, ipstr);
+    term_puts_color("-> ", DIM_FG);
+    term_puts_color(ipstr, DIM_FG);
+    term_putc('\n');
+
+    /* 连接 */
+    term_puts_color("-> TCP 连接...\n", DIM_FG);
+    if (ns_tcp_connect(ip, port, 2000) != 0) {
+        term_puts_color("curl: TCP 连接失败（超时/RST）\n", ERROR_FG);
+        return;
+    }
+    term_puts_color("-> 已连接，发送请求\n", DIM_FG);
+
+    /* 构造 HTTP/1.0 请求 */
+    static char req[512];
+    int r = 0;
+    const char *m = "GET "; while (*m) req[r++] = *m++;
+    for (int i = 0; i < pl; i++) req[r++] = path[i];
+    m = " HTTP/1.0\r\nHost: "; while (*m) req[r++] = *m++;
+    for (int i = 0; i < hl; i++) req[r++] = host[i];
+    m = "\r\nConnection: close\r\n\r\n"; while (*m) req[r++] = *m++;
+    req[r] = 0;
+
+    if (ns_tcp_send((const u8 *)req, (u32)r) != 0) {
+        term_puts_color("curl: 发送失败\n", ERROR_FG);
+        ns_tcp_close();
+        return;
+    }
+
+    /* 收至 FIN（数据在协议栈 ns_tcp_rx 中累计） */
+    int n = ns_tcp_recv(0, 0, 5000);
+    ns_tcp_close();
+    if (n < 0) {
+        term_puts_color("curl: 连接被重置\n", ERROR_FG);
+        return;
+    }
+    if (n == 0) {
+        term_puts_color("curl: 无响应数据（超时）\n", ERROR_FG);
+        return;
+    }
+
+    /* 打印状态行 + body（截断提示） */
+    u32 total = ns_tcp_rx_len;
+    u32 show = (u32)n;
+    for (u32 i = 0; i < show; i++) term_putc((char)ns_tcp_rx[i]);
+    if (total > show) {
+        term_puts_color("\n[... 已截断，共 ", DIM_FG);
+        char nb[12]; ns_u32_dec(nb, total);
+        term_puts_color(nb, DIM_FG);
+        term_puts_color(" 字节]\n", DIM_FG);
+    }
+    term_putc('\n');
+}
+
+/* ============================================================
+ *  run 命令：从 FAT32 根目录加载并跳转 PIE ELF 工具
+ * ============================================================ */
+
+#define SH_ELFCLASS64 2
+#define SH_EM_X86_64 62
+#define SH_PT_LOAD 1
+#define SH_PT_DYNAMIC 2
+#define SH_DT_RELA 7
+#define SH_DT_RELASZ 8
+#define SH_DT_RELAENT 9
+#define SH_R_X86_64_RELATIVE 8
+
+typedef struct { u8 ident[16]; u16 type,machine; u32 ver; u64 entry,phoff,shoff; u32 flags; u16 ehsize,phentsize,phnum,shentsize,shnum,shstrndx; } sh_elf64_ehdr;
+typedef struct { u32 type,flags; u64 offset,vaddr,paddr,filesz,memsz,align; } sh_elf64_phdr;
+typedef struct { i64 tag; u64 val; } sh_elf64_dyn;
+typedef struct { u64 offset; u64 info; i64 addend; } sh_elf64_rela;
+
+/* run 加载镜像缓冲（容纳工具 ELF 展开后的 memsz） */
+static u8 g_run_image[262144];
+
+static int sh_load_elf(u8 *data, void **entry_out) {
+    const sh_elf64_ehdr *eh = (const sh_elf64_ehdr *)data;
+    if (eh->ident[0] != 0x7F || eh->ident[4] != SH_ELFCLASS64) return -1;
+    if (eh->machine != SH_EM_X86_64) return -2;
+    u64 min_vaddr = ~0ULL, max_vaddr = 0;
+    u32 lc = 0;
+    for (u16 i = 0; i < eh->phnum; i++) {
+        const sh_elf64_phdr *ph = (const sh_elf64_phdr *)(data + eh->phoff + (u64)i * eh->phentsize);
+        if (ph->type != SH_PT_LOAD) continue;
+        if (ph->filesz > ph->memsz) return -3;
+        if (ph->vaddr < min_vaddr) min_vaddr = ph->vaddr;
+        if (ph->vaddr + ph->memsz > max_vaddr) max_vaddr = ph->vaddr + ph->memsz;
+        lc++;
+    }
+    if (!lc || min_vaddr == ~0ULL) return -4;
+    u64 isize = (max_vaddr - min_vaddr + 0xFFF) & ~0xFFFULL;
+    if (isize > sizeof(g_run_image)) return -5;
+    u8 *image = g_run_image;
+    for (u64 i = 0; i < isize; i++) image[i] = 0;
+    for (u16 i = 0; i < eh->phnum; i++) {
+        const sh_elf64_phdr *ph = (const sh_elf64_phdr *)(data + eh->phoff + (u64)i * eh->phentsize);
+        if (ph->type != SH_PT_LOAD) continue;
+        u64 off = ph->vaddr - min_vaddr;
+        for (u64 b = 0; b < ph->filesz; b++) image[off + b] = data[ph->offset + b];
+    }
+    *entry_out = image + (eh->entry - min_vaddr);
+
+    /* R_X86_64_RELATIVE 重定位 */
+    u64 load_bias = (u64)image - min_vaddr;
+    for (u16 i = 0; i < eh->phnum; i++) {
+        const sh_elf64_phdr *ph = (const sh_elf64_phdr *)(data + eh->phoff + (u64)i * eh->phentsize);
+        if (ph->type != SH_PT_DYNAMIC) continue;
+        const sh_elf64_dyn *dyn = (const sh_elf64_dyn *)(image + (ph->vaddr - min_vaddr));
+        u64 rela_off = 0, rela_sz = 0, rela_ent = 24;
+        for (; dyn->tag != 0; dyn++) {
+            if (dyn->tag == SH_DT_RELA) rela_off = dyn->val;
+            else if (dyn->tag == SH_DT_RELASZ) rela_sz = dyn->val;
+            else if (dyn->tag == SH_DT_RELAENT) rela_ent = dyn->val;
+        }
+        if (rela_off && rela_sz) {
+            u64 cnt = rela_sz / rela_ent;
+            for (u64 rr = 0; rr < cnt; rr++) {
+                const sh_elf64_rela *rel = (const sh_elf64_rela *)(image + (rela_off - min_vaddr) + rr * rela_ent);
+                if ((u32)(rel->info & 0xFFFFFFFF) == SH_R_X86_64_RELATIVE) {
+                    u64 *slot = (u64 *)(image + (rel->offset - min_vaddr));
+                    *slot = load_bias + (u64)rel->addend;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* run NAME.ELF — 加载根目录工具，全屏执行，返回后重绘 shell */
+static void cmd_run(const char *args) {
+    if (!g_block_read) { term_puts_color("run: 无块设备\n", ERROR_FG); return; }
+    char fn[64];
+    parse_token(args, fn, 64);
+    if (fn[0] == 0) { term_puts_color("用法: run <NAME.ELF>\n", ERROR_FG); return; }
+    char n83[11];
+    if (name_to_83(fn, n83) != 0) { term_puts_color("run: 无效文件名\n", ERROR_FG); return; }
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_root_file(n83, &data, &size) != 0) {
+        term_puts_color("run: 文件不存在: ", ERROR_FG);
+        term_puts_color(fn, ERROR_FG);
+        term_putc('\n');
+        return;
+    }
+    void *entry = 0;
+    int rc = sh_load_elf(data, &entry);
+    if (rc != 0) {
+        term_puts_color("run: ELF 加载失败（无效格式或过大）\n", ERROR_FG);
+        return;
+    }
+    logl("[shell] run: jumping to tool");
+    void (*fn_entry)(const dsk_boot_context *) = (void (*)(const dsk_boot_context *))entry;
+    fn_entry(g_boot_ctx);
+    logl("[shell] run: tool returned");
+    /* 工具可能改动磁盘/显示状态：失效 FAT 缓存并重绘 */
+    g_disk_loaded = 0;
+    term_redraw_all();
+}
+
 static void execute_command(const char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == 0) return;
@@ -367,9 +1546,15 @@ static void execute_command(const char *cmd) {
     else if (str_eq(name, "halt") || str_eq(name, "shutdown")) cmd_halt();
     else if (str_eq(name, "echo")) cmd_echo(args);
     else if (str_eq(name, "date") || str_eq(name, "time")) cmd_date();
-    else if (str_eq(name, "ls") || str_eq(name, "dir")) cmd_not_impl("ls");
-    else if (str_eq(name, "pci")) cmd_not_impl("pci");
-    else if (str_eq(name, "cat")) cmd_not_impl("cat");
+    else if (str_eq(name, "ls") || str_eq(name, "dir")) cmd_ls();
+    else if (str_eq(name, "pci")) cmd_pci();
+    else if (str_eq(name, "cat")) cmd_cat(args);
+    else if (str_eq(name, "cp")) cmd_cp(args);
+    else if (str_eq(name, "mv")) cmd_mv(args);
+    else if (str_eq(name, "rm") || str_eq(name, "del")) cmd_rm(args);
+    else if (str_eq(name, "ping")) cmd_ping(args);
+    else if (str_eq(name, "curl")) cmd_curl(args);
+    else if (str_eq(name, "run")) cmd_run(args);
     else if (str_eq(name, "cd")) cmd_not_impl("cd");
     else if (str_eq(name, "pwd")) { term_puts("/\n"); }
     else if (str_eq(name, "whoami")) { term_puts("root\n"); }
@@ -497,6 +1682,54 @@ static void kill_line(void) {
     redraw_input_line();
 }
 
+/* 开发者模式:自动测试命令序列（ls/echo>/cat/cp/mv/rm）
+ * 由 DSK 在 firstInit.txt 第二行=1 时触发，reserved[3]=1 */
+static void run_dev_tests(void) {
+    term_puts_color("=== 开发者模式:自动测试命令 ===\n", PROMPT_FG);
+    term_putc('\n');
+
+    term_puts_color("[1] ls — 列出根目录\n", ACCENT_FG);
+    cmd_ls();
+    term_putc('\n');
+
+    term_puts_color("[2] echo \"Deshab dev test\" > TEST.TXT\n", ACCENT_FG);
+    cmd_echo("Deshab dev test > TEST.TXT");
+
+    term_puts_color("[3] cat TEST.TXT — 读回验证\n", ACCENT_FG);
+    cmd_cat("TEST.TXT");
+    term_putc('\n');
+
+    term_puts_color("[4] cp TEST.TXT COPY.TXT\n", ACCENT_FG);
+    cmd_cp("TEST.TXT COPY.TXT");
+
+    term_puts_color("[5] ls — 确认复制\n", ACCENT_FG);
+    cmd_ls();
+    term_putc('\n');
+
+    term_puts_color("[6] mv COPY.TXT MOVED.TXT\n", ACCENT_FG);
+    cmd_mv("COPY.TXT MOVED.TXT");
+
+    term_puts_color("[7] ls — 确认移动\n", ACCENT_FG);
+    cmd_ls();
+    term_putc('\n');
+
+    term_puts_color("[8] rm TEST.TXT\n", ACCENT_FG);
+    cmd_rm("TEST.TXT");
+    term_puts_color("[9] rm MOVED.TXT — 清理\n", ACCENT_FG);
+    cmd_rm("MOVED.TXT");
+
+    term_puts_color("[10] ls — 确认清理\n", ACCENT_FG);
+    cmd_ls();
+
+    term_puts_color("[11] ping 10.0.2.2 — 网络回归（失败不阻断）\n", ACCENT_FG);
+    cmd_ping("10.0.2.2");
+
+    term_putc('\n');
+    term_puts_color("=== 自动测试完成 ===\n", OK_FG);
+    term_puts_color("按 Esc 返回 DSK，或继续输入命令\n", DIM_FG);
+    term_putc('\n');
+}
+
 /* ---- 主入口 ---- */
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
@@ -513,6 +1746,20 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fb_h = ctx->framebuffer_height;
     fb_p = ctx->framebuffer_pitch;
 
+    /* 保存 boot 上下文（网络协议栈/run 命令使用） */
+    g_kernel_api = ctx->dkm_kernel_api;
+    g_boot_ctx = ctx;
+
+    /* 获取 block 设备 read/write（从 kernel_api + 0xA8 → block_api → +16/+24） */
+    {
+        u64 api = ctx->dkm_kernel_api;
+        u64 blk = *(u64 *)(api + 0xA8);
+        g_block_read  = blk ? (shell_block_read_fn)*(u64 *)(blk + 16) : 0;
+        g_block_write = blk ? (shell_block_write_fn)*(u64 *)(blk + 24) : 0;
+    }
+    if (g_block_read)  logl("[shell] block_read ok");
+    if (g_block_write) logl("[shell] block_write ok");
+
     /* 初始化风格系统渲染上下文 */
     du_context_init(&g_ctx, fb_a, fb_w, fb_h, fb_p);
 
@@ -522,9 +1769,18 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     /* 启动 banner — 使用风格令牌 */
     term_puts_color("=== Deshab OS v0.1.0 ===\n", ACCENT_FG);
-    term_puts_color("欢迎使用 Deshab Shell\n", OK_FG);
+    if (ctx->reserved[3] == 1)
+        term_puts_color("开发者模式 (自动测试命令)\n", OK_FG);
+    else
+        term_puts_color("欢迎使用 Deshab Shell\n", OK_FG);
     term_puts_color("输入 'help' 查看可用命令\n", DIM_FG);
     term_putc('\n');
+
+    /* 开发者模式:DSK 设 reserved[3]=1 时自动跑命令测试序列 */
+    if (ctx->reserved[3] == 1) {
+        g_serial_mirror = 1;
+        run_dev_tests();
+    }
 
     /* 主循环 */
     int shift = 0;
@@ -567,21 +1823,27 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 else if (sc == 0x47) cursor_home();
                 else if (sc == 0x4F) cursor_end();
                 else if (sc == 0x53) delete_char_fwd();
-                else if (sc == 0x48) { }
-                else if (sc == 0x50) { }
+                else if (sc == 0x48) { history_prev(); }
+                else if (sc == 0x50) { history_next(); }
                 e0 = 0;
                 continue;
             }
             if (sc == 0x1C) {
                 term_clear_cursor();
                 input_buf[input_len] = 0;
+                /* 提交命令前先入历史; 执行后再清空输入 */
+                history_push(input_buf);
+                g_history_view = -1;
                 term_putc('\n');
                 execute_command(input_buf);
+                input_len = 0;
+                input_cursor = 0;
+                input_buf[0] = 0;
                 cmd_done = 1;
                 continue;
             }
             if (sc == 0x0E) { delete_char_back(); continue; }
-            if (sc == 0x01) { kill_line(); continue; }
+            if (sc == 0x01) { logl("[shell] esc -> return to DSK"); return; }
             if (sc == 0x15 && !shift) { kill_line(); continue; }
             if (sc == 0x17 && !shift) { while (input_cursor > 0) delete_char_back(); continue; }
             if (sc == 0x0B && !shift) { kill_to_end(); continue; }

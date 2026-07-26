@@ -12,6 +12,7 @@ typedef unsigned long long u64;
 typedef long long          i64;
 
 typedef int (*block_read_fn)(u32 index, u64 lba, u32 count, void *buf);
+typedef int (*block_write_fn)(u32 index, u64 lba, u32 count, const void *buf);
 
 static void sputc(char c) { for(unsigned i=0;i<100000;i++){if(inb(COM1+5)&0x20)break;} outb(COM1,(u8)c); }
 static void swrite(const char *s) { while(*s){if(*s=='\n')sputc('\r');sputc(*s++);} }
@@ -61,11 +62,38 @@ typedef struct { u64 offset; u64 info; i64 addend; } elf64_rela;
 
 static u64 g_fb_addr, g_fb_w, g_fb_h, g_fb_p;
 static block_read_fn g_block_read;
+static block_write_fn g_block_write;
+static u64 g_tsc_per_ms = 0;
 static u8 g_disk[131072];
 static u8 g_cluster[4096];
 static u8 g_fdata[262144];
 
 static int fat32_read_sectors(u32 lba, u32 count, u8 *out) { return g_block_read ? g_block_read(0,lba,count,out) : -1; }
+static int fat32_write_sectors(u32 lba, u32 count, const u8 *buf) { return g_block_write ? g_block_write(0,lba,count,buf) : -1; }
+
+/* ---- TSC-based timing ---- */
+static u64 rdtsc_dsk(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+static void tsc_calibrate_dsk(void) {
+    outb(0x43, 0x30);       /* ch0, lo+hi, mode 0, binary */
+    outb(0x40, 0x7c);       /* 11932 low = ~10ms */
+    outb(0x40, 0x2e);       /* 11932 high */
+    u64 tsc_start = rdtsc_dsk();
+    u16 prev = 0; u64 loops = 0;
+    for (;;) {
+        outb(0x43, 0x00);
+        u16 cur = (u16)inb(0x40) | ((u16)inb(0x40) << 8);
+        if (cur > prev && loops > 10) break;
+        prev = cur; loops++;
+    }
+    u64 tsc_end = rdtsc_dsk();
+    g_tsc_per_ms = (tsc_end - tsc_start) / 10;
+    logh("[DSK] tsc_per_ms=", g_tsc_per_ms);
+}
 
 static u32 blend_color(u32 c1, u32 c2, u32 a) {
     u32 na = 256 - a;
@@ -92,6 +120,81 @@ static void dsk_fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
             i64 xx = x + c;
             if (xx < 0 || (u64)xx >= g_fb_w) continue;
             line[(u64)xx] = color;
+        }
+    }
+}
+
+/* ---- Spinner animation: comet-tail arc, clockwise, double-buffered ---- */
+/* sin×127 lookup table, 256 entries (1.40625° each). cos(d) = sin(d+64). */
+static const i8 g_sin_tab[256] = {
+    0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,46,
+    49,51,54,57,60,63,65,68,71,73,76,78,81,83,85,88,
+    90,92,94,96,98,100,102,104,106,107,109,111,112,113,115,116,
+    117,118,120,121,122,122,123,124,125,125,126,126,126,127,127,127,
+    127,127,127,127,126,126,126,125,125,124,123,122,122,121,120,118,
+    117,116,115,113,112,111,109,107,106,104,102,100,98,96,94,92,
+    90,88,85,83,81,78,76,73,71,68,65,63,60,57,54,51,
+    49,46,43,40,37,34,31,28,25,22,19,16,12,9,6,3,
+    0,-3,-6,-9,-12,-16,-19,-22,-25,-28,-31,-34,-37,-40,-43,-46,
+    -49,-51,-54,-57,-60,-63,-65,-68,-71,-73,-76,-78,-81,-83,-85,-88,
+    -90,-92,-94,-96,-98,-100,-102,-104,-106,-107,-109,-111,-112,-113,-115,-116,
+    -117,-118,-120,-121,-122,-122,-123,-124,-125,-125,-126,-126,-126,-127,-127,-127,
+    -127,-127,-127,-127,-126,-126,-126,-125,-125,-124,-123,-122,-122,-121,-120,-118,
+    -117,-116,-115,-113,-112,-111,-109,-107,-106,-104,-102,-100,-98,-96,-94,-92,
+    -90,-88,-85,-83,-81,-78,-76,-73,-71,-68,-65,-63,-60,-57,-54,-51,
+    -49,-46,-43,-40,-37,-34,-31,-28,-25,-22,-19,-16,-12,-9,-6,-3,
+};
+static i64 dsk_isin(u32 deg) { return (i64)g_sin_tab[deg & 255]; }
+static i64 dsk_icos(u32 deg) { return (i64)g_sin_tab[(deg + 64) & 255]; }
+
+#define SPIN_R       64
+#define SPIN_ARC     110   /* comet-tail span (of 256) ≈ 155° */
+#define SPIN_THICK   3     /* half-thickness of arc band */
+#define SPIN_BOX     (SPIN_R + SPIN_THICK + 2)
+static u32 g_spin_bg[(SPIN_BOX*2+1) * (SPIN_BOX*2+1)];
+
+static void spinner_save_bg(u32 *fb, i64 cx, i64 cy) {
+    for (i64 dy = -SPIN_BOX; dy <= SPIN_BOX; dy++) {
+        for (i64 dx = -SPIN_BOX; dx <= SPIN_BOX; dx++) {
+            i64 x = cx + dx, y = cy + dy;
+            u32 px = (x >= 0 && (u64)x < g_fb_w && y >= 0 && (u64)y < g_fb_h)
+                   ? ((u32*)((u8*)fb + (u64)y * g_fb_p))[(u64)x]
+                   : dsk_bg_at_y(y);
+            g_spin_bg[(dy + SPIN_BOX) * (SPIN_BOX*2+1) + (dx + SPIN_BOX)] = px;
+        }
+    }
+}
+
+static void spinner_restore_bg(u32 *fb, i64 cx, i64 cy) {
+    for (i64 dy = -SPIN_BOX; dy <= SPIN_BOX; dy++) {
+        i64 y = cy + dy;
+        if (y < 0 || (u64)y >= g_fb_h) continue;
+        u32 *line = (u32*)((u8*)fb + (u64)y * g_fb_p);
+        for (i64 dx = -SPIN_BOX; dx <= SPIN_BOX; dx++) {
+            i64 x = cx + dx;
+            if (x < 0 || (u64)x >= g_fb_w) continue;
+            line[(u64)x] = g_spin_bg[(dy + SPIN_BOX) * (SPIN_BOX*2+1) + (dx + SPIN_BOX)];
+        }
+    }
+}
+
+/* Draw comet-tail arc: head at (base+SPIN_ARC) brightest, tail at base fading out.
+ * Clockwise rotation by advancing `base`. Double-buffered via save/restore. */
+static void spinner_draw(u32 *fb, i64 cx, i64 cy, u32 base, u32 head_color) {
+    u32 bg_ref = dsk_bg_at_y(cy);
+    for (u32 d = 0; d < SPIN_ARC; d++) {
+        u32 ang = (base + d) & 255;
+        i64 ic = dsk_icos(ang), is = dsk_isin(ang);
+        u32 alpha = ((d + 1) * 255) / SPIN_ARC;   /* tail→head: 0→255 */
+        u32 color = blend_color(bg_ref, head_color, alpha);
+        for (i64 t = -SPIN_THICK; t <= SPIN_THICK; t++) {
+            i64 r = SPIN_R + t;
+            if (r <= 0) continue;
+            i64 x = cx + (r * ic) / 127;
+            i64 y = cy + (r * is) / 127;
+            if (x < 0 || (u64)x >= g_fb_w || y < 0 || (u64)y >= g_fb_h) continue;
+            u32 *line = (u32*)((u8*)fb + (u64)y * g_fb_p);
+            line[(u64)x] = color;
         }
     }
 }
@@ -174,17 +277,238 @@ static int fat32_read_root_file(const char *name11, u8 **out_data, u32 *out_size
     return 0;
 }
 
-static int dsk_check_firstinit(int *is_first) {
+/* Write a file to the FAT32 root directory by 11-char 8.3 name.
+ * If the file exists, its content is replaced. If not, a new entry is created.
+ * Uses g_disk (256-sector buffer) which must already contain the BPB+FAT+root.
+ * Returns 0 on success. */
+static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
+    u8 *disk = g_disk;
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bps != 512) return -1;
+    u32 spc = bpb->spc;
+    u32 fat_lba = bpb->rsvd;
+    u32 fat_sectors = bpb->spf;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 root_clus = bpb->root_clus;
+    u32 cluster_bytes = spc * 512;
+
+    /* 1. Re-read BPB+FAT to ensure g_disk is fresh */
+    if (fat32_read_sectors(0, 256, disk) != 0) return -2;
+
+    /* 2. Find file entry in root directory */
+    u32 root_lba = data_lba + (root_clus - 2) * spc;
+    u8 *root_buf = disk + (u64)root_lba * 512;
+    u32 max_entries = cluster_bytes / 32;
+    fat32_de *dir = (fat32_de *)root_buf;
+    int free_entry = -1;
+    u32 existing_clus = 0;
+    int found = 0;
+    for (u32 e = 0; e < max_entries; e++) {
+        if (dir[e].name[0] == 0) { if (free_entry < 0) free_entry = (int)e; break; }
+        if ((u8)dir[e].name[0] == 0xE5) { if (free_entry < 0) free_entry = (int)e; continue; }
+        if (dir[e].attr == 0x0F) continue;
+        if (dir[e].attr & 0x08) continue;
+        if (neq11(dir[e].name, name11)) {
+            existing_clus = r16((const u8*)&dir[e].clow) | ((u32)r16((const u8*)&dir[e].chigh) << 16);
+            found = 1;
+            break;
+        }
+    }
+
+    /* 3. Allocate or reuse clusters */
+    u32 bytes_needed = size > 0 ? size : 1;
+    u32 clusters_needed = (bytes_needed + cluster_bytes - 1) / cluster_bytes;
+    u32 first_clus = 0;
+    u32 prev_clus = 0;
+
+    if (found && existing_clus >= 2) {
+        /* Reuse existing chain, extend or shrink as needed */
+        first_clus = existing_clus;
+        u32 cur = existing_clus;
+        u32 count = 0;
+        while (cur >= 2 && cur < 0x0FFFFFF8 && count < clusters_needed) {
+            prev_clus = cur;
+            u32 fo = fat_byte_off + cur * 4;
+            if (fo + 4 > sizeof(g_disk)) break;
+            cur = r32(disk + fo) & 0x0FFFFFFF;
+            count++;
+        }
+        /* If we need more clusters, allocate them */
+        while (count < clusters_needed) {
+            /* Find a free cluster in FAT */
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((r32(disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) { logl("[DSK] fat32 write: no free clusters"); return -3; }
+            /* Link previous cluster to new */
+            u32 pfo = fat_byte_off + prev_clus * 4;
+            if (pfo + 4 <= sizeof(g_disk)) {
+                disk[pfo] = (u8)(newc & 0xFF);
+                disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+            }
+            prev_clus = newc;
+            count++;
+        }
+        /* Terminate the chain */
+        if (prev_clus >= 2) {
+            u32 fo = fat_byte_off + prev_clus * 4;
+            if (fo + 4 <= sizeof(g_disk)) {
+                disk[fo] = 0xF8; disk[fo+1] = 0xFF; disk[fo+2] = 0xFF; disk[fo+3] = 0x0F;
+            }
+        }
+        /* Free excess clusters from the old chain */
+        u32 next = 0;
+        u32 fo = fat_byte_off + prev_clus * 4;
+        if (fo + 4 <= sizeof(g_disk)) next = r32(disk + fo) & 0x0FFFFFFF;
+        while (next >= 2 && next < 0x0FFFFFF8) {
+            u32 nfo = fat_byte_off + next * 4;
+            u32 nn = 0;
+            if (nfo + 4 <= sizeof(g_disk)) nn = r32(disk + nfo) & 0x0FFFFFFF;
+            disk[nfo] = 0; disk[nfo+1] = 0; disk[nfo+2] = 0; disk[nfo+3] = 0;
+            next = nn;
+        }
+    } else {
+        /* Allocate new clusters */
+        if (free_entry < 0) { logl("[DSK] fat32 write: no free dir entry"); return -4; }
+        for (u32 i = 0; i < clusters_needed; i++) {
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((r32(disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) { logl("[DSK] fat32 write: no free clusters"); return -3; }
+            if (i == 0) first_clus = newc;
+            if (prev_clus >= 2) {
+                u32 pfo = fat_byte_off + prev_clus * 4;
+                disk[pfo] = (u8)(newc & 0xFF);
+                disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+            }
+            prev_clus = newc;
+        }
+        /* Terminate chain */
+        if (prev_clus >= 2) {
+            u32 fo = fat_byte_off + prev_clus * 4;
+            disk[fo] = 0xF8; disk[fo+1] = 0xFF; disk[fo+2] = 0xFF; disk[fo+3] = 0x0F;
+        }
+    }
+
+    /* 4. Write data to clusters */
+    u32 remaining = size;
+    const u8 *src = data;
+    u32 cur = first_clus;
+    u32 ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        u32 chunk = remaining < cluster_bytes ? remaining : cluster_bytes;
+        /* Read cluster into g_cluster, overlay data, write back */
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            /* In g_disk buffer — copy data directly */
+            u8 *dst = disk + (u64)clba * 512;
+            for (u32 b = 0; b < chunk; b++) dst[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) dst[b] = 0;
+        } else {
+            /* Out of buffer — use sector write */
+            if (fat32_read_sectors(clba, spc, g_cluster) != 0) return -5;
+            for (u32 b = 0; b < chunk; b++) g_cluster[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) g_cluster[b] = 0;
+            if (fat32_write_sectors(clba, spc, g_cluster) != 0) return -6;
+        }
+        src += chunk; remaining -= chunk; ci++;
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = r32(disk + fo) & 0x0FFFFFFF;
+    }
+
+    /* 5. Update directory entry */
+    if (!found) {
+        fat32_de *e = &dir[free_entry];
+        for (int i = 0; i < 11; i++) e->name[i] = name11[i];
+        e->attr = 0x20;  /* archive */
+        e->ntr = 0; e->ctenth = 0; e->ctime = 0; e->cdate = 0;
+        e->adate = 0; e->chigh = (u16)((first_clus >> 16) & 0xFFFF);
+        e->wtime = 0; e->wdate = 0; e->clow = (u16)(first_clus & 0xFFFF);
+    } else {
+        dir[free_entry >= 0 ? (u32)free_entry : 0].chigh = (u16)((first_clus >> 16) & 0xFFFF);
+        dir[free_entry >= 0 ? (u32)free_entry : 0].clow = (u16)(first_clus & 0xFFFF);
+        /* Find the existing entry again to update it */
+        for (u32 e2 = 0; e2 < max_entries; e2++) {
+            if (neq11(dir[e2].name, name11)) {
+                dir[e2].chigh = (u16)((first_clus >> 16) & 0xFFFF);
+                dir[e2].clow = (u16)(first_clus & 0xFFFF);
+                dir[e2].fsize = size;
+                break;
+            }
+        }
+    }
+    /* Set file size in the directory entry */
+    for (u32 e2 = 0; e2 < max_entries; e2++) {
+        if (neq11(dir[e2].name, name11)) {
+            dir[e2].fsize = size;
+            break;
+        }
+    }
+
+    /* 6. Write FAT + root directory + data sectors back to disk */
+    /* Write FAT (both copies) */
+    for (u32 f = 0; f < bpb->fc; f++) {
+        u32 flba = fat_lba + f * fat_sectors;
+        if (fat32_write_sectors(flba, fat_sectors, disk + (u64)flba * 512) != 0) return -7;
+    }
+    /* Write root directory cluster */
+    u32 root_dir_lba = data_lba + (root_clus - 2) * spc;
+    if ((u64)root_dir_lba * 512 + cluster_bytes <= 256ULL * 512) {
+        if (fat32_write_sectors(root_dir_lba, spc, disk + (u64)root_dir_lba * 512) != 0) return -8;
+    }
+    /* Write data clusters that were in the g_disk buffer */
+    cur = first_clus;
+    ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            if (fat32_write_sectors(clba, spc, disk + (u64)clba * 512) != 0) return -9;
+        }
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = r32(disk + fo) & 0x0FFFFFFF;
+        ci++;
+    }
+
+    logl("[DSK] fat32 write: success");
+    return 0;
+}
+
+static int dsk_check_firstinit(int *is_first, int *dev_mode) {
     char name[12]; /* "FIRSTINTXT" on stack — no PIE reloc */
     name[0]='F';name[1]='I';name[2]='R';name[3]='S';name[4]='T';
     name[5]='I';name[6]='N';name[7]='T';name[8]='X';name[9]='T';name[10]=0;
     u8 *data = 0; u32 size = 0;
+    *dev_mode = 0;
     logl("[DSK] fat32_read_path start");
     int rc = fat32_read_root_file(name, &data, &size);
     logh("[DSK] fat32_read_path rc=", (u64)(i64)rc);
     if (rc != 0) { logl("[DSK] firstInit.txt not found"); *is_first = 1; return 0; }
-    if (data[0] == '0') { logl("[DSK] firstInit=0"); *is_first = 1; return 0; }
-    logl("[DSK] firstInit != 0"); *is_first = 0; return 0;
+    if (data[0] == '0') { logl("[DSK] firstInit=0"); *is_first = 1; }
+    else { logl("[DSK] firstInit != 0"); *is_first = 0; }
+    /* 解析第二行 dev_mode 标志（firstInit.txt 格式: "0|1\n0|1"） */
+    u32 i = 0;
+    while (i < size && data[i] != '\n') i++;
+    if (i < size) {
+        i++;  /* 跳过换行 */
+        if (i < size && data[i] == '1') {
+            *dev_mode = 1;
+            logl("[DSK] dev_mode=1 (developer auto-test)");
+        }
+    }
+    return 0;
 }
 
 static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
@@ -205,8 +529,10 @@ static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
     if (!lc || min_vaddr == ~0ULL) return -4;
     u64 isize = max_vaddr - min_vaddr;
     isize = (isize + 0xFFF) & ~0xFFFULL;
-    static u8 ibuf[262144];
+    /* 加载缓冲:需容纳 shell.elf(~536KB,含 FAT32 读写缓冲 BSS)。1MB 留余量。 */
+    static u8 ibuf[1048576];
     u8 *image = ibuf;
+    if (isize > 1048576) return -5;  /* 镜像过大，防止越界 */
     memset_dsk(image, 0, isize);
     for (u16 i = 0; i < eh->phnum; i++) {
         const elf64_phdr *ph = (const elf64_phdr *)(data + eh->phoff + (u64)i * eh->phentsize);
@@ -247,177 +573,220 @@ static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
     return 0;
 }
 
-static void dsk_spinner_and_check(u32 *fb_arg, i64 cx, i64 cy, i64 r, i64 thk,
-                                   const u32 arc_colors[4], u32 bg, const void *boot_ctx_ptr) {
-    (void)bg;
-    (void)fb_arg;
+/* Load an ELF module from the FAT32 root by 11-char 8.3 name, parse it into
+ * the shared image buffer, and jump to its entry with the boot context.
+ * Returns 0 if the module ran and returned, non-zero on load failure. */
+static int dsk_load_and_run(const char name11[12], const dsk_boot_context *ctx) {
+    u8 *data=0; u32 size=0; void *entry=0;
+    if (fat32_read_root_file(name11, &data, &size) != 0) return -1;
+    if (dsk_load_elf(data, size, &entry) != 0) return -2;
+    void(*fn)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))entry;
+    fn(ctx);
+    return 0;
+}
+
+/* Load desktop.elf and jump to it. Never returns on success. */
+static void dsk_run_desktop(const dsk_boot_context *ctx) {
+    char dn[12]; /* DESKTOP ELF */
+    dn[0]='D';dn[1]='E';dn[2]='S';dn[3]='K';dn[4]='T';dn[5]='O';dn[6]='P';dn[7]=' ';dn[8]='E';dn[9]='L';dn[10]='F';
+    if (dsk_load_and_run(dn, ctx) != 0) logl("[DSK] desktop load failed");
+    for(;;)__asm__("hlt");
+}
+
+/* After FirstInit returns, persist the encrypted user.conf buffer (left in
+ * ctx->reserved[0/1]) to the FAT32 root as USER.CONF, then flip firstInit.txt
+ * from '0' to '1' so subsequent boots skip the wizard and go to login. */
+static void dsk_persist_userconf(const dsk_boot_context *ctx) {
+    dsk_boot_context *ctx_mut = (dsk_boot_context *)ctx;
+    u64 conf_ptr = ctx_mut->reserved[0];
+    u64 conf_sz  = ctx_mut->reserved[1];
+    if (!conf_ptr || !conf_sz) {
+        logl("[DSK] no conf buffer from FirstInit, skipping persist");
+        return;
+    }
+    if (!g_block_write) {
+        logl("[DSK] no block_write, cannot persist user.conf");
+        return;
+    }
+    const u8 *conf = (const u8 *)conf_ptr;
+
+    /* 1. Write USER.CONF (encrypted buffer as-is; login decrypts with password) */
+    char cn[12]; /* USER    CON */
+    cn[0]='U';cn[1]='S';cn[2]='E';cn[3]='R';cn[4]=' ';cn[5]=' ';cn[6]=' ';cn[7]=' ';cn[8]='C';cn[9]='O';cn[10]='N';
+    logl("[DSK] writing USER.CONF");
+    int wrc = fat32_write_root_file(cn, conf, (u32)conf_sz);
+    logh("[DSK] USER.CONF write rc=", (u64)(i64)wrc);
+
+    /* 2. Flip firstInit.txt: '0' -> '1'，保留第二行 dev_mode 标志 */
+    char fn[12]; /* FIRSTINTXT */
+    fn[0]='F';fn[1]='I';fn[2]='R';fn[3]='S';fn[4]='T';fn[5]='I';fn[6]='N';fn[7]='T';fn[8]='X';fn[9]='T';fn[10]=0;
+    /* 读取当前 firstInit.txt 以保留 dev_mode（第二行），格式 "0|1\n0|1" */
+    u8 dev_mode_byte = '0';
+    u8 *fi_data = 0; u32 fi_size = 0;
+    if (fat32_read_root_file(fn, &fi_data, &fi_size) == 0) {
+        u32 i = 0;
+        while (i < fi_size && fi_data[i] != '\n') i++;
+        if (i < fi_size) { i++; if (i < fi_size) dev_mode_byte = fi_data[i]; }
+    }
+    u8 fi_buf[3]; fi_buf[0] = '1'; fi_buf[1] = '\n'; fi_buf[2] = dev_mode_byte;
+    int frc = fat32_write_root_file(fn, fi_buf, 3);
+    logh("[DSK] firstInit.txt flip rc=", (u64)(i64)frc);
+
+    /* Clear reserved so login path doesn't see stale pointer */
+    ctx_mut->reserved[0] = 0;
+    ctx_mut->reserved[1] = 0;
+}
+
+/* Draw the spinning loader (comet-tail arc) on the gradient background,
+ * then run the firstInit check and dispatch system component loading. */
+static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
     const dsk_boot_context *ctx = (const dsk_boot_context *)boot_ctx_ptr;
     { u64 api = ctx->dkm_kernel_api;
-      g_block_read = (block_read_fn)*(u64 *)(api + 0xA8);
-      if (g_block_read) g_block_read = (block_read_fn)*(u64 *)((u64)g_block_read + 16); }
-
-#define SPR 128
-    static u32 sprite[SPR*SPR];
-    i64 sp=SPR*4, scx=SPR/2, scy=SPR/2, bx=cx-scx, by=cy-scy;
-    i64 frame=0, base=0; int checked=0; void *fe_entry=0;
+      u64 blk = *(u64 *)(api + 0xA8);
+      g_block_read  = blk ? (block_read_fn)*(u64 *)(blk + 16) : 0;   /* block_api.read  */
+      g_block_write = blk ? (block_write_fn)*(u64 *)(blk + 24) : 0;  /* block_api.write */ }
 
     g_fb_addr=ctx->framebuffer_address; g_fb_w=ctx->framebuffer_width;
     g_fb_h=ctx->framebuffer_height; g_fb_p=ctx->framebuffer_pitch;
     u32 *sfb=(u32*)(u64)g_fb_addr;
-    dsk_fill_gradient_rect(sfb, 0, 0, (i64)g_fb_w, (i64)g_fb_h);
-    u64 sw=g_fb_w, sh=g_fb_h, spv=g_fb_p;
     logh("[DSK] block_read ptr=", (u64)g_block_read);
-    logl("[DSK] entering spinner loop");
 
-    while (1) {
-        g_fb_w=SPR; g_fb_h=SPR; g_fb_p=sp;
-        /* per-row gradient so sprite interior matches background */
-        static u32 row_bg[SPR];
-        for (i64 y0=0; y0<SPR; y0++) {
-            i64 ry = by + y0;
-            if (ry < 0) ry = 0;
-            if ((u64)ry >= sh) ry = (i64)sh - 1;
-            row_bg[y0] = blend_color(BG_TOP, BG_BOTTOM, (u32)(((u64)ry * 255ULL) / (sh - 1)));
-            u32 *ln=&sprite[y0*SPR]; for(i64 x0=0;x0<SPR;x0++) ln[x0]=row_bg[y0];
-        }
-        {
-            i64 ro=r+thk, ri=r-thk;
-            for (i64 dq=0; dq<4; dq++) {
-                i64 sa=base+dq*90, sw2=82; u32 clr=arc_colors[dq];
-                for(i64 dy=-ro-1;dy<=ro+1;dy++){i64 yy=scy+dy; if(yy<0||yy>=SPR)continue;
-                u32 sbg=row_bg[yy];
-                for(i64 dx=-ro-1;dx<=ro+1;dx++){i64 xx=scx+dx; if(xx<0||xx>=SPR)continue;
-                  i64 d2=dx*dx+dy*dy; if(d2<ri*ri-2||d2>(ro+1)*(ro+1)+2)continue;
-                  i64 ang; if(dx==0)ang=dy<0?90:270;
-                  else{i64 ax=dx<0?-dx:dx,ay=dy<0?-dy:dy,a0=ax>ay?ay*45/ax:90-ax*45/(ay?ay:1);
-                       if(dx>=0&&dy<=0)ang=a0;else if(dx<0&&dy<=0)ang=180-a0;
-                       else if(dx<0&&dy>0)ang=180+a0;else ang=360-a0;}
-                  i64 a=ang-sa; if(a<0)a+=360; if((u64)a>(u64)sw2)continue;
-                  u32 fade; if((u64)a<6)fade=(u32)(a*255/6);else if((u64)a>(u64)(sw2-6))fade=(u32)((sw2-a)*255/6);else fade=255;
-                  u64 vv=(u64)d2; u64 xr=vv,yr=(xr+1)>>1; while(yr<xr){xr=yr;yr=(yr+vv/yr)>>1;} i64 dist=(i64)xr;
-                  u32 eff=((sbg&0xFF)*(256-fade)+(clr&0xFF)*fade)>>8;
-                  u32 ge=(((sbg>>8)&0xFF)*(256-fade)+((clr>>8)&0xFF)*fade)>>8;
-                  u32 be=(((sbg>>16)&0xFF)*(256-fade)+((clr>>16)&0xFF)*fade)>>8;
-                  eff=0xFF000000|(be<<16)|(ge<<8)|eff;
-                  if(dist>=ri&&dist<=ro)sprite[(u64)yy*SPR+(u64)xx]=eff;
-                }}
-            }
-            i64 ri2=r-8;
-            for(i64 dy=-ri2-2;dy<=ri2+2;dy++){i64 yy2=scy+dy; if(yy2<0||yy2>=SPR)continue;
-            u32 sbg2=row_bg[yy2];
-            for(i64 dx=-ri2-2;dx<=ri2+2;dx++){i64 xx2=scx+dx; if(xx2<0||xx2>=SPR)continue;
-              i64 d2=dx*dx+dy*dy;
-              if(d2<=ri2*ri2){
-                u32 ic=((sbg2&0xFF)*176+0xD0*80)>>8;
-                u32 ig=(((sbg2>>8)&0xFF)*176+0xF0*80)>>8;
-                u32 ib=(((sbg2>>16)&0xFF)*176+0xFF*80)>>8;
-                sprite[(u64)yy2*SPR+(u64)xx2]=0xFF000000|(ib<<16)|(ig<<8)|ic;
-              }
-            }}
-        }
-        g_fb_w=sw; g_fb_h=sh; g_fb_p=spv;
-        dsk_fill_gradient_rect(sfb, bx, by, SPR, SPR);
-        for(i64 sr=0;sr<SPR;sr++){i64 sy=by+sr; if(sy<0||(u64)sy>=g_fb_h)continue;
-          u32 *dst=(u32*)((u8*)sfb+(u64)sy*g_fb_p)+bx; u32 *src=&sprite[sr*SPR];
-          for(i64 sc=0;sc<SPR;sc++){i64 sx=bx+sc; if(sx<0||(u64)sx>=g_fb_w)continue; dst[sc]=src[sc];}}
-        for(volatile u32 d=0;d<72000;d++)__asm__("pause");
-        base-=2; if(base<0)base+=360; frame++;
+    tsc_calibrate_dsk();
 
-        if(frame>=100&&!checked){checked=1;  /* was 540, reduced for test */
-            logl("[DSK] checking firstInit...");
-            if(g_block_read){logl("[DSK] have block read, calling dsk_check_firstinit");
-                int is_first=0;
-                if(dsk_check_firstinit(&is_first)==0){
-                    if(is_first){
-                        logl("[DSK] first init detected; running system initializers");
+    /* Gradient background + spinning loader (~1.1s, or 800ms without block dev). */
+    i64 cx = (i64)g_fb_w / 2;
+    i64 cy = (i64)g_fb_h / 2;
+    dsk_fill_gradient_rect(sfb, 0, 0, (i64)g_fb_w, (i64)g_fb_h);
+    spinner_save_bg(sfb, cx, cy);
 
-                        /* DSK owns system component initialization. FirstInit is only user setup. */
-                        char mn[12]; /* MOUSE   ELF */
-                        mn[0]='M';mn[1]='O';mn[2]='U';mn[3]='S';mn[4]='E';mn[5]=' ';mn[6]=' ';mn[7]=' ';mn[8]='E';mn[9]='L';mn[10]='F';
-                        u8 *md=0; u32 ms=0; void *me=0;
-                        if(fat32_read_root_file(mn,&md,&ms)==0){
-                            if(dsk_load_elf(md,ms,&me)==0){
-                                logl("[DSK] jumping to mouseInit");
-                                void(*mentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))me;
-                                mentry(ctx);
-                                logl("[DSK] mouseInit returned");
-                            }
-                        }
+    u32 base = 0;
+    u32 head_color = 0xFFE8F2FC;   /* nearly-white light blue */
+    u64 spin_start = rdtsc_dsk();
+    u64 spin_budget = g_tsc_per_ms * (g_block_read ? 1100 : 800);
+    while (rdtsc_dsk() - spin_start < spin_budget) {
+        spinner_restore_bg(sfb, cx, cy);
+        spinner_draw(sfb, cx, cy, base, head_color);
+        base = (base + 6) & 255;   /* clockwise advance */
+        u64 fs = rdtsc_dsk();
+        while (rdtsc_dsk() - fs < g_tsc_per_ms * 33) __asm__("pause");  /* ~30fps */
+    }
+    spinner_restore_bg(sfb, cx, cy);
 
-                        char nn[12]; /* NETMAN  ELF */
-                        nn[0]='N';nn[1]='E';nn[2]='T';nn[3]='M';nn[4]='A';nn[5]='N';nn[6]=' ';nn[7]=' ';nn[8]='E';nn[9]='L';nn[10]='F';
-                        u8 *nd=0; u32 ns=0; void *ne=0;
-                        if(fat32_read_root_file(nn,&nd,&ns)==0){
-                            if(dsk_load_elf(nd,ns,&ne)==0){
-                                logl("[DSK] jumping to netman");
-                                void(*nentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))ne;
-                                nentry(ctx);
-                                logl("[DSK] netman returned");
-                            }
-                        }
+    if (!g_block_read) {
+        logl("[DSK] no block device, halting");
+        for(;;)__asm__("hlt");
+    }
 
-                        logl("[DSK] loading FirstInit.elf");
-                        char en[12]; /* FIRSTINIT */
-                        en[0]='F';en[1]='I';en[2]='R';en[3]='S';en[4]='T';
-                        en[5]='I';en[6]='N';en[7]='I';en[8]='T';en[9]=' ';en[10]=0;
-                        u8 *fd=0; u32 fs=0;
-                        if(fat32_read_root_file(en,&fd,&fs)==0){
-                            if(dsk_load_elf(fd,fs,&fe_entry)==0) logl("[DSK] FirstInit.elf loaded");
-                        }
+    logl("[DSK] checking firstInit...");
+    int is_first = 0, dev_mode = 0;
+    if (dsk_check_firstinit(&is_first, &dev_mode) != 0) {
+        logl("[DSK] firstInit check failed, halting");
+        for(;;)__asm__("hlt");
+    }
+
+    /* 开发者模式:加载 shell.elf 自动测试命令序列（cp/mv/echo/ls/cat/rm） */
+    if (dev_mode) {
+        logl("[DSK] dev mode: loading shell.elf for auto-test");
+        char sn[12]; /* SHELL   ELF */
+        sn[0]='S';sn[1]='H';sn[2]='E';sn[3]='L';sn[4]='L';sn[5]=' ';sn[6]=' ';sn[7]=' ';sn[8]='E';sn[9]='L';sn[10]='F';
+        dsk_boot_context *ctx_mut = (dsk_boot_context *)ctx;
+        ctx_mut->reserved[3] = 1;  /* dev mode flag for shell */
+        if (dsk_load_and_run(sn, ctx) == 0) logl("[DSK] shell auto-test returned");
+        else logl("[DSK] shell.elf not found, skipping dev test");
+        ctx_mut->reserved[3] = 0;
+    }
+
+    if (!is_first) {
+        logl("[DSK] firstInit=1, attempting login before desktop");
+
+        /* Load login.elf first (into g_fdata, then dsk_load_elf copies to ibuf) */
+        char ln[12]; /* LOGIN    ELF */
+        ln[0]='L';ln[1]='O';ln[2]='G';ln[3]='I';ln[4]='N';ln[5]=' ';ln[6]=' ';ln[7]=' ';ln[8]='E';ln[9]='L';ln[10]='F';
+        u8 *ld=0; u32 ls=0; void *le=0;
+        int login_ok = 0;
+        if (fat32_read_root_file(ln, &ld, &ls) == 0) {
+            if (dsk_load_elf(ld, ls, &le) == 0) {
+                /* Now read USER.CONF into g_fdata (login.elf already copied to ibuf) */
+                char cn[12]; /* USER    CON */
+                cn[0]='U';cn[1]='S';cn[2]='E';cn[3]='R';cn[4]=' ';cn[5]=' ';cn[6]=' ';cn[7]=' ';cn[8]='C';cn[9]='O';cn[10]='N';
+                u8 *conf_data=0; u32 conf_size=0;
+                if (fat32_read_root_file(cn, &conf_data, &conf_size) == 0) {
+                    logl("[DSK] USER.CONF found, passing to login");
+                    dsk_boot_context *ctx_mut = (dsk_boot_context *)ctx;
+                    ctx_mut->reserved[0] = (u64)conf_data;
+                    ctx_mut->reserved[1] = (u64)conf_size;
+                    ctx_mut->reserved[2] = 0;  /* login success flag */
+
+                    logl("[DSK] jumping to login");
+                    void(*lentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))le;
+                    lentry(ctx);
+                    logl("[DSK] login returned");
+
+                    if (ctx_mut->reserved[2] == 1) {
+                        logl("[DSK] login success");
+                        login_ok = 1;
                     } else {
-                        logl("[DSK] firstInit=1, skipping user setup, loading shell directly");
+                        logl("[DSK] login skipped or failed");
                     }
+                } else {
+                    logl("[DSK] USER.CONF not found, skipping login");
                 }
+            } else {
+                logl("[DSK] login.elf load failed, skipping login");
             }
+        } else {
+            logl("[DSK] login.elf not found, skipping login");
         }
-        if(fe_entry&&frame>150){logl("[DSK] jumping to FirstInit");  /* was 600 */
-            void(*entry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))fe_entry;
-            entry(ctx);
-            logl("[DSK] FirstInit returned, loading desktop");
-            /* FirstInit 返回后加载 desktop */
-            char dn[12]; /* DESKTOP ELF */
-            dn[0]='D';dn[1]='E';dn[2]='S';dn[3]='K';dn[4]='T';dn[5]='O';dn[6]='P';dn[7]=' ';dn[8]='E';dn[9]='L';dn[10]='F';
-            u8 *dd=0; u32 ds=0; void *de=0;
-            if(fat32_read_root_file(dn,&dd,&ds)==0){
-                if(dsk_load_elf(dd,ds,&de)==0){
-                    logl("[DSK] jumping to desktop");
-                    void(*dentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))de;
-                    dentry(ctx);
-                }
-            }
-            for(;;)__asm__("hlt");
+        (void)login_ok;
+
+        logl("[DSK] loading desktop");
+        dsk_run_desktop(ctx);
+        return;
+    }
+
+    /* First boot: run system initializers, then FirstInit, then desktop */
+    logl("[DSK] first init detected; running system initializers");
+
+    /* mouseInit.elf — safe PS/2 mouse init */
+    {   char mn[12]; /* MOUSE   ELF */
+        mn[0]='M';mn[1]='O';mn[2]='U';mn[3]='S';mn[4]='E';mn[5]=' ';mn[6]=' ';mn[7]=' ';mn[8]='E';mn[9]='L';mn[10]='F';
+        logl("[DSK] loading mouseInit");
+        if (dsk_load_and_run(mn, ctx) == 0) logl("[DSK] mouseInit returned");
+        else logl("[DSK] mouseInit not found");
+    }
+
+    /* netman.elf — network configuration */
+    {   char nn[12]; /* NETMAN  ELF */
+        nn[0]='N';nn[1]='E';nn[2]='T';nn[3]='M';nn[4]='A';nn[5]='N';nn[6]=' ';nn[7]=' ';nn[8]='E';nn[9]='L';nn[10]='F';
+        logl("[DSK] loading netman");
+        if (dsk_load_and_run(nn, ctx) == 0) logl("[DSK] netman returned");
+        else logl("[DSK] netman not found");
+    }
+
+    /* FirstInit.elf — user setup wizard; returns to DSK when done */
+    {   char en[12]; /* FIRSTINIT */
+        en[0]='F';en[1]='I';en[2]='R';en[3]='S';en[4]='T';
+        en[5]='I';en[6]='N';en[7]='I';en[8]='T';en[9]=' ';en[10]=0;
+        logl("[DSK] loading FirstInit");
+        if (dsk_load_and_run(en, ctx) != 0) {
+            logl("[DSK] FirstInit not found, loading desktop directly");
+            dsk_run_desktop(ctx);
+            return;
         }
-        /* 非首次启动：直接加载 desktop */
-        if(checked&&!fe_entry&&frame>150){
-            logl("[DSK] loading desktop directly (non-first boot)");
-            char dn[12]; /* DESKTOP ELF */
-            dn[0]='D';dn[1]='E';dn[2]='S';dn[3]='K';dn[4]='T';dn[5]='O';dn[6]='P';dn[7]=' ';dn[8]='E';dn[9]='L';dn[10]='F';
-            u8 *dd=0; u32 ds=0; void *de=0;
-            if(fat32_read_root_file(dn,&dd,&ds)==0){
-                if(dsk_load_elf(dd,ds,&de)==0){
-                    logl("[DSK] jumping to desktop");
-                    void(*dentry)(const dsk_boot_context*)=(void(*)(const dsk_boot_context*))de;
-                    dentry(ctx);
-                }
-            }
-            for(;;)__asm__("hlt");
-        }
-        if(!g_block_read&&frame>800){logl("[DSK] no block device, skipping firstInit");break;}
-        if(checked&&!fe_entry&&frame>800){logl("[DSK] firstInit not found, continuing normal boot");break;}
+        logl("[DSK] FirstInit returned, persisting user.conf");
+        dsk_persist_userconf(ctx);
+        logl("[DSK] loading desktop");
+        dsk_run_desktop(ctx);
     }
 }
 
 __attribute__((noreturn, visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
-    __asm__ volatile("cli");  /* disable IRQs — ps2kbd/IRQ1 & mouse/IRQ12 handlers crash during spinner */
+    __asm__ volatile("cli");  /* disable IRQs — ps2kbd/IRQ1 & mouse/IRQ12 handlers crash during boot */
     logl("[DSK] boot");
     if(!ctx||ctx->magic!=DSK_BOOT_MAGIC){logl("[DSK] bad context");for(;;)__asm__("hlt");}
     logl("[DSK] context ok");
-    g_fb_addr=ctx->framebuffer_address; g_fb_w=ctx->framebuffer_width;
-    g_fb_h=ctx->framebuffer_height; g_fb_p=ctx->framebuffer_pitch;
-    u32 bg=BG_MID, arcs[4]={0xFF4488CC,0xFF2266AA,0xFF66AAEE,0xFF88CCFF};
-    i64 cx=(i64)g_fb_w/2,cy=(i64)g_fb_h/2,r=48,thk=4;
-    dsk_spinner_and_check((u32*)(u64)g_fb_addr,cx,cy,r,thk,arcs,bg,ctx);
+    dsk_spinner_and_check(ctx);
     logl("[DSK] SELFTEST PASS");
     for(;;)__asm__("hlt");
 }

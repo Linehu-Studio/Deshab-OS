@@ -1,10 +1,10 @@
 CC := clang
 LD := ld.lld
 
-ROOT := ../../..
-OUT := $(ROOT)/SYSTEM/system/deshab64/tools/bash.elf
+ROOT := ../..
+OUT := $(ROOT)/SYSTEM/system/user/use/login.elf
 
-CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I.. -I../../UTSM/include -O2
+CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I../UTSM/include -I../firstInit -O2
 LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
 
 C_SOURCES := main.c
@@ -15,7 +15,7 @@ OBJECTS := $(C_SOURCES:.c=.o)
 all: $(OUT)
 
 $(OUT): $(OBJECTS) linker.ld
-	@if not exist "$(ROOT)\SYSTEM\system\deshab64\tools" mkdir "$(ROOT)\SYSTEM\system\deshab64\tools"
+	@if not exist "$(ROOT)\SYSTEM\system\user\use" mkdir "$(ROOT)\SYSTEM\system\user\use"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 %.o: %.c

@@ -4,8 +4,8 @@ from PIL import Image, ImageFont, ImageDraw
 ttf = "SYSTEM/system/font/simhei.ttf"
 
 texts = [
-    ("welcome", "欢迎使用 Deshab", 48),       # only welcome stays large
-    ("setup",   "接下来让我们来引导你设置你的系统", 24),  # 32 -> 24
+    ("welcome", "欢迎使用 Deshab", 36),
+    ("setup",   "接下来让我们来引导你设置你的系统", 36),
     ("title",   "创建你的 Deshab 账户", 24),
     ("computer", "计算机名", 24),
     ("username", "用户名", 24),

@@ -31,8 +31,10 @@ struct dkm_block_api {
     int (*register_device)(const void *desc);
     u32 (*device_count)(void);
     int (*read)(u32 index, u64 lba, u32 count, void *buffer);
+    int (*write)(u32 index, u64 lba, u32 count, const void *buffer);
     u64 (*sector_size)(u32 index);
     const char *(*device_name)(u32 index);
+    int (*set_write_fn)(u32 index, int (*fn)(void *ctx, u64 lba, u32 count, const void *buf));
 };
 
 struct dkm_kernel_api {

@@ -33,10 +33,19 @@ fi
 # Start the exec daemon in the background.
 # The daemon sends EXEC_READY then HLTs (parks the guest).
 # UTSM's linux_launch() returns after this first HLT.
-echo "[utsm-linux] starting utsm_exec_daemon..."
-/bin/utsm_exec_daemon &
-DAEMON_PID=$!
-echo "[utsm-linux] daemon PID=$DAEMON_PID"
+if [ -x /bin/utsm_exec_daemon ]; then
+    echo "[utsm-linux] starting utsm_exec_daemon..."
+    /bin/utsm_exec_daemon &
+    DAEMON_PID=$!
+    echo "[utsm-linux] daemon PID=$DAEMON_PID"
+else
+    # 无 daemon（第一阶段 bring-up 冒烟测试构建）：
+    # 直接在 ttyS0 上起交互 shell，验证 console 输入输出。
+    # 注意：此模式下 guest 不会 park，UTSM linux_launch() 不返回，
+    # 仅用于验证"Linux guest 进入 shell 提示符、可执行 uname -a"。
+    echo "[utsm-linux] WARNING: no daemon, starting interactive debug shell on ttyS0"
+    exec /bin/setsid /bin/cttyhack /bin/sh
+fi
 
 # init must not exit — sleep forever to keep the kernel happy.
 # The daemon handles all UTSM exec requests; init just keeps the

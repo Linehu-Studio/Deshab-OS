@@ -79,3 +79,18 @@ void serial_write(const char *s) {
         serial_putc(*s++);
     }
 }
+
+/* 非阻塞读取 host 串口一个字节（QEMU stdio → guest COM1 输入桥）。
+ * 返回 0-255，无数据返回 -1。供 vmexit 在 guest resume 前轮询。 */
+int serial_try_read(void) {
+    if (inb(COM1 + 5) & 0x01) {
+        return inb(COM1);
+    }
+    return -1;
+}
+
+/* 导出 PIT 校准的 TSC 频率（kHz 量级，单位 ticks/ms），
+ * 供 VMX preemption timer 与 guest PIT tick 注入使用。 */
+u64 serial_tsc_per_ms(void) {
+    return g_tsc_per_ms;
+}

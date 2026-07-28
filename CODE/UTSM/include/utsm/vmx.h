@@ -169,8 +169,10 @@
 /* ===== Pin-based controls ===== */
 #define PIN_EXT_INTERRUPT_EXITING        (1ULL << 0)
 #define PIN_NMI_EXITING                  (1ULL << 3)
+#define PIN_VMX_PREEMPTION_TIMER         (1ULL << 6)
 
 /* ===== Primary processor-based controls ===== */
+#define CPU_BASED_INTR_WINDOW_EXITING    (1ULL << 2)
 #define CPU_BASED_HLT_EXITING            (1ULL << 7)
 #define CPU_BASED_INVLPG_EXITING         (1ULL << 9)
 #define CPU_BASED_MWAIT_EXITING          (1ULL << 10)
@@ -208,6 +210,7 @@
 #define EXIT_EXTERNAL_INTERRUPT          1
 #define EXIT_TRIPLE_FAULT                2
 #define EXIT_INIT_SIGNAL                 3
+#define EXIT_INTERRUPT_WINDOW            7
 #define EXIT_CPUID                       10
 #define EXIT_INVD                        13
 #define EXIT_RDMSR                       31
@@ -232,7 +235,12 @@
 #define EXIT_INVLPG                      14
 #define EXIT_EPT_VIOLATION               48
 #define EXIT_EPT_MISCONFIG               49
+#define EXIT_VMX_PREEMPTION_TIMER        52
 #define EXIT_APIC_ACCESS                 44
+
+/* ===== VM-entry interruption-information field 编码 ===== */
+#define VM_ENTRY_INTR_INFO_VALID         0x80000000ULL
+#define VM_ENTRY_INTR_TYPE_HW_IRQ        0   /* external interrupt (bits 10:8) */
 
 /* ===== EPT memory types ===== */
 #define EPT_MEMORY_TYPE_UC               0ULL
@@ -264,5 +272,17 @@ int vmx_vmresume(void);
 
 u64 vmx_read_msr(u32 msr);
 u64 vmx_get_host_cr3(void);
+
+/* ===== 虚拟中断注入（vmexit.c 实现） ===== */
+/* 向 guest 队列注入一个 ISA IRQ 向量（legacy PIC：vector = 0x30 + irq）。
+ * 仅排队；实际在下一次 vmresume 前（guest RFLAGS.IF=1 且无阻塞时）注入，
+ * 否则 arm interrupt-window exiting，待 guest 可接收时注入。 */
+void vmx_guest_queue_irq(u32 vector);
+
+/* VMX preemption timer：返回 1ms 对应的 timer 计数值（按 IA32_VMX_BASIC
+ * bits[55:48] 的 scale 换算 TSC 频率）。 */
+u64 vmx_preemption_quantum_1ms(void);
+/* 检查 CPU 是否支持 VMX preemption timer。 */
+int vmx_preemption_timer_supported(void);
 
 #endif

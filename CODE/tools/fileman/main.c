@@ -63,6 +63,22 @@ static void load_current_dir(void) {
     scroll_off = 0;
     u32 dir_clus = (path_depth == 0) ? 0 : path_clus[path_depth - 1];
     f32_list_dir(dir_clus, fm_collect_cb, 0);
+
+    /* 如果不是根目录，在开头添加 ".." 返回上级条目 */
+    if (path_depth > 0 && file_count < MAX_FILES) {
+        /* 将现有文件向后移动 */
+        for (int i = file_count; i > 0; i--) {
+            files[i] = files[i - 1];
+        }
+        /* 在开头插入 ".." 条目 */
+        files[0].name[0] = '.';
+        files[0].name[1] = '.';
+        files[0].name[2] = 0;
+        files[0].clus = 0;  /* 特殊标记 */
+        files[0].size = 0;
+        files[0].is_dir = 1;
+        file_count++;
+    }
 }
 
 /* ---- 路径显示 ---- */
@@ -243,6 +259,12 @@ static void open_selected(void) {
     if (selected < 0 || selected >= file_count) return;
     fm_entry *f = &files[selected];
 
+    /* 特殊处理 ".." 条目 */
+    if (path_depth > 0 && selected == 0 && f->name[0] == '.' && f->name[1] == '.' && f->name[2] == 0) {
+        go_up();
+        return;
+    }
+
     if (f->is_dir) {
         /* 进入子目录 */
         if (path_depth < MAX_DEPTH - 1) {
@@ -279,6 +301,42 @@ static void go_up(void) {
     }
 }
 
+/* 查找并进入 SYSTEM/user 目录 */
+static void find_user_dir(void) {
+    /* 先查找 SYSTEM 目录 */
+    file_count = 0;
+    f32_list_dir(0, fm_collect_cb, 0);
+    u32 system_clus = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].is_dir && files[i].name[0] == 'S' && files[i].name[1] == 'Y' &&
+            files[i].name[2] == 'S' && files[i].name[3] == 'T' &&
+            files[i].name[4] == 'E' && files[i].name[5] == 'M') {
+            system_clus = files[i].clus;
+            break;
+        }
+    }
+    if (!system_clus) return;  /* SYSTEM 目录不存在，保持根目录 */
+
+    /* 在 SYSTEM 中查找 user 目录 */
+    file_count = 0;
+    f32_list_dir(system_clus, fm_collect_cb, 0);
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].is_dir && files[i].name[0] == 'U' && files[i].name[1] == 'S' &&
+            files[i].name[2] == 'E' && files[i].name[3] == 'R') {
+            /* 找到了 SYSTEM/user，设置路径栈 */
+            path_clus[0] = system_clus;
+            path_name[0][0] = 'S'; path_name[0][1] = 'Y'; path_name[0][2] = 'S';
+            path_name[0][3] = 'T'; path_name[0][4] = 'E'; path_name[0][5] = 'M';
+            path_name[0][6] = 0;
+            path_clus[1] = files[i].clus;
+            path_name[1][0] = 'U'; path_name[1][1] = 'S'; path_name[1][2] = 'E';
+            path_name[1][3] = 'R'; path_name[1][4] = 0;
+            path_depth = 2;
+            return;
+        }
+    }
+}
+
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
     __asm__ volatile("cli");
@@ -297,6 +355,8 @@ void dsk_entry(const da_boot_context *ctx) {
     f32_init((f32_block_read_fn)g_ac.block_read, (f32_block_write_fn)g_ac.block_write);
 
     path_depth = 0;
+    /* 尝试进入 SYSTEM/user 目录 */
+    find_user_dir();
     load_current_dir();
     redraw_all();
 
@@ -307,15 +367,23 @@ void dsk_entry(const da_boot_context *ctx) {
         /* 鼠标轮询 */
         if (da_mouse_poll(&g_mouse, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
             need_redraw = 1;
-            if (g_cursor.btn && !view_mode) {
-                int top_y = DA_TITLEBAR_H + 4 + CHAR_H + 4;
-                int row_h = CHAR_H + 6;
-                int click_y = g_cursor.my - top_y - CHAR_H - 6;
-                if (click_y >= 0) {
-                    int idx = click_y / row_h + scroll_off;
-                    if (idx >= 0 && idx < file_count) {
-                        selected = idx;
-                        need_redraw = 1;
+            if (g_cursor.btn) {
+                /* 检查关闭按钮点击（右上角：w-28, 4, 24, 20） */
+                if (g_cursor.mx >= (i64)g_ac.fb_w - 28 && g_cursor.mx < (i64)g_ac.fb_w - 4 &&
+                    g_cursor.my >= 4 && g_cursor.my < 24) {
+                    da_slog("fileman", "close button clicked");
+                    return;
+                }
+                if (!view_mode) {
+                    int top_y = DA_TITLEBAR_H + 4 + CHAR_H + 4;
+                    int row_h = CHAR_H + 6;
+                    int click_y = g_cursor.my - top_y - CHAR_H - 6;
+                    if (click_y >= 0) {
+                        int idx = click_y / row_h + scroll_off;
+                        if (idx >= 0 && idx < file_count) {
+                            selected = idx;
+                            need_redraw = 1;
+                        }
                     }
                 }
             }

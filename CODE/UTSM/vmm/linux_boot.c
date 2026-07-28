@@ -16,6 +16,7 @@
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/vmm.h>
+#include <utsm/virtio_mmio.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
@@ -203,8 +204,14 @@ static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
 /* ===== VMCS controls for Linux ===== */
 
 static void linux_vmcs_setup_controls(u64 eptp) {
-    u64 pin = vmx_adjust_control(PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING,
-                                 IA32_VMX_TRUE_PINBASED_CTLS);
+    /* Pin-based：外部中断 exit + NMI exit + VMX preemption timer（若支持）。
+     * preemption timer 提供 1ms 周期 exit，用于轮询 host 串口 RX、
+     * 推进 guest PIT tick、注入 pending virtio/COM1 IRQ。 */
+    u64 pin_want = PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING;
+    if (vmx_preemption_timer_supported()) {
+        pin_want |= PIN_VMX_PREEMPTION_TIMER;
+    }
+    u64 pin = vmx_adjust_control(pin_want, IA32_VMX_TRUE_PINBASED_CTLS);
 
     /* CPU-based: exit on HLT, INVLPG, MWAIT, IO, use MSR bitmap,
      * activate secondary controls. Don't intercept RDTSC (Linux needs it). */
@@ -281,6 +288,10 @@ int linux_launch(void) {
 
     log_info("[LINUX] launch begin");
 
+    /* 注册 virtio-mmio 后端（block + net），guest 经 cmdline
+     * virtio_mmio.device= 发现。幂等：重复调用直接返回。 */
+    virtio_mmio_init();
+
     /* Reset VM-Exit state */
     g_guest_terminated = 0;
     g_last_exit_reason = 0xFFFFFFFFULL;
@@ -291,6 +302,9 @@ int linux_launch(void) {
     linux_vmcs_setup_guest_state(gi);
     linux_vmcs_setup_controls(vmm_get_eptp());
     linux_vmcs_setup_host_state();
+
+    /* 初始 arm preemption timer（1ms 后首次周期 exit） */
+    vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum_1ms());
 
     /* Set RSI for Linux boot_params (passed via global, loaded in asm) */
     g_linux_rsi = gi->bootparams_gpa;

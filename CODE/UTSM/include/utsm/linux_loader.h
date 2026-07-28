@@ -121,6 +121,25 @@ struct linux_setup_header {
 /* General RAM starts after IPC region */
 #define LINUX_GUEST_RAM_GPA     0x05000000ULL  /* 80 MB */
 
+/* ===== virtio-mmio device GPA layout =====
+ * virtio-mmio 设备放在 GPA 高位 MMIO 区（guest RAM 之上，不占用 e820 RAM）。
+ * guest 通过 cmdline 参数 virtio_mmio.device= 发现这些设备。
+ * 每个设备占 0x200 字节寄存器空间（virtio-mmio 规范要求 4KB 对齐）。
+ *
+ * 这些 GPA 在 EPT 中【故意不映射】，访问时触发 EPT violation，
+ * 由 vmexit handler 路由到 virtio_mmio 后端模拟寄存器读写。
+ *
+ * GPA 选择 0xF4000000 起始（接近 4GB，远离 guest RAM 0x05000000-0x09000000）。 */
+#define VIRTIO_MMIO_GPA_BASE    0xF4000000ULL
+#define VIRTIO_MMIO_GPA_STRIDE  0x1000ULL      /* 每个设备 4KB */
+
+#define VIRTIO_MMIO_BLK_GPA     (VIRTIO_MMIO_GPA_BASE + 0 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4000000 */
+#define VIRTIO_MMIO_NET_GPA     (VIRTIO_MMIO_GPA_BASE + 1 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4001000 */
+
+/* 判断 GPA 是否落在 virtio-mmio 设备区（含两端） */
+#define VIRTIO_MMIO_GPA_END     (VIRTIO_MMIO_GPA_BASE + 2 * VIRTIO_MMIO_GPA_STRIDE)
+#define IS_VIRTIO_MMIO_GPA(gpa) ((gpa) >= VIRTIO_MMIO_GPA_BASE && (gpa) < VIRTIO_MMIO_GPA_END)
+
 /* ===== Linux loader API ===== */
 
 /* Loaded Linux guest state */
@@ -165,9 +184,16 @@ int linux_launch(void);
 /* Default Linux command line (can be overridden).
  * nohlt: prevent kernel idle loop from using HLT — only the exec daemon's
  *        explicit ioctl(PARK) HLT should trigger VM-Exit park, so that
- *        linux_launch() returns only after the daemon is ready. */
+ *        linux_launch() returns only after the daemon is ready.
+ * noapic/nolapic/nosmp: UTSM VMM 只模拟 legacy PIC(8259) + PIT(8254)，
+ *        不提供 LAPIC/IOAPIC；guest 走 XT-PIC 模式，IRQ vector = 0x30+irq。
+ * virtio_mmio.device=: 向 guest 声明 virtio-mmio 设备（blk@0xF4000000 IRQ5,
+ *        net@0xF4001000 IRQ6），需 CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y。 */
 #define LINUX_DEFAULT_CMDLINE \
     "console=ttyS0,115200 earlyprintk=serial nokaslr " \
-    "no_timer_check loglevel=7 nohlt idle=poll"
+    "no_timer_check loglevel=7 nohlt idle=poll " \
+    "noapic nolapic nosmp " \
+    "virtio_mmio.device=4K@0xF4000000:5 " \
+    "virtio_mmio.device=4K@0xF4001000:6"
 
 #endif

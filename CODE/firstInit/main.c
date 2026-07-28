@@ -302,7 +302,7 @@ static void stroke_rounded_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, i64 radius,
 }
 
 static void delay_frame(void) {
-    delay_ms_fi(33);  /* 实机: 基于 TSC 的 33ms 帧间隔 (~30fps) */
+    delay_ms_fi(11);  /* 实机: 基于 TSC 的 11ms 帧间隔 (原33ms/3，加快打字机效果) */
 }
 
 #include "text_bitmaps.c"

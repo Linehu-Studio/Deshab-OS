@@ -270,6 +270,45 @@ void *linux_find_bzimage_module(u64 *size_out) {
     return (void *)0;
 }
 
+/* ===== initrd module finder =====
+ *
+ * 在 Limine boot module 中查找 initramfs（路径含 "initrd" 或 "initramfs"）。
+ * 返回模块数据指针，*size_out 为大小；未找到返回 NULL。 */
+static void *linux_find_initrd_module(u64 *size_out) {
+    if (!g_module_request.response) return (void *)0;
+
+    struct limine_module_response *resp = g_module_request.response;
+    for (u64 i = 0; i < resp->module_count; i++) {
+        struct limine_file *file = resp->modules[i];
+        if (!file || !file->path) continue;
+
+        const char *p = file->path;
+        int match = 0;
+        for (const char *s = p; *s; s++) {
+            /* 匹配 "initrd"（如 linux-initrd.img） */
+            if ((s[0] == 'i' || s[0] == 'I') &&
+                (s[1] == 'n' || s[1] == 'N') &&
+                (s[2] == 'i' || s[2] == 'I') &&
+                (s[3] == 't' || s[3] == 'T') &&
+                (s[4] == 'r' || s[4] == 'R') &&
+                (s[5] == 'd' || s[5] == 'D')) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        if (size_out) *size_out = file->size;
+        log_info("[LINUX] found initrd module:");
+        log_info(file->path);
+        log_hex64("[LINUX] initrd size=", file->size);
+        return file->address;
+    }
+
+    log_warn("[LINUX] no initrd module found");
+    return (void *)0;
+}
+
 /* ===== bzImage parser ===== */
 
 int linux_parse_bzimage(const void *bzimage, u64 size,
@@ -516,9 +555,39 @@ int linux_loader_init(void) {
     g_guest.cmdline_gpa = LINUX_GUEST_CMDLINE_GPA;
     g_guest.cmdline_size = cmdline_len;
 
-    /* For now, no initrd (Phase 1.3+ will add it) */
+    /* 8.5. Load initrd (busybox initramfs) if present.
+     * initrd 放在 GPA 0x03000000（initrd 区，上限 16MB 到 IPC 区 0x04000000）。 */
     g_guest.initrd_gpa = 0;
     g_guest.initrd_size = 0;
+    {
+        u64 initrd_size = 0;
+        void *initrd = linux_find_initrd_module(&initrd_size);
+        if (initrd && initrd_size > 0) {
+            u64 initrd_max = LINUX_GUEST_IPC_SHM_GPA - LINUX_GUEST_INITRD_GPA; /* 16MB */
+            if (initrd_size > initrd_max) {
+                log_error("[LINUX] initrd too large (>16MB), skipped");
+            } else {
+                u64 initrd_pages = (initrd_size + 4095) / 4096;
+                dkm_dma_buffer initrd_buf;
+                if (dma_alloc_pages(initrd_pages, 4096, 0, &initrd_buf) != 0) {
+                    log_error("[LINUX] failed to alloc initrd memory");
+                    return -17;
+                }
+                mem_copy(initrd_buf.virt, initrd, initrd_size);
+                if (ept_map_range(LINUX_GUEST_INITRD_GPA, initrd_buf.phys,
+                                  initrd_pages * 4096, EPT_READ | EPT_WRITE) != 0) {
+                    log_error("[LINUX] EPT map initrd failed");
+                    return -18;
+                }
+                g_guest.initrd_gpa = LINUX_GUEST_INITRD_GPA;
+                g_guest.initrd_size = initrd_size;
+                log_hex64("[LINUX] initrd mapped GPA=", g_guest.initrd_gpa);
+                log_hex64("[LINUX] initrd size=", g_guest.initrd_size);
+            }
+        } else {
+            log_warn("[LINUX] booting without initrd (no userland!)");
+        }
+    }
 
     setup_boot_params(bp_buf.virt, g_guest.bootparams_gpa,
                       g_guest.kernel_entry,

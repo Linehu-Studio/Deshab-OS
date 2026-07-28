@@ -1,5 +1,5 @@
-﻿﻿@echo off
-setlocal
+@echo off
+setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
 set "IMG=%SCRIPT_DIR%deshab.img"
@@ -41,15 +41,35 @@ if not defined OVMF (
     exit /b 1
 )
 
+REM ===== Accelerator selection =====
+REM QEMU_ACCEL env var can override: "whpx" / "tcg"
+REM Default: try WHPX first (for VMX/Linux compat), fallback to TCG if unavailable
+if not defined QEMU_ACCEL set "QEMU_ACCEL=whpx"
+
+REM Detect whether Linux compat layer is enabled (bzImage present in IMG)
+set "LINUX_ENABLED=0"
+findstr /C:"module_path: boot():/boot/linux-bzImage" "%SCRIPT_DIR%..\SYSTEM\limine\limine.conf" >nul 2>&1
+if not errorlevel 1 (
+    set "LINUX_ENABLED=1"
+)
+
 echo [qemu] Using: %QEMU%
 echo [qemu] UEFI:  %OVMF%
 echo [qemu] Image: %IMG%
+echo [qemu] Accel: %QEMU_ACCEL%
+if "%LINUX_ENABLED%"=="1" (
+    echo [qemu] Linux compat: ENABLED (requires WHPX or real hardware for VMX)
+    echo [qemu]   If VMX unavailable, UTSM will auto-skip Linux and continue to DSK
+) else (
+    echo [qemu] Linux compat: disabled (build via CODE/linux/build.sh to enable)
+)
 if exist "%SATA_IMG%" (
     echo [qemu] SATA:  %SATA_IMG%
     "%QEMU%" ^
+        -accel %QEMU_ACCEL% ^
         -machine q35 ^
         -m 512M ^
-        -cpu max ^
+        -cpu qemu64 ^
         -serial stdio ^
         -drive if=pflash,format=raw,readonly=on,file="%OVMF%" ^
         -drive format=raw,file="%IMG%",if=virtio ^
@@ -61,9 +81,10 @@ if exist "%SATA_IMG%" (
 ) else (
     echo [qemu] SATA image not found, booting without block device
     "%QEMU%" ^
+        -accel %QEMU_ACCEL% ^
         -machine q35 ^
         -m 512M ^
-        -cpu max ^
+        -cpu qemu64 ^
         -serial stdio ^
         -drive if=pflash,format=raw,readonly=on,file="%OVMF%" ^
         -drive format=raw,file="%IMG%",if=virtio ^

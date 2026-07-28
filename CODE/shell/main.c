@@ -1942,6 +1942,12 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 g_history_view = -1;
                 term_putc('\n');
                 execute_command(input_buf);
+                /* 确保命令输出后在新行绘制提示符 */
+                if (cur_col != 0) {
+                    term_putc('\n');
+                }
+                /* 刷新终端显示 */
+                term_redraw_all();
                 input_len = 0;
                 input_cursor = 0;
                 input_buf[0] = 0;

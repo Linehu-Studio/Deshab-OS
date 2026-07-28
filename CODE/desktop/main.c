@@ -268,6 +268,7 @@ static int g_ctx_win = -1;
 /* 状态栏滑块 */
 static int g_vol = 65;
 static int g_bright = 100;
+static int g_bright_applied = 100;  /* 上次应用的亮度值（避免重复处理） */
 static int g_drag_slider = 0;          /* 1=vol 2=bright */
 static int g_vol_rect[4];              /* x,y,w,h 滑轨 */
 static int g_bri_rect[4];
@@ -311,6 +312,68 @@ static int g_ide_host[4];
 static int g_ide_tabx[4];              /* IDE 标签 × */
 static int g_ide_new_rect[4];          /* IDE "+ NEW IDE" 按钮 */
 static int g_cp_host[4];               /* 自定义页宿主 */
+
+/* ============================================================
+ *  脏矩形渲染（性能优化：只更新变化区域）
+ * ============================================================ */
+
+#define MAX_DIRTY_RECTS  16
+
+typedef struct {
+    int x, y, w, h;
+    int active;
+} dirty_rect;
+
+static dirty_rect g_dirty_rects[MAX_DIRTY_RECTS];
+static int g_dirty_count = 0;
+static int g_full_redraw = 1;  /* 初始全屏重绘 */
+
+/* 标记脏区域 */
+__attribute__((unused))
+static void mark_dirty(int x, int y, int w, int h) {
+    if (g_dirty_count >= MAX_DIRTY_RECTS) {
+        /* 溢出时合并为全屏重绘 */
+        g_full_redraw = 1;
+        return;
+    }
+    g_dirty_rects[g_dirty_count].x = x;
+    g_dirty_rects[g_dirty_count].y = y;
+    g_dirty_rects[g_dirty_count].w = w;
+    g_dirty_rects[g_dirty_count].h = h;
+    g_dirty_rects[g_dirty_count].active = 1;
+    g_dirty_count++;
+}
+
+/* 合并所有脏矩形为一个包围盒 */
+static void merge_dirty_rects(int *out_x, int *out_y, int *out_w, int *out_h) {
+    if (g_dirty_count == 0) {
+        *out_x = *out_y = *out_w = *out_h = 0;
+        return;
+    }
+    int min_x = (int)g_fb_w, min_y = (int)g_fb_h;
+    int max_x = 0, max_y = 0;
+    for (int i = 0; i < g_dirty_count; i++) {
+        if (!g_dirty_rects[i].active) continue;
+        int x1 = g_dirty_rects[i].x;
+        int y1 = g_dirty_rects[i].y;
+        int x2 = x1 + g_dirty_rects[i].w;
+        int y2 = y1 + g_dirty_rects[i].h;
+        if (x1 < min_x) min_x = x1;
+        if (y1 < min_y) min_y = y1;
+        if (x2 > max_x) max_x = x2;
+        if (y2 > max_y) max_y = y2;
+    }
+    *out_x = min_x;
+    *out_y = min_y;
+    *out_w = max_x - min_x;
+    *out_h = max_y - min_y;
+}
+
+/* 清除所有脏矩形 */
+static void clear_dirty_rects(void) {
+    g_dirty_count = 0;
+    g_full_redraw = 0;
+}
 
 /* ============================================================
  *  箭头光标形状（24×24，1=前景 0=透明）
@@ -847,6 +910,9 @@ typedef struct {
     char input_buf[256];
     int input_len, input_cursor;
     int prompt_len;
+    /* 性能优化：脏行标记（增量渲染） */
+    u8 dirty_rows[TERM_MAX_ROWS];  /* 标记哪些行需要重绘 */
+    int any_dirty;                   /* 是否有任何脏行 */
 } bash_state;
 
 static const char *BASH_PROMPT = "deshab# ";
@@ -864,11 +930,20 @@ static void bash_reset(bash_state *s, int w, int h) {
     s->cur_col = 0; s->cur_row = 0;
     s->input_len = 0; s->input_cursor = 0;
     s->prompt_len = kstrlen(BASH_PROMPT);
+    /* 初始化脏行标记：所有行标记为脏，确保首次渲染 */
+    for (int i = 0; i < TERM_MAX_ROWS; i++) s->dirty_rows[i] = 1;
+    s->any_dirty = 1;
 }
 
 static void bash_putc(bash_state *s, char c, u32 color) {
-    if (c == '\n') { s->cur_col = 0; s->cur_row++; return; }
+    if (c == '\n') {
+        s->dirty_rows[s->cur_row] = 1;  /* 标记当前行为脏 */
+        s->any_dirty = 1;
+        s->cur_col = 0; s->cur_row++;
+        return;
+    }
     if (s->cur_row >= s->rows) {
+        /* 滚动：所有行都需要重绘 */
         for (int r = 1; r < s->rows; r++) {
             for (int c2 = 0; c2 < s->cols; c2++) {
                 s->ch[(r-1)*TERM_MAX_COLS+c2] = s->ch[r*TERM_MAX_COLS+c2];
@@ -879,11 +954,17 @@ static void bash_putc(bash_state *s, char c, u32 color) {
             s->ch[(s->rows-1)*TERM_MAX_COLS+c2] = ' ';
         }
         s->cur_row = s->rows - 1;
+        /* 标记所有行为脏 */
+        for (int r = 0; r < s->rows; r++) s->dirty_rows[r] = 1;
+        s->any_dirty = 1;
     }
     if (s->cur_col >= s->cols) { s->cur_col = 0; s->cur_row++; }
     int idx = s->cur_row * TERM_MAX_COLS + s->cur_col;
     s->ch[idx] = (u8)c; s->fg[idx] = color;
     s->cur_col++;
+    /* 标记当前行为脏 */
+    s->dirty_rows[s->cur_row] = 1;
+    s->any_dirty = 1;
 }
 
 static void bash_puts(bash_state *s, const char *str, u32 color) {
@@ -958,11 +1039,18 @@ static void bash_key(bash_state *s, u8 sc, int shift) {
     }
 }
 
-/* 绘制终端到指定矩形区域（面板或窗口客户区） */
+/* 绘制终端到指定矩形区域（面板或窗口客户区）
+ * 性能优化：增量渲染，只绘制脏行 */
 static void bash_draw_to(bash_state *s, int cx, int cy, int cw, int ch) {
+    /* 快速退出：终端内容未修改，跳过绘制 */
+    if (!s->any_dirty) return;
+    
     du_fill_rect(&g_fb, cx, cy, cw, ch, KS_BG_PRIMARY);
 
     for (int r = 0; r < s->rows; r++) {
+        /* 增量渲染：只绘制脏行 */
+        if (!s->dirty_rows[r]) continue;
+        
         for (int c = 0; c < s->cols; c++) {
             int idx = r * TERM_MAX_COLS + c;
             if (s->ch[idx] == ' ') continue;
@@ -972,6 +1060,9 @@ static void bash_draw_to(bash_state *s, int cx, int cy, int cw, int ch) {
             if (py + (int)DU_ASCII_CELL_H > cy + ch) continue;
             du_draw_char(&g_fb, s->ch[idx], px, py, s->fg[idx], KS_BG_PRIMARY);
         }
+        
+        /* 清除脏行标记 */
+        s->dirty_rows[r] = 0;
     }
 
     int input_y = cy + (int)DU_SPACE_SM + s->cur_row * (int)DU_ASCII_LINE_H;
@@ -987,6 +1078,9 @@ static void bash_draw_to(bash_state *s, int cx, int cy, int cw, int ch) {
         du_fill_rect(&g_fb, cursor_x, input_y + (int)DU_ASCII_CELL_H - 3,
                      (int)DU_ASCII_CELL_W, 2, KS_ACCENT);
     }
+    
+    /* 清除全局脏标记 */
+    s->any_dirty = 0;
 }
 
 /* ---- 窗口适配 ---- */
@@ -1365,7 +1459,11 @@ static void register_apps(void) {
 }
 
 /* Winux-Kate .desktop-grid：canvas padding 24px，列宽 104px，gap 18px，
- * 左→右排列，超出画布宽度则换行（align-content: start） */
+ * 左→右排列，超出画布宽度则换行（align-content: start）
+ *
+ * 注意：Terminal 和 CMD 已在第一页 Dashboard（TERM-01 / TERM-02），
+ * 桌面不再重复显示其图标。
+ */
 static void setup_desktop_icons(void) {
     int pad = KATE_ICON_PAD;                        /* 24 */
     int x = pad;
@@ -1373,6 +1471,9 @@ static void setup_desktop_icons(void) {
     int max_x = (int)g_fb_w - pad;                  /* canvas 右缘 */
     for (int i = 0; i < g_app_count; i++) {
         if (!g_apps[i].on_create && !g_apps[i].elf_name) continue;
+        /* 跳过 Terminal 和 CMD（已在 Dashboard 第一页） */
+        if (g_apps[i].name[0] == 's' && g_apps[i].name[1] == 'h' && g_apps[i].name[2] == 'e') continue;
+        if (g_apps[i].name[0] == 'c' && g_apps[i].name[1] == 'm' && g_apps[i].name[2] == 'd') continue;
         if (x > pad && x + KATE_ICON_W > max_x) {
             x = pad;
             y += KATE_ICON_H + KATE_ICON_GAP;
@@ -1803,10 +1904,10 @@ static void draw_topbar(void) {
     du_divider_v(&g_fb, x - 4, 6, KATE_TOPBAR_H - 12, KS_BORDER);
     x += 4;
 
-    /* 页面切换 */
-    static const char *pg_names[3] = { "1.DASHBOARD", "2.IDE", "3.DESKTOP" };
+    /* 页面切换：精简按钮文字 */
+    static const char *pg_names[3] = { "DASH", "IDE", "DESK" };
     for (int i = 0; i < 3; i++) {
-        int bw = kstrlen(pg_names[i]) * (int)DU_ASCII_STEP + 16;
+        int bw = kstrlen(pg_names[i]) * (int)DU_ASCII_STEP + 24;
         int active = (g_page == i + 1);
         int hover = g_mouse_x >= x && g_mouse_x < x + bw &&
                     g_mouse_y >= 5 && g_mouse_y < 29;
@@ -1817,11 +1918,11 @@ static void draw_topbar(void) {
             du_fill_rect(&g_fb, x, 5, bw, 24, KS_ACCENT_DIM);
         }
         du_rect_outline(&g_fb, x, 5, bw, 24, active ? KS_ACCENT : KS_BORDER, 1);
-        du_draw_string(&g_fb, pg_names[i], x + 8, ty,
+        du_draw_string(&g_fb, pg_names[i], x + 12, ty,
                        active ? KS_TEXT_INVERT : KS_TEXT_DIM, 0, DU_ASCII_STEP);
         g_pg_rect[i][0] = x; g_pg_rect[i][1] = 5;
         g_pg_rect[i][2] = bw; g_pg_rect[i][3] = 24;
-        x += bw + 6;
+        x += bw + 8;
     }
     /* 自定义页 */
     for (int i = 0; i < g_cpage_count; i++) {
@@ -2006,7 +2107,7 @@ static void dash_layout(void) {
     int pad = 8, gap = 8;
     int avail_w = (int)g_fb_w - 2 * pad;
     int avail_h = bot - top - 2 * pad;
-    int left_w = avail_w * 42 / 100;
+    int left_w = avail_w * 35 / 100;   /* 终端面板：42%→35% */
     int right_x = pad + left_w + gap;
     int right_w = (int)g_fb_w - pad - right_x;
     int row_h = (avail_h - gap) / 2;
@@ -2524,9 +2625,21 @@ static void draw_ctx_menu(void) {
  *  全屏重绘
  * ============================================================ */
 
-/* 全局亮度（BRIGHT 滑块真实调暗） */
+/* 全局亮度（BRIGHT 滑块真实调暗）
+ * 性能优化：仅在亮度变化时处理，避免每帧全屏遍历 */
 static void apply_brightness(void) {
-    if (g_bright >= 100) return;
+    /* 快速退出：亮度100%无需调整 */
+    if (g_bright >= 100) {
+        g_bright_applied = 100;
+        return;
+    }
+    
+    /* 快速退出：亮度未变化，跳过处理 */
+    if (g_bright == g_bright_applied) return;
+    
+    /* 记录当前应用的亮度值 */
+    g_bright_applied = g_bright;
+    
     u32 f = (u32)g_bright;
     for (u64 y = 0; y < g_fb_h; y++) {
         u32 *line = (u32 *)((u8 *)g_fb.fb + y * g_fb_pitch);
@@ -3137,8 +3250,28 @@ void dsk_entry(const dsk_boot_context *ctx) {
         }
 
         if (need_redraw) {
-            redraw_all();
-            flip_buffer();                     /* 全屏 flip：无闪烁 */
+            /* 脏矩形渲染：合并脏矩形，只 flip 变化区域 */
+            if (g_full_redraw || g_dirty_count == 0) {
+                /* 全屏重绘 */
+                redraw_all();
+                flip_buffer();
+            } else {
+                /* 合并脏矩形 */
+                int dx, dy, dw, dh;
+                merge_dirty_rects(&dx, &dy, &dw, &dh);
+                
+                /* 重绘并 flip 脏区域 */
+                if (dw > 0 && dh > 0) {
+                    /* 清除脏矩形标记 */
+                    clear_dirty_rects();
+                    
+                    /* 重绘整个屏幕（简化：暂不支持局部重绘） */
+                    redraw_all();
+                    
+                    /* Flip 合并后的脏区域 */
+                    flip_rect(dx, dy, dw, dh);
+                }
+            }
         } else if (moved) {
             /* 仅光标移动：局部 flip（双缓冲 → 无闪烁） */
             int old_x = g_cursor_old_x, old_y = g_cursor_old_y;

@@ -10,6 +10,7 @@
 
 #include "../UTSM/include/utsm/dsk.h"
 #include "../UTSM/include/utsm/pe.h"
+#include "../UTSM/pe/pe_loader.h"   /* PE 头结构体（image_dos_header 等），供 peinfo 解析 */
 
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -196,6 +197,18 @@ static void term_putx(u32 v) {
     }
 }
 
+/* 64 位十六进制输出（前导零抑制），用于 PE ImageBase 等宽字段 */
+static void term_putx64(u64 v) {
+    static const char hex[] = "0123456789ABCDEF";
+    term_putc('0'); term_putc('x');
+    int started = 0;
+    for (int i = 60; i >= 0; i -= 4) {
+        u64 nib = (v >> i) & 0xF;
+        if (nib) started = 1;
+        if (started || i == 0) term_putc(hex[nib]);
+    }
+}
+
 /* ---- 终端全屏渲染 ---- */
 static void term_redraw_all(void) {
     du_fill_rect(&g_ctx, 0, 0, (i64)fb_w, (i64)fb_h, CMD_BG);
@@ -372,6 +385,8 @@ static void cmd_help(void) {
     term_puts_color("\nPE 程序执行:\r\n", CMD_WARN);
     term_puts("  <name>.exe   运行 PE32+/PE32 程序 (如 hello.exe)\r\n");
     term_puts("  <name>       自动查找 name.exe 并运行\r\n");
+    term_puts("  pe <name>    显式运行 PE 程序 (如 pe hello64)\r\n");
+    term_puts("  peinfo <nm>  显示 PE 头信息 (不执行)\r\n");
 }
 
 static void cmd_ver(void) {
@@ -645,6 +660,8 @@ static int has_exec_ext(const char *name) {
  * prog_name = 程序名（可能带或不带 .exe 后缀）
  * full_cmdline = 完整命令行（程序名 + 参数，即 GetCommandLineA 返回值）
  */
+static int cmd_read_pe_from_bin(const char *name11, u8 **data, u32 *size);  /* 前向声明 */
+
 static void exec_pe(const char *prog_name, const char *full_cmdline) {
     if (!g_pe_svc) {
         term_puts_color("PE 兼容层不可用（UTSM PE 服务未初始化）\r\n", CMD_ERROR);
@@ -677,12 +694,17 @@ static void exec_pe(const char *prog_name, const char *full_cmdline) {
         return;
     }
 
-    /* 从 FAT32 根目录读取 */
+    /* PATH 查找：先根目录，再 /bin/ */
     u8 *pe_data = 0; u32 pe_size = 0;
-    if (f32_read_root_file(name11, &pe_data, &pe_size) != 0) {
+    int rc = f32_read_root_file(name11, &pe_data, &pe_size);
+    if (rc != 0) {
+        rc = cmd_read_pe_from_bin(name11, &pe_data, &pe_size);
+    }
+    if (rc != 0) {
         term_puts_color("'", CMD_ERROR);
         term_puts_color(prog_name, CMD_ERROR);
         term_puts_color("' 不是内部或外部命令，也不是可运行的程序。\r\n", CMD_ERROR);
+        term_puts_color("  (已搜索 C:\\ 及 C:\\bin\\)\r\n", CMD_DIM);
         return;
     }
 
@@ -702,7 +724,7 @@ static void exec_pe(const char *prog_name, const char *full_cmdline) {
     swrite("[cmd] cmdline: "); swrite(full_cmdline); swrite("\n");
 
     u64 exit_code = 0;
-    int rc = g_pe_svc->run(pe_data, (u64)pe_size, full_cmdline, &exit_code);
+    rc = g_pe_svc->run(pe_data, (u64)pe_size, full_cmdline, &exit_code);
 
     if (rc != 0) {
         term_puts_color("PE 执行失败，错误码: ", CMD_ERROR);
@@ -715,6 +737,417 @@ static void exec_pe(const char *prog_name, const char *full_cmdline) {
     }
 
     logl("[cmd] PE run end");
+}
+
+/* ============================================================
+ *  /bin 子目录支持 — 用于查找 PE 可执行程序
+ * ============================================================ */
+
+/* 在根目录簇链中查找名为 name11 的子目录（attr & 0x10），返回首簇号。
+ * 使用 f32_disk 缓存（来自 fat32_io.h）。返回 0 成功，-1 未找到。 */
+static int cmd_find_subdir(u32 dir_clus, const char *name11, u32 *out_clus) {
+    if (!f32_disk_loaded && f32_disk_load() != 0) return -2;
+    const f32_bpb *bpb = (const f32_bpb *)f32_disk;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 spc = bpb->spc;
+    u32 clus = dir_clus;
+    while (clus >= 2 && clus < 0x0FFFFFF8) {
+        u32 lba = data_lba + (clus - 2) * spc;
+        const u8 *cb;
+        if ((u64)lba * 512 + (u64)spc * 512 <= sizeof(f32_disk))
+            cb = f32_disk + (u64)lba * 512;
+        else {
+            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            cb = f32_cluster;
+        }
+        const f32_dirent *dir = (const f32_dirent *)cb;
+        for (u32 e = 0; e * 32 < spc * 512; e++) {
+            if (dir[e].name[0] == 0) goto done_dir;
+            if ((u8)dir[e].name[0] == 0xE5) continue;
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            if (!(dir[e].attr & 0x10)) continue;  /* 只匹配目录 */
+            if (f32_neq11(dir[e].name, name11)) {
+                *out_clus = f32_r16((const u8*)&dir[e].clow) | ((u32)f32_r16((const u8*)&dir[e].chigh) << 16);
+                return 0;
+            }
+        }
+        u32 fo = fat_byte_off + clus * 4;
+        if (fo + 4 > sizeof(f32_disk)) break;
+        clus = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+    }
+done_dir:
+    return -1;
+}
+
+/* 从指定目录首簇读取文件到 f32_data。
+ * dir_clus: 目录起始簇号。name11: 8.3 名。
+ * 返回 0 成功，*out_data 指向 f32_data，*out_size 为字节数；非 0 失败。 */
+static int cmd_read_file_in_dir(u32 dir_clus, const char *name11, u8 **out_data, u32 *out_size) {
+    if (!f32_disk_loaded && f32_disk_load() != 0) return -1;
+    const f32_bpb *bpb = (const f32_bpb *)f32_disk;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 spc = bpb->spc;
+
+    /* 先在目录中查找文件 */
+    u32 clus = dir_clus;
+    u32 found_clus = 0, found_size = 0;
+    int found = 0;
+    while (clus >= 2 && clus < 0x0FFFFFF8 && !found) {
+        u32 lba = data_lba + (clus - 2) * spc;
+        const u8 *cb;
+        if ((u64)lba * 512 + (u64)spc * 512 <= sizeof(f32_disk))
+            cb = f32_disk + (u64)lba * 512;
+        else {
+            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            cb = f32_cluster;
+        }
+        const f32_dirent *dir = (const f32_dirent *)cb;
+        for (u32 e = 0; e * 32 < spc * 512; e++) {
+            if (dir[e].name[0] == 0) goto done_find;
+            if ((u8)dir[e].name[0] == 0xE5) continue;
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            if (dir[e].attr & 0x10) continue;  /* 跳过目录 */
+            if (f32_neq11(dir[e].name, name11)) {
+                found_clus = f32_r16((const u8*)&dir[e].clow) | ((u32)f32_r16((const u8*)&dir[e].chigh) << 16);
+                found_size = dir[e].fsize;
+                found = 1;
+                break;
+            }
+        }
+        u32 fo = fat_byte_off + clus * 4;
+        if (fo + 4 > sizeof(f32_disk)) break;
+        clus = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+    }
+done_find:
+    if (!found) return -5;
+    if (found_size > sizeof(f32_data)) return -6;
+
+    /* 读取文件数据 */
+    u8 *dst = f32_data; u32 remaining = found_size; u32 fc = found_clus;
+    while (fc >= 2 && fc < 0x0FFFFFF8 && remaining > 0) {
+        u32 fc_lba = data_lba + (fc - 2) * spc;
+        u32 fc_bytes = spc * 512;
+        if (fc_bytes > remaining) fc_bytes = remaining;
+        const u8 *fb;
+        if ((u64)fc_lba * 512 + (u64)spc * 512 <= sizeof(f32_disk))
+            fb = f32_disk + (u64)fc_lba * 512;
+        else {
+            if (f32_read_sectors(fc_lba, 8, f32_cluster) != 0) return -7;
+            fb = f32_cluster;
+        }
+        for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
+        dst += fc_bytes; remaining -= fc_bytes;
+        u32 fo = fat_byte_off + fc * 4;
+        if (fo + 4 > sizeof(f32_disk)) break;
+        fc = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+    }
+    *out_data = f32_data; *out_size = found_size;
+    return 0;
+}
+
+static u32 g_cmd_bin_clus = 0;
+static int g_cmd_bin_checked = 0;
+
+/* 获取 /bin 目录首簇号。返回 0 成功，-1 未找到。 */
+static int cmd_get_bin_cluster(u32 *out_clus) {
+    if (g_cmd_bin_checked) {
+        if (g_cmd_bin_clus == 0) return -1;
+        *out_clus = g_cmd_bin_clus;
+        return 0;
+    }
+    g_cmd_bin_checked = 1;
+    const f32_bpb *bpb = (const f32_bpb *)f32_disk;
+    char bin83[11] = {'B','I','N',' ',' ',' ',' ',' ',' ',' ',' '};
+    if (cmd_find_subdir(bpb->root_clus, bin83, &g_cmd_bin_clus) != 0) {
+        g_cmd_bin_clus = 0;
+        return -1;
+    }
+    *out_clus = g_cmd_bin_clus;
+    return 0;
+}
+
+/* 从 /bin 子目录读取 PE 文件。返回 0 成功。 */
+static int cmd_read_pe_from_bin(const char *name11, u8 **data, u32 *size) {
+    u32 bin_clus;
+    if (cmd_get_bin_cluster(&bin_clus) != 0) return -1;
+    return cmd_read_file_in_dir(bin_clus, name11, data, size);
+}
+
+/* ============================================================
+ *  peinfo — 解析并显示 PE 头信息（不执行）
+ * ============================================================ */
+
+/* 把程序名转为 8.3 名（自动补 .exe），返回 0 成功，-1 失败。
+ * 内联自 exec_pe 的同名逻辑，供 cmd_peinfo 复用。 */
+static int make_pe_name83(const char *prog, char name11[11]) {
+    char base[64];
+    str_copy(base, prog, sizeof(base));
+    int has_dot = 0;
+    for (int i = 0; base[i]; i++) {
+        if (base[i] == '.') { has_dot = 1; break; }
+    }
+    if (!has_dot) {
+        int bl = str_len(base);
+        if (bl > 59) bl = 59;
+        base[bl] = '.'; base[bl + 1] = 'e'; base[bl + 2] = 'x';
+        base[bl + 3] = 'e'; base[bl + 4] = 0;
+    }
+    return f32_name_to_83(base, name11);
+}
+
+static void cmd_peinfo(const char *args) {
+    if (!*args) {
+        term_puts_color("用法: peinfo <程序名>  (如 peinfo hello64)\r\n", CMD_INFO);
+        return;
+    }
+    if (!f32_blk_read) {
+        term_puts_color("peinfo: 无块设备\r\n", CMD_ERROR);
+        return;
+    }
+
+    char name11[11];
+    if (make_pe_name83(args, name11) != 0) {
+        term_puts_color("peinfo: 无效文件名\r\n", CMD_ERROR);
+        return;
+    }
+
+    /* PATH 查找：先根目录，再 /bin/ */
+    u8 *pe = 0; u32 pe_size = 0;
+    int rc = f32_read_root_file(name11, &pe, &pe_size);
+    if (rc != 0) {
+        rc = cmd_read_pe_from_bin(name11, &pe, &pe_size);
+    }
+    if (rc != 0) {
+        term_puts_color("peinfo: 文件不存在: ", CMD_ERROR);
+        term_puts_color(args, CMD_ERROR);
+        term_puts_color(" (已搜索 C:\\ 及 C:\\bin\\)\r\n", CMD_ERROR);
+        return;
+    }
+
+    /* ---- DOS 头 ---- */
+    if (pe_size < sizeof(image_dos_header)) {
+        term_puts_color("peinfo: 文件过小，无 DOS 头\r\n", CMD_ERROR);
+        return;
+    }
+    const image_dos_header *dos = (const image_dos_header *)pe;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        term_puts_color("peinfo: 缺少 MZ 签名\r\n", CMD_ERROR);
+        return;
+    }
+    u32 lfanew = dos->e_lfanew;
+    if ((u64)lfanew + 4 + sizeof(image_file_header) > pe_size) {
+        term_puts_color("peinfo: e_lfanew 越界\r\n", CMD_ERROR);
+        return;
+    }
+
+    term_puts_color("=== PE 头信息 ===\r\n", CMD_INFO);
+    term_puts("  DOS: MZ OK, e_lfanew=");
+    term_putx(lfanew);
+    term_puts("\r\n");
+
+    /* ---- NT 签名 + File Header ---- */
+    const u8 *nt = pe + lfanew;
+    if (*(const u32 *)nt != IMAGE_NT_SIGNATURE) {
+        term_puts_color("peinfo: 缺少 PE\\0\\0 签名\r\n", CMD_ERROR);
+        return;
+    }
+    const image_file_header *fh = (const image_file_header *)(nt + 4);
+    u16 machine = fh->machine;
+    u16 nsec = fh->number_of_sections;
+    u16 opt_size = fh->size_of_optional_header;
+
+    term_puts("  NT: PE\\0\\0 OK\r\n");
+    term_puts("  Machine: ");
+    term_putx(machine);
+    if (machine == 0x8664)      term_puts_color(" (AMD64)\r\n", CMD_OK);
+    else if (machine == 0x014c) term_puts_color(" (i386)\r\n",  CMD_OK);
+    else                        term_puts(" (未知)\r\n");
+    term_puts("  节区数: ");
+    term_putu(nsec);
+    term_puts("  OptHdr 大小: ");
+    term_putu(opt_size);
+    term_puts("\r\n");
+
+    /* ---- Optional Header ---- */
+    if (opt_size < 2) {
+        term_puts_color("peinfo: Optional Header 过小\r\n", CMD_WARN);
+        return;
+    }
+    if ((u64)lfanew + 4 + sizeof(image_file_header) + opt_size > pe_size) {
+        term_puts_color("peinfo: Optional Header 越界\r\n", CMD_ERROR);
+        return;
+    }
+    const void *opt = (const void *)(nt + 4 + sizeof(image_file_header));
+    u16 magic = *(const u16 *)opt;
+    int is_pe32_plus = (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+
+    u64 img_base = 0;
+    u32 entry_rva = 0;
+    u32 img_size = 0;
+    u32 subsys = 0;
+    const image_data_directory *import_dir = 0;
+
+    if (is_pe32_plus) {
+        if (opt_size >= sizeof(image_optional_header64)) {
+            const image_optional_header64 *oh = (const image_optional_header64 *)opt;
+            img_base = oh->image_base;
+            entry_rva = oh->address_of_entry_point;
+            img_size = oh->size_of_image;
+            subsys = oh->subsystem;
+            import_dir = &oh->data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        }
+        term_puts_color("  格式: PE32+ (64位 原生)\r\n", CMD_OK);
+    } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        if (opt_size >= sizeof(image_optional_header32)) {
+            const image_optional_header32 *oh = (const image_optional_header32 *)opt;
+            img_base = oh->image_base;
+            entry_rva = oh->address_of_entry_point;
+            img_size = oh->size_of_image;
+            subsys = oh->subsystem;
+            import_dir = &oh->data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        }
+        term_puts_color("  格式: PE32 (32位 解释器)\r\n", CMD_OK);
+    } else {
+        term_puts_color("peinfo: 未知 Optional Header magic=", CMD_ERROR);
+        term_putx(magic);
+        term_puts("\r\n");
+        return;
+    }
+
+    term_puts("  ImageBase:    ");
+    term_putx64(img_base);
+    term_puts("\r\n");
+    term_puts("  EntryPoint:   ");
+    term_putx(entry_rva);
+    term_puts(" (RVA)\r\n");
+    term_puts("  SizeOfImage:  ");
+    term_putx(img_size);
+    term_puts(" (");
+    term_putu(img_size);
+    term_puts(" bytes)\r\n");
+    term_puts("  Subsystem:    ");
+    term_putu(subsys);
+    term_puts(subsys == 3 ? " (CUI 控制台)\r\n" : "\r\n");
+
+    /* ---- 节区表 ---- */
+    const image_section_header *secs = (const image_section_header *)
+        ((const u8 *)opt + opt_size);
+    if ((u64)((const u8 *)secs - pe) + (u64)nsec * sizeof(image_section_header) > pe_size) {
+        term_puts_color("peinfo: 节区表越界，跳过\r\n", CMD_WARN);
+        nsec = 0;
+    }
+    if (nsec > 0) {
+        term_puts_color("  节区表:\r\n", CMD_INFO);
+        term_puts("    Name       VAddr       VSize       RawSize     Flg\r\n");
+        for (int i = 0; i < nsec && i < 96; i++) {
+            char nm[9];
+            for (int j = 0; j < 8; j++) nm[j] = (char)secs[i].name[j];
+            nm[8] = 0;
+            term_puts("    ");
+            term_puts(nm);
+            int pad = 8 - str_len(nm);
+            for (int k = 0; k < pad; k++) term_putc(' ');
+            term_puts("  ");
+            term_putx(secs[i].virtual_address);
+            term_puts("  ");
+            term_putx(secs[i].virtual_size);
+            term_puts("  ");
+            term_putx(secs[i].size_of_raw_data);
+            term_puts("  ");
+            char flags[4];
+            flags[0] = (secs[i].characteristics & IMAGE_SCN_MEM_EXECUTE) ? 'X' : '-';
+            flags[1] = (secs[i].characteristics & IMAGE_SCN_MEM_READ)    ? 'R' : '-';
+            flags[2] = (secs[i].characteristics & IMAGE_SCN_MEM_WRITE)   ? 'W' : '-';
+            flags[3] = 0;
+            term_puts_color(flags, CMD_WARN);
+            term_puts("\r\n");
+        }
+    }
+
+    /* ---- 导入表 ---- */
+    if (import_dir && import_dir->virtual_address != 0 && import_dir->size != 0) {
+        u32 imp_rva = import_dir->virtual_address;
+        if (imp_rva >= pe_size) {
+            term_puts_color("peinfo: 导入表 RVA 越界\r\n", CMD_WARN);
+        } else {
+            term_puts_color("  导入表:\r\n", CMD_INFO);
+            int dll_count = 0;
+            int func_total = 0;
+            int truncated = 0;
+            for (int di = 0; !truncated; di++) {
+                u32 desc_off = imp_rva + (u32)di * sizeof(image_import_descriptor);
+                if ((u64)desc_off + sizeof(image_import_descriptor) > pe_size) break;
+                const image_import_descriptor *desc =
+                    (const image_import_descriptor *)(pe + desc_off);
+                if (desc->name == 0 && desc->first_thunk == 0) break;
+
+                const char *dll_name = 0;
+                if (desc->name < pe_size) dll_name = (const char *)(pe + desc->name);
+                term_puts("    DLL: ");
+                term_puts_color(dll_name ? dll_name : "(?)", CMD_WARN);
+                term_puts("\r\n");
+
+                u32 int_rva = desc->original_first_thunk;
+                u32 iat_rva = desc->first_thunk;
+                if (int_rva == 0) int_rva = iat_rva;
+                if (int_rva == 0) { dll_count++; continue; }
+
+                for (int fi = 0; ; fi++) {
+                    u32 thunk_off = int_rva + (u32)fi * 4;
+                    if ((u64)thunk_off + 4 > pe_size) break;
+                    u32 thunk = *(const u32 *)(pe + thunk_off);
+                    if (thunk == 0) break;
+
+                    term_puts("      ");
+                    if (thunk & 0x80000000u) {
+                        term_puts("#ordinal ");
+                        term_putu(thunk & 0xFFFF);
+                    } else if (thunk + 2 < pe_size) {
+                        const char *fn = (const char *)(pe + thunk + 2);
+                        term_puts(fn);
+                    } else {
+                        term_puts("(?)");
+                    }
+                    term_puts("\r\n");
+                    func_total++;
+                    if (func_total > 64) {
+                        term_puts_color("      ... (导入过多，截断)\r\n", CMD_DIM);
+                        truncated = 1;
+                        break;
+                    }
+                }
+                dll_count++;
+                if (dll_count > 32) {
+                    term_puts_color("    ... (DLL 过多，截断)\r\n", CMD_DIM);
+                    break;
+                }
+            }
+            term_puts("  共 ");
+            term_putu(dll_count);
+            term_puts(" 个 DLL, ");
+            term_putu(func_total);
+            term_puts(" 个导入函数\r\n");
+        }
+    } else {
+        term_puts_color("  导入表: 无\r\n", CMD_DIM);
+    }
+
+    term_puts_color("=== PE 头信息结束 ===\r\n", CMD_INFO);
+}
+
+/* ============================================================
+ *  pe — 显式运行 PE 程序（等价于直接输入名字，但可在 help 中列出）
+ * ============================================================ */
+static void cmd_pe(const char *args) {
+    if (!*args) {
+        term_puts_color("用法: pe <程序名>  (如 pe hello64)\r\n", CMD_INFO);
+        return;
+    }
+    exec_pe(args, args);
 }
 
 /* ============================================================
@@ -756,6 +1189,8 @@ static void execute_command(const char *cmd) {
         g_should_exit = 1;
         return;
     }
+    if (str_ieq(name, "pe"))     { cmd_pe(args);     return; }
+    if (str_ieq(name, "peinfo")) { cmd_peinfo(args); return; }
     if (str_ieq(name, "reboot")) {
         term_puts_color("重启中...\r\n", CMD_WARN);
         term_redraw_all();

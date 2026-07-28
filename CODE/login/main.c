@@ -4,11 +4,21 @@
  * extracts username + password hash, prompts for password,
  * verifies via SHA256 comparison, sets ctx->reserved[2]=1 on success.
  *
+ * 防篡改：对 .text 段做 SHA256 自校验，预期哈希由构建后补丁脚本
+ * 写入 .hashseg 段（__expected_hash）。运行时若发现哈希不匹配，
+ * 拒绝继续并触发串口告警。开发期哈希为全 0 时跳过校验。
+ *
  * Returns to DSK in all cases (success, skip via Esc, or fatal error).
  * DSK loads desktop.elf after this returns.
  */
 
 #include "../UTSM/include/utsm/dsk.h"
+
+/* 防篡改：linker 导出的 .text 段范围与预期哈希存储位置 */
+extern const u8 __text_start[];
+extern const u8 __text_end[];
+extern const u8 __expected_hash[];
+extern const u8 __expected_hash_end[];
 
 typedef signed char        i8;
 typedef unsigned char      u8;
@@ -253,6 +263,69 @@ static void sha256(const char *msg, u8 out[32]) {
     for(int i=0;i<8;i++){out[i*4]=(u8)(h[i]>>24);out[i*4+1]=(u8)(h[i]>>16);out[i*4+2]=(u8)(h[i]>>8);out[i*4+3]=(u8)h[i];}
 }
 
+/* ---- 防篡改：对任意字节缓冲计算 SHA256（分块处理，支持 >55 字节） ---- */
+static void sha256_buf(const u8 *msg, u64 len, u8 out[32]) {
+    u32 h[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    u8 block[64];
+    u64 processed = 0;
+    while (processed + 64 <= len) {
+        for (int i = 0; i < 64; i++) block[i] = msg[processed + i];
+        u32 w[64];
+        for(int i=0;i<16;i++) w[i]=((u32)block[i*4]<<24)|((u32)block[i*4+1]<<16)|((u32)block[i*4+2]<<8)|block[i*4+3];
+        for(int i=16;i<64;i++){u32 s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3);u32 s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);w[i]=w[i-16]+s0+w[i-7]+s1;}
+        u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for(int i=0;i<64;i++){u32 S1=ROR(e,6)^ROR(e,11)^ROR(e,25);u32 ch=(e&f)^((~e)&g);u32 t1=hh+S1+ch+K256[i]+w[i];u32 S0=ROR(a,2)^ROR(a,13)^ROR(a,22);u32 maj=(a&b)^(a&c)^(b&c);u32 t2=S0+maj;hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}
+        h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+        processed += 64;
+    }
+    /* 最终块：剩余数据 + 0x80 + 长度（64 位大端） */
+    u32 rem = (u32)(len - processed);
+    for (u32 i = 0; i < 64; i++) block[i] = 0;
+    for (u32 i = 0; i < rem; i++) block[i] = msg[processed + i];
+    block[rem] = 0x80;
+    u64 bit = len * 8;
+    for (int i = 0; i < 8; i++) block[63 - i] = (u8)(bit >> (i * 8));
+    u32 w[64];
+    for(int i=0;i<16;i++) w[i]=((u32)block[i*4]<<24)|((u32)block[i*4+1]<<16)|((u32)block[i*4+2]<<8)|block[i*4+3];
+    for(int i=16;i<64;i++){u32 s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3);u32 s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);w[i]=w[i-16]+s0+w[i-7]+s1;}
+    u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(int i=0;i<64;i++){u32 S1=ROR(e,6)^ROR(e,11)^ROR(e,25);u32 ch=(e&f)^((~e)&g);u32 t1=hh+S1+ch+K256[i]+w[i];u32 S0=ROR(a,2)^ROR(a,13)^ROR(a,22);u32 maj=(a&b)^(a&c)^(b&c);u32 t2=S0+maj;hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+    for(int i=0;i<8;i++){out[i*4]=(u8)(h[i]>>24);out[i*4+1]=(u8)(h[i]>>16);out[i*4+2]=(u8)(h[i]>>8);out[i*4+3]=(u8)h[i];}
+}
+
+/* ---- 防篡改：运行时 .text 段完整性校验 ----
+ * 计算 __text_start ~ __text_end 的 SHA256，与 __expected_hash 对比。
+ * 返回 1=校验通过（或开发期哈希为空跳过），0=校验失败（被篡改） */
+static int login_verify_integrity(void) {
+    const u8 *start = __text_start;
+    const u8 *end = __text_end;
+    const u8 *expected = __expected_hash;
+    u64 len = (u64)(end - start);
+    if (len == 0) return 0;
+
+    /* 开发期便利：预期哈希全 0 时跳过校验 */
+    int all_zero = 1;
+    for (int i = 0; i < 32; i++) if (expected[i] != 0) { all_zero = 0; break; }
+    if (all_zero) {
+        logl("[login] integrity: expected hash empty (dev mode), skip");
+        return 1;
+    }
+
+    u8 actual[32];
+    sha256_buf(start, len, actual);
+
+    /* 常量时间比较 */
+    u8 diff = 0;
+    for (int i = 0; i < 32; i++) diff |= actual[i] ^ expected[i];
+    if (diff == 0) {
+        logl("[login] integrity: OK");
+        return 1;
+    }
+    logl("[login] integrity: FAIL — code tampered!");
+    return 0;
+}
+
 /* ---- conf parsing ----
  * USER.CONF format (built by FirstInit's build_user_conf, but stored unencrypted
  * on disk for login.elf to parse):
@@ -404,6 +477,14 @@ __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[login] boot");
+
+    /* 防篡改：第一时间校验 .text 段完整性。失败则拒绝继续，立即返回。 */
+    if (!login_verify_integrity()) {
+        logl("[login] integrity check failed, refusing to continue");
+        if (ctx) ((dsk_boot_context *)ctx)->reserved[2] = 0;
+        return;
+    }
+
     logl("[login] calibrating TSC");
     tsc_calibrate_fi();
 

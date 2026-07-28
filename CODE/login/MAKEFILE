@@ -3,6 +3,7 @@ LD := ld.lld
 
 ROOT := ../..
 OUT := $(ROOT)/SYSTEM/system/user/use/login.elf
+PATCHER := $(ROOT)/.build_tmp/patch_login_hash.ps1
 
 CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I../UTSM/include -I../firstInit -O2
 LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
@@ -14,9 +15,12 @@ OBJECTS := $(C_SOURCES:.c=.o)
 
 all: $(OUT)
 
+# 构建后用 patch_login_hash.ps1 计算 .text SHA256 并写入 .hashseg
 $(OUT): $(OBJECTS) linker.ld
 	@if not exist "$(ROOT)\SYSTEM\system\user\use" mkdir "$(ROOT)\SYSTEM\system\user\use"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+	@echo [login] patching .text SHA256 into .hashseg...
+	powershell -NoProfile -ExecutionPolicy Bypass -File $(PATCHER) $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -706,4 +706,266 @@ static inline du_u32 du_theme_accent(du_theme t) {
     return (t == DU_THEME_DARK) ? DS_DARK_ACCENT : DS_LIGHT_ACCENT;
 }
 
+/* ===================================================================
+ *  L0+ — Winux-Kate 调色板 (eDEX-UI Neon Cyber Theme)
+ *
+ *  源自 D:\Code\Winux-Kate\src\styles\theme.css
+ *  风格：深蓝黑底 + 青色霓虹 + 绿色辅助 + 扫描线纹理
+ * =================================================================== */
+
+/* --- 主色调：深空蓝黑 (Deep Space Black) --- */
+#define DP_KATE_BG          0xFF02040Au   /* --bg: #02040a */
+#define DP_KATE_BG2         0xFF050A18u   /* --bg2: #050a18 */
+#define DP_KATE_PANEL       0xB20A1228u   /* --panel: rgba(10,18,40,0.72) 半透明 */
+#define DP_KATE_PANEL_SOLID 0xFF0A1228u   /* 不透明版本（用于无 alpha 混合场景） */
+
+/* --- 强调色：霓虹青 (Neon Cyan) --- */
+#define DP_KATE_ACCENT      0xFF00E5FFu   /* --accent: #00e5ff */
+#define DP_KATE_ACCENT_DIM  0x2E00E5FFu   /* --accent-dim: rgba(0,229,255,0.18) */
+#define DP_KATE_ACCENT_DIM_SOLID 0xFF1A3A4Au  /* 不透明近似 */
+#define DP_KATE_PANEL_BORDER 0x5900E5FFu  /* --panel-border: rgba(0,229,255,0.35) */
+#define DP_KATE_PANEL_BORDER_SOLID 0xFF005A6Au  /* 不透明近似 */
+
+/* --- 辅助色：霓虹绿 (Neon Green) --- */
+#define DP_KATE_ACCENT2     0xFF39FF14u   /* --accent2: #39ff14 */
+
+/* --- 文本色 --- */
+#define DP_KATE_TEXT        0xFFCFEFFBu   /* --text: #cfeffb */
+#define DP_KATE_TEXT_DIM    0xFF6F8AA8u   /* --text-dim: #6f8aa8 */
+
+/* --- 状态色 --- */
+#define DP_KATE_WARN        0xFFFFCC00u   /* --warn: #ffcc00 */
+#define DP_KATE_DANGER      0xFFFF4D6Du   /* --danger: #ff4d6d */
+
+/* ===================================================================
+ *  L1 — Winux-Kate 语义色值
+ * =================================================================== */
+
+#define KS_BG_PRIMARY       DP_KATE_BG
+#define KS_BG_SECONDARY     DP_KATE_PANEL_SOLID
+#define KS_BG_TERTIARY      DP_KATE_BG2
+
+#define KS_TEXT_PRIMARY     DP_KATE_TEXT
+#define KS_TEXT_DIM         DP_KATE_TEXT_DIM
+#define KS_TEXT_INVERT      DP_KATE_BG
+
+#define KS_ACCENT           DP_KATE_ACCENT
+#define KS_ACCENT2          DP_KATE_ACCENT2
+#define KS_ACCENT_DIM       DP_KATE_ACCENT_DIM_SOLID
+
+#define KS_BORDER           DP_KATE_PANEL_BORDER_SOLID
+#define KS_BORDER_FOCUS     DP_KATE_ACCENT
+#define KS_BORDER_DIM       0xFF1A2840u   /* 暗边框 */
+
+#define KS_DANGER           DP_KATE_DANGER
+#define KS_WARN             DP_KATE_WARN
+
+/* ===================================================================
+ *  Winux-Kate 布局常量（源自 theme.css / pages.css）
+ * =================================================================== */
+
+#define KATE_TOPBAR_H       34     /* .topbar height */
+#define KATE_STATUSBAR_H    32     /* .statusbar height */
+#define KATE_TASKBAR_H      40     /* .taskbar height */
+#define KATE_PANEL_HEADER_H 24     /* .panel-header */
+#define KATE_TITLEBAR_H     28     /* 窗口标题栏 */
+#define KATE_ICON_W         104    /* .desktop-icon width */
+#define KATE_ICON_H         90     /* .desktop-icon height (含 label) */
+#define KATE_ICON_IMG       40     /* .di-img / .di-fallback */
+#define KATE_ICON_GAP       18     /* .desktop-grid gap */
+#define KATE_ICON_PAD       24     /* .desktop-canvas padding */
+#define KATE_TB_ITEM_MAX_W  200    /* .tb-item max-width */
+#define KATE_PAGE_PAD       8      /* 页面 padding */
+
+/* ===================================================================
+ *  Winux-Kate 特效函数
+ * =================================================================== */
+
+/* 绘制扫描线纹理（ repeating-linear-gradient 0deg, 3px 周期）
+ * 在指定矩形区域内叠加半透明青色水平细线 */
+static inline void du_kate_scanlines(du_context *ctx, du_i64 x, du_i64 y,
+                                     du_i64 w, du_i64 h) {
+    for (du_i64 ry = 0; ry < h; ry++) {
+        du_i64 yy = y + ry;
+        if (yy < 0 || (du_u64)yy >= ctx->height) continue;  /* 每 3 像素一条线 */
+        du_u32 *line = (du_u32 *)((du_u8 *)ctx->fb + (du_u64)yy * ctx->pitch);
+        for (du_i64 rx = 0; rx < w; rx++) {
+            du_i64 xx = x + rx;
+            if (xx < 0 || (du_u64)xx >= ctx->width) continue;
+            /* 叠加极淡青色（alpha ~0.03 ≈ 8/255）*/
+            du_u32 cur = line[(du_u64)xx];
+            du_u32 b = (cur >> 16) & 0xFF;
+            du_u32 g = (cur >> 8) & 0xFF;
+            du_u32 r = cur & 0xFF;
+            b = (b + 2 < 255) ? b + 2 : 255;
+            g = (g + 4 < 255) ? g + 4 : 255;
+            r = (r + 2 < 255) ? r + 2 : 255;
+            line[(du_u64)xx] = 0xFF000000u | (b << 16) | (g << 8) | r;
+        }
+    }
+}
+
+/* 绘制带光晕的矩形边框（box-shadow 效果）
+ * 外发光：在矩形外围绘制渐变青色光晕 */
+static inline void du_kate_glow_border(du_context *ctx, du_i64 x, du_i64 y,
+                                       du_i64 w, du_i64 h, du_u32 glow_color) {
+    /* 2px 渐变光晕，alpha 混合到实际背景（逐像素读-混合-写） */
+    for (du_i64 i = 2; i >= 1; i--) {
+        du_u32 alpha = (i == 2) ? 50 : 100;
+        /* 上下边 */
+        for (du_i64 c = -i; c < w + i; c++) {
+            du_i64 xt = x + c;
+            du_pixel(ctx, xt, y - i,
+                     du_blend(du_pixel_read(ctx, xt, y - i), glow_color, alpha));
+            du_pixel(ctx, xt, y + h + i - 1,
+                     du_blend(du_pixel_read(ctx, xt, y + h + i - 1), glow_color, alpha));
+        }
+        /* 左右边 */
+        for (du_i64 r = -i; r < h + i; r++) {
+            du_i64 yt = y + r;
+            du_pixel(ctx, x - i, yt,
+                     du_blend(du_pixel_read(ctx, x - i, yt), glow_color, alpha));
+            du_pixel(ctx, x + w + i - 1, yt,
+                     du_blend(du_pixel_read(ctx, x + w + i - 1, yt), glow_color, alpha));
+        }
+    }
+}
+
+/* 绘制 Winux-Kate 面板（.panel 样式）
+ * - 半透明深蓝背景
+ * - 青色边框
+ * - 内外光晕
+ * - 扫描线纹理
+ * - 可选标题栏 */
+static inline void du_kate_panel(du_context *ctx, du_i64 x, du_i64 y,
+                                 du_i64 w, du_i64 h, const char *header) {
+    /* 1. 背景 */
+    du_fill_rounded_rect(ctx, x, y, w, h, KS_BG_SECONDARY, 2);
+    /* 2. 边框 */
+    du_rect_outline(ctx, x, y, w, h, KS_BORDER, 2);
+    /* 3. 外光晕 */
+    du_kate_glow_border(ctx, x, y, w, h, KS_ACCENT);
+    /* 4. 扫描线纹理 */
+    du_kate_scanlines(ctx, x + 1, y + 1, w - 2, h - 2);
+    /* 5. 标题栏 */
+    if (header) {
+        du_fill_rect(ctx, x, y, w, KATE_PANEL_HEADER_H, 0xFF062838u);  /* 深青色标题栏 */
+        du_divider_h(ctx, x, y + KATE_PANEL_HEADER_H, w, KS_BORDER);
+        /* 标题文字：青色，大写，letter-spacing */
+        du_draw_string(ctx, header, x + 10, y + (KATE_PANEL_HEADER_H - DU_ASCII_LINE_H) / 2 + 2,
+                       KS_ACCENT, 0xFF062838u, DU_ASCII_STEP);
+        /* 标题前的小绿点 */
+        du_fill_rect(ctx, x + 4, y + KATE_PANEL_HEADER_H / 2 - 3, 6, 6, KS_ACCENT2);
+    }
+}
+
+/* 绘制 Winux-Kate 顶部栏（.topbar 样式）
+ * - 34px 高
+ * - 渐变背景
+ * - 底部边框
+ * - 品牌名 + 时钟槽位 */
+static inline void du_kate_topbar(du_context *ctx, du_i64 w,
+                                  const char *brand, const char *clock) {
+    /* 渐变背景：左青色微亮 → 右深色 */
+    du_fill_rect_gradient(ctx, 0, 0, w, KATE_TOPBAR_H,
+                          0xFF0A3050u, 0xFF02040Au);
+    /* 底部分隔线 */
+    du_divider_h(ctx, 0, KATE_TOPBAR_H, w, KS_BORDER);
+    /* 品牌名（青色，加粗，letter-spacing 4px）*/
+    if (brand) {
+        du_draw_string(ctx, brand, 12, (KATE_TOPBAR_H - DU_ASCII_LINE_H) / 2 + 1,
+                       KS_ACCENT, 0, DU_ASCII_STEP);
+    }
+    /* 时钟（右侧，绿色）*/
+    if (clock) {
+        du_i64 cl = 0;
+        while (clock[cl]) cl++;
+        du_draw_string(ctx, clock, w - 12 - cl * DU_ASCII_STEP,
+                       (KATE_TOPBAR_H - DU_ASCII_LINE_H) / 2 + 1,
+                       KS_ACCENT2, 0, DU_ASCII_STEP);
+    }
+}
+
+/* 绘制 Winux-Kate 状态栏（.statusbar 样式）
+ * - 32px 高
+ * - 顶部边框
+ * - 半透明青色背景 */
+static inline void du_kate_statusbar(du_context *ctx, du_i64 x, du_i64 y,
+                                     du_i64 w, const char *status_text) {
+    du_fill_rect(ctx, x, y, w, KATE_STATUSBAR_H, 0xFF051828u);
+    du_divider_h(ctx, x, y, w, KS_BORDER);
+    if (status_text) {
+        du_draw_string(ctx, status_text, x + 12,
+                       y + (KATE_STATUSBAR_H - DU_ASCII_LINE_H) / 2 + 1,
+                       KS_TEXT_DIM, 0, DU_ASCII_STEP);
+    }
+}
+
+/* 绘制 Winux-Kate 桌面图标（.desktop-icon 样式）
+ * - 104px 宽
+ * - 40x40 图标区域
+ * - 下方文字标签
+ * - 选中态：青色边框 + 光晕 */
+static inline void du_kate_desktop_icon(du_context *ctx, du_i64 x, du_i64 y,
+                                        const char *label, int selected) {
+    /* 悬停/选中背景 */
+    if (selected) {
+        du_fill_rect(ctx, x, y, KATE_ICON_W, KATE_ICON_H, KS_ACCENT_DIM);
+        du_rect_outline(ctx, x, y, KATE_ICON_W, KATE_ICON_H, KS_ACCENT, 1);
+        du_kate_glow_border(ctx, x, y, KATE_ICON_W, KATE_ICON_H, KS_ACCENT);
+    }
+    /* 图标占位区域（40x40 居中）*/
+    du_i64 ix = x + (KATE_ICON_W - KATE_ICON_IMG) / 2;
+    du_i64 iy = y + 10;
+    du_rect_outline(ctx, ix, iy, KATE_ICON_IMG, KATE_ICON_IMG, KS_BORDER, 1);
+    /* 标签 */
+    if (label) {
+        du_i64 ll = 0;
+        while (label[ll]) ll++;
+        du_i64 lx = x + (KATE_ICON_W - ll * DU_ASCII_STEP) / 2;
+        if (lx < x + 2) lx = x + 2;
+        du_draw_string(ctx, label, lx, y + KATE_ICON_IMG + 18,
+                       KS_TEXT_PRIMARY, 0, DU_ASCII_STEP);
+    }
+}
+
+/* 绘制 Winux-Kate 任务栏项（.tb-item 样式） */
+static inline void du_kate_tb_item(du_context *ctx, du_i64 x, du_i64 y,
+                                   const char *title, int active) {
+    du_i64 tl = 0;
+    while (title[tl]) tl++;
+    du_i64 w = tl * DU_ASCII_STEP + 24;
+    if (w > KATE_TB_ITEM_MAX_W) w = KATE_TB_ITEM_MAX_W;
+
+    du_u32 fg = active ? KS_ACCENT : KS_TEXT_PRIMARY;
+    if (active) {
+        du_fill_rect(ctx, x, y, w, 28, KS_ACCENT_DIM);
+    }
+    du_rect_outline(ctx, x, y, w, 28, KS_BORDER, 1);
+    if (active) {
+        du_kate_glow_border(ctx, x, y, w, 28, KS_ACCENT);
+    }
+    du_draw_string(ctx, title, x + 8, y + (28 - DU_ASCII_LINE_H) / 2 + 1,
+                   fg, 0, DU_ASCII_STEP);
+}
+
+/* 绘制 Winux-Kate 按钮 (.btn 样式) */
+static inline void du_kate_button(du_context *ctx, du_i64 x, du_i64 y,
+                                  du_i64 w, du_i64 h, const char *label,
+                                  int hover) {
+    du_u32 fg = KS_ACCENT;
+    if (hover) {
+        du_fill_rect(ctx, x, y, w, h, KS_ACCENT_DIM);
+    }
+    du_rect_outline(ctx, x, y, w, h, KS_BORDER, 1);
+    if (hover) {
+        du_kate_glow_border(ctx, x, y, w, h, KS_ACCENT);
+    }
+    du_i64 ll = 0;
+    while (label[ll]) ll++;
+    du_i64 lx = x + (w - ll * DU_ASCII_STEP) / 2;
+    du_draw_string(ctx, label, lx, y + (h - DU_ASCII_LINE_H) / 2 + 1,
+                   fg, hover ? KS_ACCENT_DIM : KS_BG_SECONDARY, DU_ASCII_STEP);
+}
+
 #endif /* DESHAB_UI_H */

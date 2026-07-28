@@ -40,8 +40,9 @@ typedef struct {
     u64 kernel_stack_top; u64 reserved[8];
 } da_boot_context;
 
-/* block_read 函数类型 */
-typedef int (*da_block_read_fn)(void *ctx, u64 lba, u32 count, void *buffer);
+/* block 设备函数类型（与 shell/fat32_io.h 一致：u32 index 固定 0） */
+typedef int (*da_block_read_fn)(u32 index, u64 lba, u32 count, void *buffer);
+typedef int (*da_block_write_fn)(u32 index, u64 lba, u32 count, const void *buffer);
 
 /* 应用上下文 — 从 dsk_boot_context 提取的常用数据 */
 typedef struct {
@@ -49,22 +50,27 @@ typedef struct {
     u64 fb_w;          /* 宽度 */
     u64 fb_h;          /* 高度 */
     u64 fb_pitch;      /* 行宽(字节) */
-    da_block_read_fn block_read;
+    da_block_read_fn  block_read;
+    da_block_write_fn block_write;
     const void *kernel_api;
 } da_app_context;
 
-/* 从 dsk_boot_context 初始化 da_app_context */
+/* 从 dsk_boot_context 初始化 da_app_context。
+ * block API 从 kernel_api + 0xA8 获取：read @ +0x10，write @ +0x18。 */
 static inline void da_init(da_app_context *ac, const da_boot_context *ctx) {
     ac->fb = (u32 *)ctx->framebuffer_address;
     ac->fb_w = ctx->framebuffer_width;
     ac->fb_h = ctx->framebuffer_height;
     ac->fb_pitch = ctx->framebuffer_pitch;
     ac->kernel_api = (const void *)ctx->dkm_kernel_api;
-    /* block_read 从 kernel_api + 0xA8 获取 */
+    ac->block_read = 0;
+    ac->block_write = 0;
     u64 api = ctx->dkm_kernel_api;
-    ac->block_read = (da_block_read_fn)*(u64 *)(api + 0xA8);
-    if (ac->block_read)
-        ac->block_read = (da_block_read_fn)*(u64 *)((u64)ac->block_read + 16);
+    u64 blk_api = *(u64 *)(api + 0xA8);
+    if (blk_api) {
+        ac->block_read  = (da_block_read_fn)*(u64 *)(blk_api + 0x10);
+        ac->block_write = (da_block_write_fn)*(u64 *)(blk_api + 0x18);
+    }
 }
 
 /* ========== 帧缓冲绘制 ========== */
@@ -285,10 +291,12 @@ static inline int da_mouse_poll(da_mouse *m, da_cursor *c, i64 fb_w, i64 fb_h) {
     if (m->idx < 3) return 0;
     m->idx = 0;
     if (!(m->buf[0] & 0x08)) return 0;
+    /* PS/2 鼠标包：buf[1]/buf[2] 已是 9 位补码的低 8 位，
+     * (signed char) 强转即可正确符号扩展，无需再依据 buf[0] 的 sign bit 反转。
+     * X 直接相加；Y 需翻转一次（PS/2 Y 向上为正，屏幕 Y 向下为正）。
+     * 与 desktop/main.c:ps2_mouse_poll 保持一致。 */
     int dx = (int)(signed char)m->buf[1];
     int dy = (int)(signed char)m->buf[2];
-    if (m->buf[0] & 0x10) dx = -dx;
-    if (!(m->buf[0] & 0x20)) dy = -dy; else dy = -dy;
     dy = -dy;
     c->mx += dx; c->my += dy;
     if (c->mx < 0) c->mx = 0;

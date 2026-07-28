@@ -66,7 +66,7 @@ static block_write_fn g_block_write;
 static u64 g_tsc_per_ms = 0;
 static u8 g_disk[131072];
 static u8 g_cluster[4096];
-static u8 g_fdata[262144];
+static u8 g_fdata[1048576];
 
 static int fat32_read_sectors(u32 lba, u32 count, u8 *out) { return g_block_read ? g_block_read(0,lba,count,out) : -1; }
 static int fat32_write_sectors(u32 lba, u32 count, const u8 *buf) { return g_block_write ? g_block_write(0,lba,count,buf) : -1; }
@@ -529,7 +529,7 @@ static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
     if (!lc || min_vaddr == ~0ULL) return -4;
     u64 isize = max_vaddr - min_vaddr;
     isize = (isize + 0xFFF) & ~0xFFFULL;
-    /* 加载缓冲:需容纳 shell.elf(~536KB,含 FAT32 读写缓冲 BSS)。1MB 留余量。 */
+    /* 加载缓冲:需容纳 shell.elf(~862KB memsz,含 FAT32 读写缓冲 BSS)。1MB 留余量。 */
     static u8 ibuf[1048576];
     u8 *image = ibuf;
     if (isize > 1048576) return -5;  /* 镜像过大，防止越界 */

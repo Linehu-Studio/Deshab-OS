@@ -1,14 +1,18 @@
 /* Deshab Editor — 全屏文本编辑器
  * PS/2 键盘输入，行号 + 光标 + 垂直滚动。
- * Ctrl+O 打开文件，Ctrl+S 保存（暂不支持），Esc 退出。
+ * Ctrl+O 打开文件（输入 8.3 名，从 FAT32 根目录读取）
+ * Ctrl+S 保存文件（输入 8.3 名，写入 FAT32 根目录）
+ * Esc 退出。
  */
 
 #include "../../firstInit/ascii_bitmaps.c"
 #include "../desktop_app.h"
+#include "../fat32_io.h"
 
 #define CHAR_STEP  12
 #define CHAR_H     18
 #define EDITOR_BUF_SIZE 65536
+#define INPUT_BUF_SIZE  16
 
 static da_app_context g_ac;
 
@@ -21,6 +25,11 @@ static int cursor_col = 0;
 static int modified = 0;
 static char filename[64] = "untitled";
 static int ctrl_down = 0;
+
+/* 输入模式：Ctrl+O/Ctrl+S 时进入，在状态栏输入文件名 */
+static int  input_mode = 0;       /* 0=编辑, 1=open, 2=save */
+static char input_buf[INPUT_BUF_SIZE];
+static int  input_len = 0;
 
 static int line_start(int line) {
     int l = 0;
@@ -45,6 +54,63 @@ static void init_default_text(void) {
         text_buf[text_len++] = *sample++;
     cursor_pos = text_len;
     recalc_cursor();
+}
+
+/* ---- 文件打开/保存 ---- */
+static void do_open(void) {
+    if (input_len == 0) return;
+    char name11[11];
+    if (f32_name_to_83(input_buf, name11) != 0) {
+        da_slog("editor", "open: bad name");
+        return;
+    }
+    u8 *data = 0; u32 size = 0;
+    if (f32_read_root_file(name11, &data, &size) != 0) {
+        da_slog("editor", "open: read failed");
+        return;
+    }
+    if (size > EDITOR_BUF_SIZE) size = EDITOR_BUF_SIZE;
+    text_len = (int)size;
+    for (int i = 0; i < text_len; i++) text_buf[i] = (char)data[i];
+    cursor_pos = 0;
+    modified = 0;
+    /* 更新 filename 显示 */
+    int p = 0;
+    for (int i = 0; i < input_len && p < 60; i++) filename[p++] = input_buf[i];
+    filename[p] = 0;
+    recalc_cursor();
+    da_slog("editor", "open: ok");
+}
+
+static void do_save(void) {
+    if (input_len == 0) return;
+    char name11[11];
+    if (f32_name_to_83(input_buf, name11) != 0) {
+        da_slog("editor", "save: bad name");
+        return;
+    }
+    if (f32_write_root_file(name11, (const u8 *)text_buf, (u32)text_len) != 0) {
+        da_slog("editor", "save: write failed");
+        return;
+    }
+    modified = 0;
+    int p = 0;
+    for (int i = 0; i < input_len && p < 60; i++) filename[p++] = input_buf[i];
+    filename[p] = 0;
+    da_slog("editor", "save: ok");
+}
+
+static void enter_input_mode(int mode) {
+    input_mode = mode;
+    input_len = 0;
+    input_buf[0] = 0;
+}
+
+static void commit_input(void) {
+    int mode = input_mode;
+    input_mode = 0;
+    if (mode == 1) do_open();
+    else if (mode == 2) do_save();
 }
 
 static void redraw_all(void) {
@@ -74,16 +140,13 @@ static void redraw_all(void) {
     for (; pos <= text_len && line < scroll_y + visible_rows; ) {
         if (line >= scroll_y) {
             int screen_y = top_y + (line - scroll_y) * CHAR_H;
-            /* 行号 */
             char ln[8];
             ln[0] = '0' + ((line+1)/100)%10;
             ln[1] = '0' + ((line+1)/10)%10;
             ln[2] = '0' + (line+1)%10;
             ln[3] = 0;
             da_draw_string(&g_ac, ln, margin_x, screen_y, DA_TEXT_DIM, DA_BG_SECONDARY, CHAR_STEP);
-            /* 分隔线 */
             da_fill_rect(&g_ac, margin_x + line_num_w - 2, screen_y, 1, CHAR_H, DA_BORDER);
-            /* 文本 */
             int col = 0;
             while (pos < text_len && text_buf[pos] != '\n' && col < visible_cols) {
                 da_draw_char(&g_ac, text_buf[pos],
@@ -97,25 +160,35 @@ static void redraw_all(void) {
         if (pos < text_len && text_buf[pos] == '\n') pos++;
         line++;
         if (pos >= text_len) {
-            /* 空行也画光标 */
             if (line > cursor_line) break;
         }
     }
 
-    /* 光标 */
-    if (cursor_line >= scroll_y && cursor_line < scroll_y + visible_rows) {
+    /* 光标（编辑模式） */
+    if (!input_mode && cursor_line >= scroll_y && cursor_line < scroll_y + visible_rows) {
         int cy = top_y + (cursor_line - scroll_y) * CHAR_H;
         int cx = text_x + cursor_col * CHAR_STEP;
         da_fill_rect(&g_ac, cx, cy, 2, CHAR_H, DA_ACCENT_LIGHT);
     }
 
     /* 状态栏 */
-    char status[64]; p = 0;
-    const char *s1 = "L:"; while (*s1) status[p++] = *s1++;
-    status[p++] = '0' + (cursor_line+1)/10%10; status[p++] = '0' + (cursor_line+1)%10;
-    const char *s2 = " C:"; while (*s2) status[p++] = *s2++;
-    status[p++] = '0' + (cursor_col+1)/10%10; status[p++] = '0' + (cursor_col+1)%10;
-    if (modified) { const char *m = " *"; while (*m) status[p++] = *m++; }
+    char status[96]; p = 0;
+    if (input_mode) {
+        const char *prompt = (input_mode == 1) ? "Open: " : "Save: ";
+        while (*prompt) status[p++] = *prompt++;
+        for (int i = 0; i < input_len; i++) status[p++] = input_buf[i];
+        status[p++] = '_';
+        const char *hint = "  Enter:confirm  Esc:cancel";
+        while (*hint && p < 95) status[p++] = *hint++;
+    } else {
+        const char *s1 = "L:"; while (*s1) status[p++] = *s1++;
+        status[p++] = '0' + (cursor_line+1)/10%10; status[p++] = '0' + (cursor_line+1)%10;
+        const char *s2 = " C:"; while (*s2) status[p++] = *s2++;
+        status[p++] = '0' + (cursor_col+1)/10%10; status[p++] = '0' + (cursor_col+1)%10;
+        if (modified) { const char *m = " *"; while (*m) status[p++] = *m++; }
+        const char *s3 = "  Ctrl+O:Open  Ctrl+S:Save  Esc:Exit";
+        while (*s3 && p < 95) status[p++] = *s3++;
+    }
     status[p] = 0;
     da_draw_statusbar(&g_ac, status, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
 }
@@ -131,6 +204,7 @@ void dsk_entry(const da_boot_context *ctx) {
     }
 
     da_init(&g_ac, ctx);
+    f32_init((f32_block_read_fn)g_ac.block_read, (f32_block_write_fn)g_ac.block_write);
     init_default_text();
     redraw_all();
 
@@ -148,6 +222,36 @@ void dsk_entry(const da_boot_context *ctx) {
         if (sc == 0x9D) { ctrl_down = 0; continue; }
         if (sc & 0x80) { e0 = 0; continue; }
 
+        /* Esc：输入模式取消 / 编辑模式退出 */
+        if (sc == 0x01 && !e0) {
+            if (input_mode) { input_mode = 0; redraw_all(); continue; }
+            da_slog("editor", "exit");
+            return;
+        }
+
+        /* ---- 输入模式：输入文件名 ---- */
+        if (input_mode) {
+            if (sc == 0x1C) { /* Enter - 确认 */
+                commit_input();
+                redraw_all();
+                continue;
+            }
+            if (sc == 0x0E) { /* Backspace */
+                if (input_len > 0) input_len--;
+                input_buf[input_len] = 0;
+                redraw_all();
+                continue;
+            }
+            char c = da_scan_to_ascii(sc, shift);
+            if (c && c >= 32 && c <= 126 && input_len < INPUT_BUF_SIZE - 1) {
+                input_buf[input_len++] = c;
+                input_buf[input_len] = 0;
+                redraw_all();
+            }
+            continue;
+        }
+
+        /* ---- 编辑模式 ---- */
         /* Esc 退出 */
         if (sc == 0x01 && !e0) { da_slog("editor", "exit"); return; }
 
@@ -212,16 +316,16 @@ void dsk_entry(const da_boot_context *ctx) {
                 modified = 1;
             }
         } else {
-            /* Ctrl+O: 打开文件（提示暂不支持） */
+            /* Ctrl+O: 打开文件 */
             if (ctrl_down && (sc == 0x18)) {
-                /* Ctrl+O - stub */
-                da_slog("editor", "Ctrl+O - open not yet");
+                enter_input_mode(1);
+                redraw_all();
                 continue;
             }
-            /* Ctrl+S: 保存（提示暂不支持） */
+            /* Ctrl+S: 保存文件 */
             if (ctrl_down && (sc == 0x1F)) {
-                da_slog("editor", "Ctrl+S - save not yet");
-                modified = 0;
+                enter_input_mode(2);
+                redraw_all();
                 continue;
             }
             char c = da_scan_to_ascii(sc, shift);

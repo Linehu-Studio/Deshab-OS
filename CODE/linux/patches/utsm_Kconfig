@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# UTSM dual-kernel hypercall driver configuration
+#
+
+config UTSM_HCALL
+	tristate "UTSM dual-kernel hypercall and IPC driver"
+	default y
+	help
+	  This driver enables communication between the Linux guest and
+	  the UTSM monitor kernel in the Deshab dual-kernel architecture.
+
+	  When loaded, it:
+	  - Probes for the UTSM monitor via a VMCALL PING hypercall
+	  - Maps the IPC shared memory ring buffer
+	  - Registers /dev/utsm for userspace IPC message passing
+
+	  If running on bare metal or a non-UTSM hypervisor, the driver
+	  loads in passive mode (no /dev/utsm registered).
+
+	  If unsure, say Y for UTSM guest builds, N otherwise.
+
+config UTSM_EARLY_CONSOLE
+	bool "Redirect kernel printk to UTSM serial console"
+	depends on UTSM_HCALL
+	default n
+	help
+	  Redirects Linux kernel console output to the UTSM monitor's
+	  serial port via UTSM_HCALL_CONSOLE_WRITE hypercalls. Useful
+	  for early boot debugging when the guest's own serial is not
+	  configured.
+
+	  If unsure, say N.

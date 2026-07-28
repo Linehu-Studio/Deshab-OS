@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# UTSM dual-kernel driver Makefile
+#
+
+obj-$(CONFIG_UTSM_HCALL) += utsm_hcall.o
+
+# Include the shared IPC protocol header from CODE/utsm-ipc/
+# This path is set up by build.sh when copying files into the source tree
+ccflags-y += -I$(src)/include

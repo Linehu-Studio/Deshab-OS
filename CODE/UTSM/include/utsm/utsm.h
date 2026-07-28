@@ -9,6 +9,10 @@
 #include <utsm/segment.h>
 #include <utsm/capability.h>
 #include <utsm/utrw.h>
+#include <utsm/vmm.h>
+#include <utsm/linux_loader.h>
+#include <utsm/ipc_shm.h>
+#include <utsm/hypercall.h>
 
 void utsm_init(void);
 int utsm_selftest_run(void);

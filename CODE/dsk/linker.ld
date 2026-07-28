@@ -17,8 +17,10 @@ SECTIONS
         *(.data*)
         *(.data.rel.ro*)
         *(COMMON)
-        *(.bss*)
     } :data
     .rela.dyn : ALIGN(8) { *(.rela.dyn*) } :data
     .dynamic : ALIGN(8) { *(.dynamic*) } :data :dynamic
+    .bss : ALIGN(4K) {
+        *(.bss*)
+    } :data
 }

@@ -5,12 +5,12 @@ OBJCOPY := llvm-objcopy
 ROOT := ../..
 OUT := $(ROOT)/SYSTEM/boot/utsm.elf
 
-CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -Iinclude -O2
-ASFLAGS := -target x86_64-unknown-none -ffreestanding -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Iinclude
+CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -Iinclude -I../utsm-ipc -O2
+ASFLAGS := -target x86_64-unknown-none -ffreestanding -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Iinclude -I../utsm-ipc
 LDFLAGS := -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 
-C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c dkm/*.c test/*.c)
-S_SOURCES := $(wildcard arch/x86_64/*.S)
+C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c dkm/*.c test/*.c vmm/*.c)
+S_SOURCES := $(wildcard arch/x86_64/*.S vmm/*.S)
 OBJECTS := $(C_SOURCES:.c=.o) $(S_SOURCES:.S=.o)
 
 .PHONY: all clean

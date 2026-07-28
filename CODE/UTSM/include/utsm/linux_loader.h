@@ -162,9 +162,12 @@ const struct linux_guest_info *linux_get_guest_info(void);
  * Returns 0 on successful guest termination, negative on error. */
 int linux_launch(void);
 
-/* Default Linux command line (can be overridden). */
+/* Default Linux command line (can be overridden).
+ * nohlt: prevent kernel idle loop from using HLT — only the exec daemon's
+ *        explicit ioctl(PARK) HLT should trigger VM-Exit park, so that
+ *        linux_launch() returns only after the daemon is ready. */
 #define LINUX_DEFAULT_CMDLINE \
     "console=ttyS0,115200 earlyprintk=serial nokaslr " \
-    "no_timer_check loglevel=7"
+    "no_timer_check loglevel=7 nohlt idle=poll"
 
 #endif

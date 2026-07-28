@@ -4,6 +4,8 @@
  */
 
 #include "../UTSM/include/utsm/dsk.h"
+#include "../UTSM/include/utsm/pe.h"
+#include "../UTSM/include/utsm/linux_compat.h"
 
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -72,8 +74,6 @@ static void logl(const char *s) { swrite(s); swrite("\n"); }
 /* ASCII 字体 — 必须在 deshab_ui.h 之前包含，因为 du_draw_char 引用 g_ascii */
 #include "../firstInit/ascii_bitmaps.c"
 #include "../UTSM/include/utsm/deshab_ui.h"
-/* 用户态共享协议栈（ping/curl 内建命令使用） */
-#include "../tools/net_stack.h"
 
 /* ============================================================
  *  Block 设备 + FAT32 读写（移植自 DSK，支持 cp/mv/cat/ls）
@@ -190,16 +190,57 @@ static int fat32_find_in_root(const u8 *clus, u32 clus_sectors, const char *targ
     return -1;
 }
 
-/* 读取根目录下指定 8.3 名文件到 g_fdata。
+/* 在目录簇链中查找名为 name11 的子目录（attr & 0x10），返回首簇号。
+ * dir_clus: 目录起始簇号。返回 0 成功，-1 未找到。 */
+static int fat32_find_dir(u32 dir_clus, const char *name11, u32 *out_clus) {
+    if (sh_disk_load() != 0) return -2;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 spc = bpb->spc;
+    u32 clus = dir_clus;
+    while (clus >= 2 && clus < 0x0FFFFFF8) {
+        u32 lba = data_lba + (clus - 2) * spc;
+        const u8 *cb;
+        if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
+            cb = g_disk + (u64)lba * 512;
+        else {
+            if (sh_read_sectors(lba, 8, g_cluster) != 0) return -4;
+            cb = g_cluster;
+        }
+        const shell_fat32_de *dir = (const shell_fat32_de *)cb;
+        for (u32 e = 0; e * 32 < spc * 512; e++) {
+            if (dir[e].name[0] == 0) goto done_dir;
+            if ((u8)dir[e].name[0] == 0xE5) continue;
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            if (!(dir[e].attr & 0x10)) continue;  /* 只匹配目录 */
+            if (sh_neq11(dir[e].name, name11)) {
+                *out_clus = (u32)sh_r16((const u8*)&dir[e].clow)
+                          | ((u32)sh_r16((const u8*)&dir[e].chigh) << 16);
+                return 0;
+            }
+        }
+        u32 fo = fat_byte_off + clus * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+done_dir:
+    return -1;
+}
+
+/* 从指定目录首簇读取文件到 g_fdata。
+ * dir_clus: 目录起始簇号。name11: 8.3 名。
  * 返回 0 成功，*out_data 指向 g_fdata，*out_size 为字节数；非 0 失败。 */
-static int fat32_read_root_file(const char *name11, u8 **out_data, u32 *out_size) {
+static int fat32_read_file_in_dir(u32 dir_clus, const char *name11,
+                                   u8 **out_data, u32 *out_size) {
     if (sh_disk_load() != 0) return -1;
     const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
     u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
     u32 fat_byte_off = bpb->rsvd * 512;
     u32 spc = bpb->spc;
 
-    u32 clus = bpb->root_clus;
+    u32 clus = dir_clus;
     u32 found_clus = 0, found_size = 0;
     int found = 0;
     while (clus >= 2 && clus < 0x0FFFFFF8 && !found) {
@@ -238,6 +279,37 @@ static int fat32_read_root_file(const char *name11, u8 **out_data, u32 *out_size
         fc = sh_r32(g_disk + fo) & 0x0FFFFFFF;
     }
     *out_data = g_fdata; *out_size = found_size;
+    return 0;
+}
+
+/* 读取根目录下指定 8.3 名文件到 g_fdata。
+ * 返回 0 成功，*out_data 指向 g_fdata，*out_size 为字节数；非 0 失败。 */
+static int fat32_read_root_file(const char *name11, u8 **out_data, u32 *out_size) {
+    if (sh_disk_load() != 0) return -1;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    return fat32_read_file_in_dir(bpb->root_clus, name11, out_data, out_size);
+}
+
+/* /bin 目录首簇号缓存 */
+static u32 g_bin_clus = 0;
+static int g_bin_checked = 0;
+
+/* 获取 /bin 目录首簇号。返回 0 成功，-1 未找到。 */
+static int get_bin_cluster(u32 *out_clus) {
+    if (g_bin_checked) {
+        if (g_bin_clus == 0) return -1;
+        *out_clus = g_bin_clus;
+        return 0;
+    }
+    g_bin_checked = 1;
+    if (sh_disk_load() != 0) { g_bin_clus = 0; return -1; }
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    char bin83[11] = {'B','I','N',' ',' ',' ',' ',' ',' ',' ',' '};
+    if (fat32_find_dir(bpb->root_clus, bin83, &g_bin_clus) != 0) {
+        g_bin_clus = 0;
+        return -1;
+    }
+    *out_clus = g_bin_clus;
     return 0;
 }
 
@@ -804,11 +876,14 @@ static void cmd_help(void) {
     term_puts("  date          显示当前日期\n");
     term_puts("  about         关于 Deshab\n");
     term_puts("  pci           列出 PCI 设备\n");
-    term_puts("  ping [ip]     ICMP echo 测试（缺省网关 10.0.2.2）\n");
-    term_puts("  curl <url>    HTTP GET 请求（http://host[:port]/path）\n");
     term_puts("  run <NAME.ELF> 运行根目录下的工具程序\n");
+    term_puts("  linux <prog> [args] 通过双内核兼容层运行 Linux 程序\n");
     term_puts("  reboot        重启系统\n");
     term_puts("  halt          关机（停止 CPU）\n");
+    term_putc('\n');
+    term_puts_color("外部命令（/bin/ 目录，PATH 自动查找）:\n", DIM_FG);
+    term_puts("  ping          ICMP echo 测试工具\n");
+    term_puts("  curl          HTTP GET 请求工具\n");
 }
 
 static void cmd_version(void) {
@@ -1234,193 +1309,9 @@ static void cmd_pci(void) {
     term_puts_color(tail, DIM_FG);
 }
 
-/* ============================================================
- *  网络命令：ping / curl（共享协议栈 net_stack.h）
- * ============================================================ */
-
 static u64 g_kernel_api = 0;
 static const dsk_boot_context *g_boot_ctx = 0;
-static int g_ns_status = 0;  /* 0=未尝试, 1=就绪, <0=初始化失败 */
-
-static int shell_net_ready(void) {
-    if (g_ns_status == 1) return 1;
-    if (g_ns_status < 0) return 0;
-    int rc = ns_init(g_kernel_api);
-    g_ns_status = (rc == 0) ? 1 : -1;
-    if (rc != 0) {
-        logl("[shell] ns_init failed");
-        term_puts_color("网络初始化失败 (rc=", ERROR_FG);
-        char rcbuf[4];
-        rcbuf[0] = (char)('0' + (-rc % 10));
-        rcbuf[1] = 0;
-        term_puts_color(rcbuf, ERROR_FG);
-        term_puts_color(")，无可用网卡或 net API\n", ERROR_FG);
-        return 0;
-    }
-    logl("[shell] ns_init ok");
-    return 1;
-}
-
-/* ping [a.b.c.d] — 缺省网关 10.0.2.2，4 次 echo */
-static void cmd_ping(const char *args) {
-    u32 ip;
-    if (!args || !*args) {
-        ip = NS_GATEWAY_IP;
-    } else if (ns_parse_ip(args, &ip) != 0) {
-        term_puts_color("用法: ping [a.b.c.d]\n", ERROR_FG);
-        return;
-    }
-    if (!shell_net_ready()) return;
-
-    char ipstr[24];
-    ns_fmt_ip(ip, ipstr);
-    term_puts_color("PING ", PROMPT_FG);
-    term_puts_color(ipstr, ACCENT_FG);
-    term_puts_color(" 32 data bytes\n", DIM_FG);
-
-    int sent = 0, recv = 0;
-    u32 sum = 0, min = 0xFFFFFFFFu, max = 0;
-    for (u16 seq = 1; seq <= 4; seq++) {
-        u32 rtt = 0; u8 ttl = 0;
-        int rc = ns_ping(ip, seq, 2000, &rtt, &ttl);
-        sent++;
-        if (rc == 0) {
-            recv++;
-            sum += rtt;
-            if (rtt < min) min = rtt;
-            if (rtt > max) max = rtt;
-            term_puts("reply from ");
-            term_puts(ipstr);
-            term_puts(": bytes=32 time=");
-            char nb[12]; ns_u32_dec(nb, rtt);
-            term_puts(nb);
-            term_puts("ms TTL=");
-            ns_u32_dec(nb, ttl);
-            term_puts(nb);
-            term_putc('\n');
-        } else if (rc == -1) {
-            term_puts_color("ARP 解析失败，目标不可达\n", ERROR_FG);
-            break;
-        } else {
-            term_puts_color("request timed out\n", DIM_FG);
-        }
-    }
-    /* 统计行 */
-    char nb[12];
-    ns_u32_dec(nb, (u32)sent);
-    term_puts_color("--- ", DIM_FG);
-    term_puts_color(ipstr, DIM_FG);
-    term_puts_color(" ping statistics ---\n  ", DIM_FG);
-    term_puts(nb);
-    term_puts(" transmitted, ");
-    ns_u32_dec(nb, (u32)recv);
-    term_puts(nb);
-    term_puts(" received, ");
-    u32 loss = sent ? (u32)(sent - recv) * 100 / (u32)sent : 100;
-    ns_u32_dec(nb, loss);
-    term_puts(nb);
-    term_puts("% loss");
-    if (recv > 0) {
-        term_puts(", min/avg/max = ");
-        ns_u32_dec(nb, min); term_puts(nb); term_puts("/");
-        ns_u32_dec(nb, sum / (u32)recv); term_puts(nb); term_puts("/");
-        ns_u32_dec(nb, max); term_puts(nb); term_puts(" ms");
-    }
-    term_putc('\n');
-}
-
-/* curl http://host[:port][/path] — HTTP/1.0 GET，打印 status + body */
-static void cmd_curl(const char *args) {
-    if (!args || !*args) {
-        term_puts_color("用法: curl http://host[:port][/path]\n", ERROR_FG);
-        return;
-    }
-    if (!shell_net_ready()) return;
-
-    const char *p = args;
-    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':'&&p[5]=='/'&&p[6]=='/') p += 7;
-
-    char host[128]; int hl = 0;
-    while (*p && *p != ':' && *p != '/' && hl < 127) host[hl++] = *p++;
-    host[hl] = 0;
-    if (!hl) { term_puts_color("curl: 缺少主机名\n", ERROR_FG); return; }
-
-    u16 port = 80;
-    if (*p == ':') {
-        p++;
-        u32 pv = 0; int digits = 0;
-        while (*p >= '0' && *p <= '9') { pv = pv * 10 + (u32)(*p - '0'); p++; digits++; }
-        if (digits && pv <= 65535) port = (u16)pv;
-    }
-    char path[128]; int pl = 0;
-    if (*p == '/') {
-        while (*p && *p != ' ' && pl < 127) path[pl++] = *p++;
-    }
-    if (!pl) { path[0] = '/'; pl = 1; }
-    path[pl] = 0;
-
-    /* 解析主机 */
-    u32 ip;
-    term_puts_color("-> 解析 ", DIM_FG);
-    term_puts_color(host, DIM_FG);
-    term_puts_color("...\n", DIM_FG);
-    if (ns_dns_resolve(host, &ip) != 0) {
-        term_puts_color("curl: DNS 解析失败\n", ERROR_FG);
-        return;
-    }
-    char ipstr[24]; ns_fmt_ip(ip, ipstr);
-    term_puts_color("-> ", DIM_FG);
-    term_puts_color(ipstr, DIM_FG);
-    term_putc('\n');
-
-    /* 连接 */
-    term_puts_color("-> TCP 连接...\n", DIM_FG);
-    if (ns_tcp_connect(ip, port, 2000) != 0) {
-        term_puts_color("curl: TCP 连接失败（超时/RST）\n", ERROR_FG);
-        return;
-    }
-    term_puts_color("-> 已连接，发送请求\n", DIM_FG);
-
-    /* 构造 HTTP/1.0 请求 */
-    static char req[512];
-    int r = 0;
-    const char *m = "GET "; while (*m) req[r++] = *m++;
-    for (int i = 0; i < pl; i++) req[r++] = path[i];
-    m = " HTTP/1.0\r\nHost: "; while (*m) req[r++] = *m++;
-    for (int i = 0; i < hl; i++) req[r++] = host[i];
-    m = "\r\nConnection: close\r\n\r\n"; while (*m) req[r++] = *m++;
-    req[r] = 0;
-
-    if (ns_tcp_send((const u8 *)req, (u32)r) != 0) {
-        term_puts_color("curl: 发送失败\n", ERROR_FG);
-        ns_tcp_close();
-        return;
-    }
-
-    /* 收至 FIN（数据在协议栈 ns_tcp_rx 中累计） */
-    int n = ns_tcp_recv(0, 0, 5000);
-    ns_tcp_close();
-    if (n < 0) {
-        term_puts_color("curl: 连接被重置\n", ERROR_FG);
-        return;
-    }
-    if (n == 0) {
-        term_puts_color("curl: 无响应数据（超时）\n", ERROR_FG);
-        return;
-    }
-
-    /* 打印状态行 + body（截断提示） */
-    u32 total = ns_tcp_rx_len;
-    u32 show = (u32)n;
-    for (u32 i = 0; i < show; i++) term_putc((char)ns_tcp_rx[i]);
-    if (total > show) {
-        term_puts_color("\n[... 已截断，共 ", DIM_FG);
-        char nb[12]; ns_u32_dec(nb, total);
-        term_puts_color(nb, DIM_FG);
-        term_puts_color(" 字节]\n", DIM_FG);
-    }
-    term_putc('\n');
-}
+static const linux_compat_service *g_lxc_svc = 0;
 
 /* ============================================================
  *  run 命令：从 FAT32 根目录加载并跳转 PIE ELF 工具
@@ -1526,6 +1417,185 @@ static void cmd_run(const char *args) {
     term_redraw_all();
 }
 
+/* ============================================================
+ *  PATH 查找：在 /bin 子目录中搜索 name.ELF 并执行
+ *  返回 1 表示找到并已处理（成功或报错），0 表示未找到
+ * ============================================================ */
+static int path_search_and_run(const char *name, const char *args) {
+    (void)args;  /* 参数保留供未来扩展 */
+    if (!g_block_read) return 0;
+
+    /* 构造 "NAME.ELF" → 8.3 名 */
+    char full[64];
+    int nl = 0;
+    while (name[nl] && nl < 55) nl++;
+    int p = 0;
+    for (int i = 0; i < nl; i++) full[p++] = name[i];
+    full[p++] = '.'; full[p++] = 'E'; full[p++] = 'L';
+    full[p++] = 'F'; full[p] = 0;
+    char n83[11];
+    if (name_to_83(full, n83) != 0) return 0;
+
+    /* 获取 /bin 目录首簇 */
+    u32 bin_clus;
+    if (get_bin_cluster(&bin_clus) != 0) return 0;
+
+    /* 从 /bin 子目录读取 ELF */
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_file_in_dir(bin_clus, n83, &data, &size) != 0) return 0;
+
+    /* 加载 ELF */
+    void *entry = 0;
+    int rc = sh_load_elf(data, &entry);
+    if (rc != 0) {
+        term_puts_color(name, ERROR_FG);
+        term_puts_color(": ELF 加载失败\n", ERROR_FG);
+        return 1;
+    }
+
+    /* 执行 */
+    logl("[shell] path: running /bin/ tool");
+    void (*fn_entry)(const dsk_boot_context *) = (void (*)(const dsk_boot_context *))entry;
+    fn_entry(g_boot_ctx);
+    logl("[shell] path: tool returned");
+    g_disk_loaded = 0;
+    term_redraw_all();
+    return 1;
+}
+
+/* ============================================================
+ *  linux 命令：通过双内核兼容层执行 Linux 程序
+ *
+ *  用法:
+ *    linux                显示兼容层状态
+ *    linux <prog> [args]  执行 /bin/<prog>（或完整路径）
+ *    linux ls -la         → 执行 /bin/ls -la
+ *    linux uname -a       → 执行 /bin/uname -a
+ *
+ *  依赖 UTSM+Linux 双内核架构: Linux guest 作为 daemon park 在 VMX
+ *  guest 中,shell 通过 g_lxc_svc->exec 写 IPC 请求并 vmresume 唤醒。
+ * ============================================================ */
+
+/* 简单 token 分词：将 args 按空格切分为 argv[]，返回 argc。
+ * 不支持引号转义（保持与 shell 其余部分一致的简单分词）。 */
+static int split_args(const char *args, char argv[16][64], int max_argc) {
+    int argc = 0;
+    const char *p = args;
+    while (*p && argc < max_argc) {
+        while (*p == ' ') p++;
+        if (*p == 0) break;
+        int len = 0;
+        while (*p && *p != ' ' && len < 63) {
+            argv[argc][len++] = *p++;
+        }
+        argv[argc][len] = 0;
+        argc++;
+    }
+    return argc;
+}
+
+static void cmd_linux(const char *args) {
+    if (!g_lxc_svc) {
+        term_puts_color("linux: 兼容层服务未初始化（boot context 未提供）\n", ERROR_FG);
+        return;
+    }
+    if (!g_lxc_svc->is_available()) {
+        term_puts_color("linux: 兼容层不可用（Linux guest 未驻留或 IPC 未就绪）\n", ERROR_FG);
+        char status[128];
+        g_lxc_svc->status(status, sizeof(status));
+        term_puts_color(status, ERROR_FG);
+        term_putc('\n');
+        return;
+    }
+
+    /* 无参数：显示状态 */
+    while (*args == ' ') args++;
+    if (*args == 0) {
+        term_puts_color("Linux 兼容层已就绪 (双内核 park-and-resume)\n", OK_FG);
+        term_puts_color("用法: linux <程序> [参数...]\n", DIM_FG);
+        term_puts_color("示例: linux ls -la / linux uname -a / linux cat /etc/hostname\n", DIM_FG);
+        return;
+    }
+
+    /* 分词参数 */
+    char argv_buf[16][64];
+    int argc = split_args(args, argv_buf, 16);
+    if (argc == 0) {
+        term_puts_color("linux: 参数解析失败\n", ERROR_FG);
+        return;
+    }
+
+    /* 构造程序路径：
+     *   - 以 '/' 开头视为绝对路径
+     *   - 否则前缀 "/bin/" */
+    char path[160];
+    const char *prog = argv_buf[0];
+    if (prog[0] == '/') {
+        int i = 0;
+        while (prog[i] && i < 159) { path[i] = prog[i]; i++; }
+        path[i] = 0;
+    } else {
+        const char *prefix = "/bin/";
+        int i = 0;
+        while (prefix[i]) { path[i] = prefix[i]; i++; }
+        int j = 0;
+        while (prog[j] && i < 159) { path[i++] = prog[j++]; }
+        path[i] = 0;
+    }
+
+    /* 构造 argv 指针数组（argv[0] = 程序名） */
+    const char *argv_ptrs[16];
+    argv_ptrs[0] = prog;  /* argv[0] 用程序名（不带 /bin/ 前缀） */
+    for (int i = 1; i < argc; i++) argv_ptrs[i] = argv_buf[i];
+
+    /* 执行：stdout 缓冲区 */
+    static char stdout_buf[8192];
+    u64 stdout_len = 0;
+    u64 exit_code = 0;
+
+    logl("[shell] linux: exec ");
+    logl(path);
+    int rc = g_lxc_svc->exec(path, argc, argv_ptrs,
+                             stdout_buf, sizeof(stdout_buf) - 1,
+                             &stdout_len, &exit_code);
+
+    if (rc != 0) {
+        term_puts_color("linux: 执行失败 (code=", ERROR_FG);
+        char num[16];
+        int neg = rc < 0;
+        unsigned int v = neg ? (unsigned int)(-rc) : (unsigned int)rc;
+        int n = 0;
+        if (v == 0) num[n++] = '0';
+        while (v) { num[n++] = '0' + (v % 10); v /= 10; }
+        if (neg) term_putc('-');
+        for (int i = n - 1; i >= 0; i--) term_putc(num[i]);
+        term_puts_color(")\n", ERROR_FG);
+        return;
+    }
+
+    /* 输出 stdout */
+    if (stdout_len > 0) {
+        stdout_buf[stdout_len] = 0;
+        term_puts(stdout_buf);
+        /* 确保末尾换行 */
+        if (stdout_buf[stdout_len - 1] != '\n') {
+            term_putc('\n');
+        }
+    }
+
+    /* 非零退出码提示 */
+    if (exit_code != 0) {
+        term_puts_color("[exit ", DIM_FG);
+        char ec[16];
+        unsigned int ev = (unsigned int)exit_code;
+        int en = 0;
+        if (ev == 0) ec[en++] = '0';
+        while (ev) { ec[en++] = '0' + (ev % 10); ev /= 10; }
+        for (int i = en - 1; i >= 0; i--) term_putc(ec[i]);
+        term_puts_color("]\n", DIM_FG);
+    }
+}
+
 static void execute_command(const char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == 0) return;
@@ -1552,14 +1622,16 @@ static void execute_command(const char *cmd) {
     else if (str_eq(name, "cp")) cmd_cp(args);
     else if (str_eq(name, "mv")) cmd_mv(args);
     else if (str_eq(name, "rm") || str_eq(name, "del")) cmd_rm(args);
-    else if (str_eq(name, "ping")) cmd_ping(args);
-    else if (str_eq(name, "curl")) cmd_curl(args);
     else if (str_eq(name, "run")) cmd_run(args);
+    else if (str_eq(name, "linux")) cmd_linux(args);
     else if (str_eq(name, "cd")) cmd_not_impl("cd");
     else if (str_eq(name, "pwd")) { term_puts("/\n"); }
     else if (str_eq(name, "whoami")) { term_puts("root\n"); }
     else if (str_eq(name, "id")) { term_puts("uid=0(root) gid=0(root)\n"); }
-    else cmd_unknown(name);
+    /* ---- PATH 查找：未匹配内建时搜索 /bin/ ---- */
+    else if (!path_search_and_run(name, args)) {
+        cmd_unknown(name);
+    }
 }
 
 /* ---- CMOS RTC 读取 ---- */
@@ -1721,8 +1793,7 @@ static void run_dev_tests(void) {
     term_puts_color("[10] ls — 确认清理\n", ACCENT_FG);
     cmd_ls();
 
-    term_puts_color("[11] ping 10.0.2.2 — 网络回归（失败不阻断）\n", ACCENT_FG);
-    cmd_ping("10.0.2.2");
+    term_puts_color("[11] ping — 外部命令（/bin/ping.elf），跳过内联测试\n", ACCENT_FG);
 
     term_putc('\n');
     term_puts_color("=== 自动测试完成 ===\n", OK_FG);
@@ -1760,6 +1831,22 @@ void dsk_entry(const dsk_boot_context *ctx) {
     if (g_block_read)  logl("[shell] block_read ok");
     if (g_block_write) logl("[shell] block_write ok");
 
+    /* 获取 Linux 兼容层服务（reserved[5]）—— 双内核 park-and-resume */
+    {
+        u64 lxc_addr = ctx->reserved[5];
+        if (lxc_addr) {
+            const linux_compat_service *lxc = (const linux_compat_service *)lxc_addr;
+            if (lxc->magic == LINUX_COMPAT_MAGIC) {
+                g_lxc_svc = lxc;
+                logl("[shell] linux_compat service ok");
+            } else {
+                logl("[shell] linux_compat magic mismatch");
+            }
+        } else {
+            logl("[shell] linux_compat service not available");
+        }
+    }
+
     /* 初始化风格系统渲染上下文 */
     du_context_init(&g_ctx, fb_a, fb_w, fb_h, fb_p);
 
@@ -1782,9 +1869,13 @@ void dsk_entry(const dsk_boot_context *ctx) {
         run_dev_tests();
     }
 
+    /* 将 banner + dev test 输出刷新到 framebuffer */
+    term_redraw_all();
+
     /* 主循环 */
     int shift = 0;
     int e0 = 0;
+    u64 blink_start = rdtsc_shell();
     for (;;) {
         draw_prompt();
         input_len = 0;
@@ -1793,15 +1884,30 @@ void dsk_entry(const dsk_boot_context *ctx) {
         int prompt_len = 0;
         while (PROMPT[prompt_len]) prompt_len++;
         cur_col = prompt_len;
-        term_redraw_cursor();
+        cur_visible = 1;
+        redraw_input_line();
 
         int cmd_done = 0;
         while (!cmd_done) {
+            /* 光标闪烁：每 ~530ms 切换一次可见性 */
+            if (g_tsc_per_ms) {
+                u64 now = rdtsc_shell();
+                u64 elapsed = now - blink_start;
+                int want_vis = (elapsed / (g_tsc_per_ms * 530)) & 1;
+                if (want_vis != cur_visible) {
+                    if (want_vis) term_redraw_cursor();
+                    else term_clear_cursor();
+                    cur_visible = want_vis;
+                }
+            }
             u8 st = inb(0x64);
             if (!(st & 1)) { __asm__("pause"); continue; }
             u8 data = inb(0x60);
             if (st & 0x20) continue;
             u8 sc = data;
+            /* 有键盘输入时重置闪烁，让光标保持可见 */
+            blink_start = rdtsc_shell();
+            if (!cur_visible) { cur_visible = 1; term_redraw_cursor(); }
             if (sc == 0xE0) { e0 = 1; continue; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }

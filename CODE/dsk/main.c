@@ -207,7 +207,7 @@ static int fat32_find_entry(const u8 *clus, u32 clus_sectors, const char *target
         if (dir[e].attr==0x0F) continue;
         if (dir[e].attr & 0x08) continue;
         if (neq11(dir[e].name, target)) {
-            *out_clus = r16((const u8*)&dir[e].clow);
+            *out_clus = r16((const u8*)&dir[e].clow) | ((u32)r16((const u8*)&dir[e].chigh) << 16);
             *out_size = dir[e].fsize;
             return 0;
         }
@@ -436,10 +436,9 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
         e->ntr = 0; e->ctenth = 0; e->ctime = 0; e->cdate = 0;
         e->adate = 0; e->chigh = (u16)((first_clus >> 16) & 0xFFFF);
         e->wtime = 0; e->wdate = 0; e->clow = (u16)(first_clus & 0xFFFF);
+        e->fsize = size;
     } else {
-        dir[free_entry >= 0 ? (u32)free_entry : 0].chigh = (u16)((first_clus >> 16) & 0xFFFF);
-        dir[free_entry >= 0 ? (u32)free_entry : 0].clow = (u16)(first_clus & 0xFFFF);
-        /* Find the existing entry again to update it */
+        /* 文件已存在：只更新匹配到的条目（不触碰 free_entry！） */
         for (u32 e2 = 0; e2 < max_entries; e2++) {
             if (neq11(dir[e2].name, name11)) {
                 dir[e2].chigh = (u16)((first_clus >> 16) & 0xFFFF);
@@ -447,13 +446,6 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
                 dir[e2].fsize = size;
                 break;
             }
-        }
-    }
-    /* Set file size in the directory entry */
-    for (u32 e2 = 0; e2 < max_entries; e2++) {
-        if (neq11(dir[e2].name, name11)) {
-            dir[e2].fsize = size;
-            break;
         }
     }
 

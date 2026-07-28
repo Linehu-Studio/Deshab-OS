@@ -109,6 +109,17 @@ if [ -d "$INITRAMFS_DIR" ]; then
     # Copy initramfs contents
     cp -a "$INITRAMFS_DIR"/* "$INITRAMFS_TMP"/
 
+    # Build utsm_exec_daemon (static binary for initramfs)
+    DAEMON_SRC="$INITRAMFS_DIR/bin/utsm_exec_daemon.c"
+    if [ -f "$DAEMON_SRC" ]; then
+        echo "[build] Compiling utsm_exec_daemon (static)..."
+        mkdir -p "$INITRAMFS_TMP/bin"
+        cc -static -O2 -Wall -I"$PROJECT_ROOT/CODE/utsm-ipc" \
+            -o "$INITRAMFS_TMP/bin/utsm_exec_daemon" "$DAEMON_SRC"
+        strip "$INITRAMFS_TMP/bin/utsm_exec_daemon" 2>/dev/null || true
+        echo "[build]   daemon: $(du -h "$INITRAMFS_TMP/bin/utsm_exec_daemon" | cut -f1)"
+    fi
+
     # Create init script if not present
     if [ ! -f "$INITRAMFS_TMP/init" ]; then
         cat > "$INITRAMFS_TMP/init" <<'INITEOF'

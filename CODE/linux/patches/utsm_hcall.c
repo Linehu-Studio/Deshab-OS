@@ -23,11 +23,42 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/sched.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
 
 /* Shared IPC protocol header (included via build.sh -I flag) */
 #include <ipc_proto.h>
 
 #define UTSM_DEV_NAME "utsm"
+
+/* ===== Ioctl interface for exec daemon =====
+ *
+ * The exec daemon (userspace) uses these ioctls to:
+ *   1. RECV_MSG: poll utsm_to_linux ring for EXEC_REQUEST (non-blocking)
+ *   2. SEND_MSG: push STDOUT/STDERR/EXIT to linux_to_utsm ring
+ *   3. PARK: execute HLT to trigger VM-Exit → UTSM parks guest,
+ *            returning control to the host. vmresume causes the
+ *            ioctl to return, at which point the daemon re-checks
+ *            the ring for new requests.
+ *
+ * This explicit-park model avoids the need for timer emulation or
+ * IRQ injection: the daemon HLTs only when it has nothing to do,
+ * and UTSM vmresumes only when there is work. */
+
+#define UTSM_IOCTL_RECV_MSG  _IOWR('U', 1, struct utsm_ioctl_msg)
+#define UTSM_IOCTL_SEND_MSG  _IOWR('U', 2, struct utsm_ioctl_msg)
+#define UTSM_IOCTL_PARK      _IO('U', 3)
+#define UTSM_IOCTL_GET_READY _IOR('U', 4, int)
+
+/* Ioctl message wrapper: carries type + data in a single call */
+struct utsm_ioctl_msg {
+    u32 type;          /* message type (in/out) */
+    u32 data_len;      /* actual bytes in data (in/out) */
+    u32 reserved;
+    u32 buf_size;      /* capacity of data buffer (in) */
+    u8  data[UTSM_IPC_MSG_DATA_SIZE]; /* payload */
+};
 
 /* ===== Hypercall ABI =====
  *
@@ -169,10 +200,116 @@ static ssize_t utsm_dev_read(struct file *f, char __user *buf,
 	return (ssize_t)msg.data_len;
 }
 
+/* ===== Ioctl handlers for exec daemon ===== */
+
+static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+    if (!g_shm_mapped)
+        return -ENODEV;
+
+    switch (cmd) {
+    case UTSM_IOCTL_RECV_MSG: {
+        /* Non-blocking dequeue from utsm_to_linux ring */
+        struct utsm_ioctl_msg umsg;
+        struct utsm_ipc_msg msg;
+        int ret;
+
+        if (copy_from_user(&umsg, (void __user *)arg, sizeof(umsg)))
+            return -EFAULT;
+
+        ret = utsm_ipc_ring_pop(&g_shm->utsm_to_linux, &msg);
+        if (ret != 0)
+            return -EAGAIN;  /* ring empty */
+
+        umsg.type = msg.type;
+        umsg.data_len = msg.data_len;
+        if (umsg.buf_size < msg.data_len)
+            return -EINVAL;
+        if (msg.data_len > 0) {
+            if (copy_to_user(umsg.data, msg.data, msg.data_len))
+                return -EFAULT;
+        }
+        if (copy_to_user((void __user *)arg, &umsg, sizeof(umsg)))
+            return -EFAULT;
+        return 0;
+    }
+
+    case UTSM_IOCTL_SEND_MSG: {
+        /* Enqueue to linux_to_utsm ring */
+        struct utsm_ioctl_msg umsg;
+        struct utsm_ipc_msg msg;
+
+        if (copy_from_user(&umsg, (void __user *)arg, sizeof(umsg)))
+            return -EFAULT;
+
+        memset(&msg, 0, sizeof(msg));
+        msg.type = umsg.type;
+        msg.data_len = min_t(u32, umsg.data_len, UTSM_IPC_MSG_DATA_SIZE);
+        if (msg.data_len > 0) {
+            if (copy_from_user(msg.data, umsg.data, msg.data_len))
+                return -EFAULT;
+        }
+
+        if (utsm_ipc_ring_push(&g_shm->linux_to_utsm, &msg) != 0) {
+            pr_warn("[utsm] linux_to_utsm ring full\n");
+            return -EAGAIN;
+        }
+        return 0;
+    }
+
+    case UTSM_IOCTL_PARK: {
+        /* Execute HLT to trigger VM-Exit → UTSM parks guest.
+         * Interrupts must be enabled so that on vmresume the guest
+         * can continue (HLT with interrupts disabled would hang).
+         *
+         * Flow:
+         *   1. daemon calls ioctl(PARK) → driver executes HLT
+         *   2. HLT → VM-Exit (CPU_BASED_HLT_EXITING) → UTSM handle_hlt
+         *   3. UTSM advances RIP past HLT, exits to host (park)
+         *   4. UTSM writes request + vmresume
+         *   5. Guest continues from after HLT → ioctl returns
+         *   6. Daemon re-checks ring for new EXEC_REQUEST
+         */
+        mb();  /* ensure prior ring writes are visible before HLT */
+        asm volatile("hlt" ::: "memory");
+        return 0;
+    }
+
+    case UTSM_IOCTL_GET_READY: {
+        int ready = (g_shm->header.utsm_ready && g_shm->header.linux_ready) ? 1 : 0;
+        if (copy_to_user((void __user *)arg, &ready, sizeof(ready)))
+            return -EFAULT;
+        return 0;
+    }
+
+    default:
+        return -ENOTTY;
+    }
+}
+
+static __poll_t utsm_dev_poll(struct file *f, struct poll_table_struct *wait)
+{
+    __poll_t mask = 0;
+
+    if (!g_shm_mapped)
+        return EPOLLERR;
+
+    /* Report readable if utsm_to_linux ring has messages */
+    if (!utsm_ipc_ring_empty(&g_shm->utsm_to_linux))
+        mask |= EPOLLIN | EPOLLRDNORM;
+
+    /* Always writable (ring push may still fail with -EAGAIN) */
+    mask |= EPOLLOUT | EPOLLWRNORM;
+
+    return mask;
+}
+
 static const struct file_operations utsm_fops = {
-	.owner  = THIS_MODULE,
-	.write  = utsm_dev_write,
-	.read   = utsm_dev_read,
+    .owner          = THIS_MODULE,
+    .write          = utsm_dev_write,
+    .read           = utsm_dev_read,
+    .unlocked_ioctl = utsm_dev_ioctl,
+    .poll           = utsm_dev_poll,
 };
 
 static struct miscdevice utsm_miscdev = {

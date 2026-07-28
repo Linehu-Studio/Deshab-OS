@@ -3,6 +3,8 @@
 #include <utsm/dkm.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/pe.h>
+#include <utsm/linux_compat.h>
 #include "../arch/x86_64/limine.h"
 
 #define DSK_PATH "/system/deshab64/deshab.elf"
@@ -318,6 +320,18 @@ static void dsk_fill_boot_context(dsk_boot_context *ctx) {
     }
     ctx->boot_modules_response = (u64)g_module_request.response;
     ctx->dkm_kernel_api = (u64)dkm_get_kernel_api();
+
+    /* PE 兼容层服务（PE32+ 原生 + PE32 解释器） */
+    const pe_service *pe = pe_get_service();
+    if (pe && pe->magic == PE_SERVICE_MAGIC) {
+        ctx->reserved[4] = (u64)pe;
+    }
+
+    /* Linux 兼容层服务（依赖双内核 park-and-resume + IPC） */
+    const linux_compat_service *lxc = linux_compat_get_service();
+    if (lxc && lxc->magic == LINUX_COMPAT_MAGIC) {
+        ctx->reserved[5] = (u64)lxc;
+    }
 
     u64 rsp;
     __asm__ volatile ("movq %%rsp, %0" : "=r"(rsp));

@@ -67,7 +67,42 @@ enum utsm_ipc_msg_type {
     UTSM_MSG_ACK      = 6,    /* Acknowledgment */
     UTSM_MSG_NACK     = 7,    /* Negative acknowledgment */
     UTSM_MSG_SHUTDOWN = 8,    /* Shutdown notification */
+    /* Linux compat exec protocol (UTSM → Linux → UTSM) */
+    UTSM_MSG_EXEC_REQUEST = 16, /* UTSM→Linux: exec a program (payload=ipc_exec_request) */
+    UTSM_MSG_EXEC_STDOUT  = 17, /* Linux→UTSM: stdout chunk (payload=raw bytes) */
+    UTSM_MSG_EXEC_STDERR  = 18, /* Linux→UTSM: stderr chunk (payload=raw bytes) */
+    UTSM_MSG_EXEC_EXIT    = 19, /* Linux→UTSM: process exited (payload=ipc_exec_exit) */
+    UTSM_MSG_EXEC_READY   = 20, /* Linux→UTSM: daemon ready to accept exec requests */
 };
+
+/* ===== Linux compat exec payload structures =====
+ *
+ * Flow:
+ *   1. UTSM writes UTSM_MSG_EXEC_REQUEST into utsm_to_linux ring,
+ *      then calls linux_resume() to wake the parked Linux guest.
+ *   2. Linux daemon reads the request, fork+exec's the program,
+ *      streams stdout/stderr back via UTSM_MSG_EXEC_STDOUT/STDERR.
+ *   3. Linux daemon writes UTSM_MSG_EXEC_EXIT with exit code, then HLTs (park).
+ *   4. UTSM reads the responses from linux_to_utsm ring, returns to caller.
+ *
+ * All strings are NUL-terminated. argv_blob contains argv[0..argc-1] each
+ * NUL-terminated, concatenated. path is the program path to execute. */
+
+#define UTSM_EXEC_PATH_MAX   128
+#define UTSM_EXEC_ARGV_MAX   96   /* total argv blob size */
+#define UTSM_EXEC_MAX_ARGS   16
+
+struct ipc_exec_request {
+    uint32_t argc;                                   /* number of arguments */
+    uint32_t flags;                                  /* reserved (0) */
+    char     path[UTSM_EXEC_PATH_MAX];               /* program path (NUL-terminated) */
+    char     argv_blob[UTSM_EXEC_ARGV_MAX];          /* argv strings, each NUL-terminated */
+} __attribute__((packed));
+
+struct ipc_exec_exit {
+    uint32_t exit_code;                              /* process exit status */
+    uint32_t reserved;
+} __attribute__((packed));
 
 /* ===== Ring buffer structures ===== */
 

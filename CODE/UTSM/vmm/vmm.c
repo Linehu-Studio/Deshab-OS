@@ -46,6 +46,12 @@ volatile u64 g_saved_return_rip;
 volatile int g_guest_terminated;
 volatile u64 g_last_exit_reason;
 
+/* Linux guest park-and-resume 状态。
+ * g_linux_guest_active: 1 = 当前运行的 guest 是 Linux（HLT 时 park，不终止）
+ * g_guest_parked: 1 = Linux guest 已 HLT 驻留，等待 vmresume 唤醒 */
+volatile int g_linux_guest_active;
+volatile int g_guest_parked;
+
 /* Guest GPR save area (referenced by vmexit_asm.S).
  * VM-Exit 时 CPU 不自动保存 guest GPR，由汇编入口保存到此结构。
  * C 处理器可读写此结构（如 VMCALL 返回值写入 rax）。 */

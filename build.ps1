@@ -603,6 +603,25 @@ if (-not (Test-Path $DesktopOutput)) {
 }
 Write-Host "[build] desktop Output: $DesktopOutput"
 
+# ---------- CMD (Windows-style command line + PE/EXE compat) ----------
+$CmdDir = Join-Path $Root 'CODE\cmd'
+$CmdOutput = Join-Path $SystemDir 'system\deshab64\cmd.elf'
+
+Write-Host '[build] Building cmd.elf...'
+try {
+    & $make -C "$CmdDir" -f MAKEFILE "CC=$clang" "LD=$lld"
+    if ($LASTEXITCODE -ne 0) {
+        throw "make cmd failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+}
+
+if (-not (Test-Path $CmdOutput)) {
+    throw "cmd build did not produce $CmdOutput"
+}
+Write-Host "[build] cmd Output: $CmdOutput"
+
 # ---------- Tool applications ----------
 $ToolsDir = Join-Path $Root 'CODE\tools'
 $ToolsOutDir = Join-Path $SystemDir 'system\deshab64\tools'

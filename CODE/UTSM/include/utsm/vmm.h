@@ -42,6 +42,30 @@ struct vmexit_guest_regs {
  * Non-static: shared between vmm.c, vmexit.c, hypercall.c, and vmexit_asm.S. */
 extern volatile struct vmexit_guest_regs g_guest_regs;
 
+/* ===== Linux guest park-and-resume 状态 =====
+ *
+ * g_linux_guest_active: 1 = 当前运行的 guest 是 Linux guest。
+ *   handle_hlt 检查此标志：Linux guest HLT 时 park（推进 RIP，exit-to-host），
+ *   self-test guest HLT 时 terminate。
+ * g_guest_parked: 1 = Linux guest 已 HLT 驻留，可被 linux_resume() 唤醒。
+ *   linux_compat_service 通过此标志判断 guest 是否就绪。 */
+extern volatile int g_linux_guest_active;
+extern volatile int g_guest_parked;
+
+/* ===== VM-Exit host 恢复点（vmm.c 定义，vmm.c / linux_boot.c / linux_resume.c 共用） =====
+ *
+ * g_saved_host_rsp:   vmlaunch/vmresume 前保存的 host RSP。VM-Exit 处理器
+ *                     终止 guest 时恢复此 RSP 并 jmp 到 g_saved_return_rip。
+ * g_saved_return_rip: vmlaunch/vmresume 后的返回地址（post_guest / post_resume 标签）。
+ * g_guest_terminated: 1 = guest 已终止（不再 vmresume）。dispatch 返回 0 时置位。
+ * g_last_exit_reason: 最近一次 VM-Exit 的 reason（vmexit_asm.S 路径写入）。
+ *
+ * 这些符号必须是非 static 全局变量，因为 vmexit_asm.S 通过 RIP 相对寻址引用。 */
+extern volatile u64 g_saved_host_rsp;
+extern volatile u64 g_saved_return_rip;
+extern volatile int g_guest_terminated;
+extern volatile u64 g_last_exit_reason;
+
 /* ===== VMM API ===== */
 
 /* 初始化 VMM：VMX root 模式 + EPT 表 + 分配 VMCS。

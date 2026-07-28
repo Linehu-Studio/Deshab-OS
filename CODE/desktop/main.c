@@ -3,12 +3,11 @@
  * 布局结构与 D:\Code\Winux-Kate 完全一致：
  *   app-shell
  *   ├── topbar (34px)：品牌 + 工作区切换 + 页面切换 + PG 时钟
- *   ├── page-host
+ *   page-host
  *   │   ├── 1·DASHBOARD：TERM-01 / TERM-02 / EDITOR / FILES 四面板 + StatusBar
  *   │   ├── 2·IDE：标签栏 + 编辑宿主
- *   │   ├── 3·IM：栏 + 分屏槽（未检测卡片）
- *   │   ├── 4·DESKTOP：图标网格 + 窗口 + 任务栏
- *   │   └── 5+/CUSTOM：外部 .elf 全屏宿主（双击启动）
+ *   │   ├── 3·DESKTOP：图标网格 + 窗口 + 任务栏
+ *   │   └── 4+/CUSTOM：外部 .elf 全屏宿主（双击启动）
  *   └── task-view overlay（工作区卡片）
  *
  * 新 UI 特性（Kate 之外）：
@@ -204,6 +203,10 @@ typedef struct {
 static du_context g_fb;
 static u64 g_fb_addr, g_fb_w, g_fb_h, g_fb_pitch;
 static const void *g_kernel_api;
+
+/* 双缓冲：渲染到 sprite buffer，完成后一次性 flip 到真实 framebuffer */
+#define SPRITE_BUF_ADDR 0x7000000ULL          /* 112MB，在 identity-mapped 区域 */
+static u8 *g_real_fb = 0;                     /* 真实 framebuffer 地址 */
 static desktop_block_read_fn  g_block_read;
 static desktop_block_write_fn g_block_write;
 static const dsk_boot_context *g_boot_ctx = 0;
@@ -246,7 +249,7 @@ static int g_icon_count = 0;
 
 /* ---- Kate 外壳状态 ---- */
 static int g_booted = 0;
-static int g_page = 1;                 /* 1..4 内置, 5..8 自定义 */
+static int g_page = 1;                 /* 1..3 内置, 4..8 自定义 */
 static int g_taskview = 0;
 static int g_dash_focus = 0;           /* 0=t1 1=t2 2=ed 3=files */
 
@@ -307,7 +310,6 @@ static int g_ctx_item_ws[MAX_WS + 1];   /* 菜单行 → 真实工作区索引�
 static int g_ide_host[4];
 static int g_ide_tabx[4];              /* IDE 标签 × */
 static int g_ide_new_rect[4];          /* IDE "+ NEW IDE" 按钮 */
-static int g_im_toggle_rect[4];        /* IM bar 切换视图按钮 */
 static int g_cp_host[4];               /* 自定义页宿主 */
 
 /* ============================================================
@@ -511,16 +513,47 @@ static void cursor_draw(int mx, int my) {
     }
 }
 
+/* ---- 双缓冲 flip ---- */
+
+/* 将 sprite buffer 完整复制到真实 framebuffer */
+static void flip_buffer(void) {
+    if (!g_real_fb) return;
+    u64 total = g_fb_h * g_fb_pitch / 4;
+    u32 *dst = (u32 *)g_real_fb;
+    u32 *src = (u32 *)SPRITE_BUF_ADDR;
+    for (u64 i = 0; i < total; i++) dst[i] = src[i];
+}
+
+/* 仅复制指定矩形区域（用于鼠标移动时的局部更新） */
+static void flip_rect(int x, int y, int w, int h) {
+    if (!g_real_fb) return;
+    for (int r = 0; r < h; r++) {
+        int ry = y + r;
+        if (ry < 0 || (u64)ry >= g_fb_h) continue;
+        u32 *dst = (u32 *)(g_real_fb + (u64)ry * g_fb_pitch);
+        u32 *src = (u32 *)((u8 *)SPRITE_BUF_ADDR + (u64)ry * g_fb_pitch);
+        for (int c = 0; c < w; c++) {
+            int rx = x + c;
+            if (rx < 0 || (u64)rx >= g_fb_w) continue;
+            dst[rx] = src[rx];
+        }
+    }
+}
+
 /* 非阻塞延时：动画期间持续轮询鼠标，保持光标响应。 */
+__attribute__((unused))
 static void anim_delay_poll_mouse(u32 ms) {
     for (u32 i = 0; i < ms; i++) {
         for (volatile u32 j = 0; j < 50000; j++) {
             __asm__ volatile("pause");
         }
         if (ps2_mouse_poll()) {
+            int old_x = g_cursor_old_x, old_y = g_cursor_old_y;
             cursor_restore_bg();
+            flip_rect(old_x, old_y, CURSOR_SIZE, CURSOR_SIZE);
             cursor_save_bg(g_mouse_x, g_mouse_y);
             cursor_draw(g_mouse_x, g_mouse_y);
+            flip_rect(g_mouse_x, g_mouse_y, CURSOR_SIZE, CURSOR_SIZE);
         }
     }
 }
@@ -598,28 +631,8 @@ static void win_destroy(desktop_window *w) {
     }
     if (idx < 0) return;
 
-    /* 窗口关闭动画 — 收缩矩形 */
-    {
-        int wx = w->x, wy = w->y, ww = w->w, wh = w->h;
-        int was_cur = (w->ws == g_ws_cur);
-        w->visible = 0;
-        if (was_cur) {
-            for (int step = 5; step >= 0; step--) {
-                int scale = (step + 1) * 100 / 6;
-                int aw = ww * scale / 100;
-                int ah = wh * scale / 100;
-                int ax = wx + (ww - aw) / 2;
-                int ay = wy + (wh - ah) / 2;
-                cursor_restore_bg();
-                redraw_all();
-                cursor_restore_bg();
-                du_rect_outline(&g_fb, ax, ay, aw, ah, KS_ACCENT, DU_RADIUS_SM);
-                cursor_save_bg(g_mouse_x, g_mouse_y);
-                cursor_draw(g_mouse_x, g_mouse_y);
-                anim_delay_poll_mouse(16);
-            }
-        }
-    }
+    /* 直接隐藏窗口（去掉关闭动画以避免卡顿和闪屏） */
+    w->visible = 0;
 
     if (w->app_id >= 0 && w->app_id < g_app_count && g_apps[w->app_id].on_destroy && w->app_state) {
         g_apps[w->app_id].on_destroy(w->app_state);
@@ -977,21 +990,25 @@ static void bash_draw_to(bash_state *s, int cx, int cy, int cw, int ch) {
 }
 
 /* ---- 窗口适配 ---- */
+__attribute__((unused))
 static void *bash_on_create(app_ctx *ctx) {
     bash_state *s = (bash_state *)ADDR_TERMWIN;
     bash_reset(s, ctx->client_w, ctx->client_h);
     bash_puts(s, "Deshab Bash v0.1\nType help for commands\n\n", KS_TEXT_PRIMARY);
     return s;
 }
+__attribute__((unused))
 static void bash_on_event(void *state, app_ctx *ctx, desktop_event *ev) {
     if (ev->type != EV_KEY_DOWN) return;
     bash_key((bash_state *)state, ev->scancode, ev->shift);
     ctx->win->dirty = 1;
 }
+__attribute__((unused))
 static void bash_on_draw(void *state, app_ctx *ctx) {
     bash_draw_to((bash_state *)state, ctx->client_x, ctx->client_y,
                  ctx->client_w, ctx->client_h);
 }
+__attribute__((unused))
 static void bash_on_destroy(void *state) { (void)state; }
 
 /* ============================================================
@@ -1313,27 +1330,34 @@ static void calc_on_destroy(void *state) { (void)state; }
  * ============================================================ */
 
 static void register_apps(void) {
+    /* 命令行1：shell.elf（原生命令行 + 可运行 Linux 程序）*/
     g_apps[0] = (app_descriptor){
-        "bash", "Terminal", 640, 440,
-        bash_on_create, bash_on_event, bash_on_draw, bash_on_destroy, 0
+        "shell", "Terminal", 720, 480,
+        0, 0, 0, 0, "SHELL   ELF"
     };
     g_app_count++;
+    /* 命令行2：cmd.elf（Windows 风格命令行 + PE/EXE 执行）*/
     g_apps[1] = (app_descriptor){
+        "cmd", "CMD", 720, 480,
+        0, 0, 0, 0, "CMD     ELF"
+    };
+    g_app_count++;
+    g_apps[2] = (app_descriptor){
         "editor", "Editor", 600, 450,
         editor_on_create, editor_on_event, editor_on_draw, editor_on_destroy, 0
     };
     g_app_count++;
-    g_apps[2] = (app_descriptor){
+    g_apps[3] = (app_descriptor){
         "fileman", "Files", 500, 400,
         0, 0, 0, 0, "FILEMAN ELF"
     };
     g_app_count++;
-    g_apps[3] = (app_descriptor){
+    g_apps[4] = (app_descriptor){
         "calc", "Calculator", 280, 400,
         calc_on_create, calc_on_event, calc_on_draw, calc_on_destroy, 0
     };
     g_app_count++;
-    g_apps[4] = (app_descriptor){
+    g_apps[5] = (app_descriptor){
         "browser", "Browser", 700, 500,
         0, 0, 0, 0, "BROWSER ELF"
     };
@@ -1510,21 +1534,7 @@ static void launch_app(int app_id) {
     win->app_state = app->on_create(&ctx);
     win->dirty = 1;
 
-    /* 窗口打开动画 — 展开矩形 */
-    for (int step = 0; step < 6; step++) {
-        int scale = (step + 1) * 100 / 6;
-        int aw = win->w * scale / 100;
-        int ah = win->h * scale / 100;
-        int ax = win->x + (win->w - aw) / 2;
-        int ay = win->y + (win->h - ah) / 2;
-        cursor_restore_bg();
-        redraw_all();
-        cursor_restore_bg();
-        du_rect_outline(&g_fb, ax, ay, aw, ah, KS_ACCENT, DU_RADIUS_SM);
-        cursor_save_bg(g_mouse_x, g_mouse_y);
-        cursor_draw(g_mouse_x, g_mouse_y);
-        anim_delay_poll_mouse(16);
-    }
+    /* 直接显示窗口（去掉打开动画以避免卡顿和闪屏） */
 
     slog("app launched");
 }
@@ -1537,6 +1547,16 @@ static int files_list_cb(const char *name, u32 size, u8 attr, void *ud) {
     (void)ud;
     if (attr & 0x10) return 0;                 /* 跳过子目录 */
     if (g_file_count >= MAX_FILES) return 1;   /* 停止 */
+
+    /* 只显示 user 文件：跳过 .ELF 可执行文件和系统模块 */
+    int nl = kstrlen(name);
+    if (nl >= 4 && name[nl-4] == '.' && name[nl-3] == 'E' &&
+        name[nl-2] == 'L' && name[nl-1] == 'F') return 0;
+    /* FIRSTINI* (FirstInit.elf，Name83=FIRSTINIT → 显示名 FIRSTINI.T) */
+    if (nl >= 8 && name[0] == 'F' && name[1] == 'I' && name[2] == 'R' &&
+        name[3] == 'S' && name[4] == 'T' && name[5] == 'I' && name[6] == 'N' &&
+        name[7] == 'I') return 0;
+
     fentry *f = &g_files[g_file_count];
     f->size = size;
     kstrcpy(f->disp, name, 13);
@@ -1614,7 +1634,7 @@ static void draw_centered(const char *s, int cx, int y, u32 fg, u32 bg) {
     du_draw_string(&g_fb, s, cx - l * (int)DU_ASCII_STEP / 2, y, fg, bg, DU_ASCII_STEP);
 }
 
-/* 虚线矩形（ide-host / im-slot / custom host） */
+/* 虚线矩形（ide-host / custom host） */
 static void draw_dashed_rect(int x, int y, int w, int h, u32 color) {
     for (int i = x; i < x + w; i += 8) {
         du_fill_rect(&g_fb, i, y, 4, 1, color);
@@ -1651,6 +1671,7 @@ static void busy_delay(u32 cycles) {
 static void boot_screen(void) {
     int W = (int)g_fb_w, H = (int)g_fb_h;
     du_fill_bg_solid(&g_fb, KS_BG_PRIMARY);
+    flip_buffer();
 
     int lw = 46 * (int)DU_ASCII_STEP;
     int lx = (W - lw) / 2;
@@ -1663,13 +1684,15 @@ static void boot_screen(void) {
         char t[2] = { title[i], 0 };
         du_draw_string(&g_fb, t, W / 2 - tl * (int)DU_ASCII_STEP + i * (int)DU_ASCII_STEP * 2,
                        ty, KS_ACCENT, 0, DU_ASCII_STEP * 2);
-        busy_delay(8000000);
+        flip_buffer();
+        busy_delay(2000000);
     }
     du_divider_h(&g_fb, W / 2 - 120, ty + 30, 240, KS_ACCENT);
 
     /* boot-subtitle（对应 Kate "由 Deaicup 工作室制作"） */
     draw_centered("DEAICUP STUDIO", W / 2, ty + 44, KS_ACCENT2, 0);
-    busy_delay(10000000);
+    flip_buffer();
+    busy_delay(2500000);
 
     /* boot-lines 打字机；进度条固定在全部行下方（对应 Kate .boot-bar） */
     int ly = ty + 76;
@@ -1683,7 +1706,8 @@ static void boot_screen(void) {
             char t[2] = { s[ci], 0 };
             du_draw_string(&g_fb, t, lx + (ci + 1) * (int)DU_ASCII_STEP, ly,
                            fg, 0, DU_ASCII_STEP);
-            busy_delay(500000);
+            flip_buffer();
+            busy_delay(125000);
         }
         ly += (int)DU_ASCII_LINE_H + 2;
         /* boot-bar:渐变填充（accent → accent2） */
@@ -1691,12 +1715,14 @@ static void boot_screen(void) {
         du_rect_outline(&g_fb, W / 2 - bw / 2, bar_y, bw, 6, KS_BORDER, 1);
         if (fill > 2) du_fill_rect_gradient(&g_fb, W / 2 - bw / 2 + 1, bar_y + 1,
                                             fill - 2, 4, KS_ACCENT, KS_ACCENT2);
+        flip_buffer();
     }
 
     /* boot-hint + credit（对应 Kate "SYSTEM ONLINE" + "© 2026 Deaicup Studio"） */
     draw_centered("SYSTEM ONLINE", W / 2, H - 64, KS_ACCENT2, 0);
     draw_centered("(C) 2026 DEAICUP STUDIO", W / 2, H - 40, KS_TEXT_DIM, 0);
-    busy_delay(40000000);
+    flip_buffer();
+    busy_delay(10000000);
 }
 
 /* ============================================================
@@ -1778,8 +1804,8 @@ static void draw_topbar(void) {
     x += 4;
 
     /* 页面切换 */
-    static const char *pg_names[4] = { "1.DASHBOARD", "2.IDE", "3.IM", "4.DESKTOP" };
-    for (int i = 0; i < 4; i++) {
+    static const char *pg_names[3] = { "1.DASHBOARD", "2.IDE", "3.DESKTOP" };
+    for (int i = 0; i < 3; i++) {
         int bw = kstrlen(pg_names[i]) * (int)DU_ASCII_STEP + 16;
         int active = (g_page == i + 1);
         int hover = g_mouse_x >= x && g_mouse_x < x + bw &&
@@ -1816,10 +1842,10 @@ static void draw_topbar(void) {
         du_draw_string(&g_fb, label, x + 6, ty,
                        active ? KS_TEXT_INVERT : KS_TEXT_DIM, 0, DU_ASCII_STEP);
         du_draw_string(&g_fb, "x", x + bw - 14, ty, KS_DANGER, 0, DU_ASCII_STEP);
-        g_pg_rect[4 + i][0] = x; g_pg_rect[4 + i][1] = 5;
-        g_pg_rect[4 + i][2] = bw; g_pg_rect[4 + i][3] = 24;
-        g_pg_rm_rect[4 + i][0] = x + bw - 20; g_pg_rm_rect[4 + i][1] = 5;
-        g_pg_rm_rect[4 + i][2] = 20; g_pg_rm_rect[4 + i][3] = 24;
+        g_pg_rect[3 + i][0] = x; g_pg_rect[3 + i][1] = 5;
+        g_pg_rect[3 + i][2] = bw; g_pg_rect[3 + i][3] = 24;
+        g_pg_rm_rect[3 + i][0] = x + bw - 20; g_pg_rm_rect[3 + i][1] = 5;
+        g_pg_rm_rect[3 + i][2] = 20; g_pg_rm_rect[3 + i][3] = 24;
         x += bw + 6;
     }
     /* pg-add "+" */
@@ -1948,7 +1974,7 @@ static void draw_statusbar_full(void) {
     du_draw_string(&g_fb, "WIFI --", x, ty, KS_TEXT_DIM, 0, DU_ASCII_STEP);
 
     /* 右侧 hint */
-    const char *hint = "Ctrl+Tab PAGE . Ctrl+Shift+Tab CTX";
+    const char *hint = "Ctrl+Tab PAGE";
     du_draw_string(&g_fb, hint, W - 12 - kstrlen(hint) * (int)DU_ASCII_STEP, ty,
                    KS_TEXT_DIM, 0, DU_ASCII_STEP);
 }
@@ -2049,7 +2075,7 @@ static void draw_dashboard(void) {
         du_fill_rect(&g_fb, fx, fy, fw, fh, KS_BG_PRIMARY);
 
         char path_buf[32];
-        kstrcpy(path_buf, "FAT32:/ROOT (", 32);
+        kstrcpy(path_buf, "FAT32:/USER (", 32);
         int pl = kstrlen(path_buf);
         if (g_file_count >= 10) path_buf[pl++] = '0' + (char)(g_file_count / 10);
         path_buf[pl++] = '0' + (char)(g_file_count % 10);
@@ -2167,93 +2193,7 @@ static void draw_ide(void) {
     }
 }
 
-/* ---- 3·IM ---- */
-static int g_im_view = 0;   /* 0=split（WECHAT/QQ） 1=full（WECOM），对应 Kate imView */
-
-/* Kate .missing-card：h2 + p + a.btn 下载按钮 */
-static void draw_missing_card(int sx, int sy, int sw, int sh,
-                              const char *title, const char *desc,
-                              const char *btn) {
-    int cw = 340, ch = 150;
-    int cx = sx + (sw - cw) / 2, cy = sy + (sh - ch) / 2;
-    du_kate_panel(&g_fb, cx, cy, cw, ch, 0);
-    draw_centered(title, sx + sw / 2, cy + 28, KS_ACCENT, 0);
-    draw_centered(desc, sx + sw / 2, cy + 56, KS_TEXT_DIM, 0);
-    /* .btn 下载按钮（视觉复刻，Deshab 无网络安装渠道） */
-    int bw = kstrlen(btn) * (int)DU_ASCII_STEP + 20;
-    int bx = sx + sw / 2 - bw / 2, by = cy + 88;
-    int hover = g_mouse_x >= bx && g_mouse_x < bx + bw &&
-                g_mouse_y >= by && g_mouse_y < by + 22;
-    if (hover) du_fill_rect(&g_fb, bx, by, bw, 22, KS_ACCENT_DIM);
-    du_rect_outline(&g_fb, bx, by, bw, 22, KS_BORDER, 1);
-    du_draw_string(&g_fb, btn, bx + 10, by + 3, KS_ACCENT, 0, DU_ASCII_STEP);
-}
-
-static void draw_im(void) {
-    int W = (int)g_fb_w;
-    int top = KATE_TOPBAR_H;
-
-    /* im-bar（36px）：dot + 视图标签 + page-credit + 切换按钮（margin-left:auto） */
-    du_fill_rect(&g_fb, 0, top, W, 36, 0xFF051828u);
-    du_divider_h(&g_fb, 0, top + 36, W, KS_BORDER);
-    int ty = top + (36 - (int)DU_ASCII_LINE_H) / 2 + 1;
-
-    /* .dot（8×8 accent2 发光点） */
-    du_fill_rect(&g_fb, 12, top + 14, 8, 8, KS_ACCENT2);
-
-    du_draw_string(&g_fb,
-                   g_im_view ? "WECOM FULLSCREEN" : "WECHAT / QQ SPLIT",
-                   28, ty, KS_ACCENT, 0, DU_ASCII_STEP);
-    /* page-credit（对应 Kate "由 Deaicup 工作室制作"） */
-    du_draw_string(&g_fb, "DEAICUP STUDIO",
-                   28 + (g_im_view ? 16 : 17) * (int)DU_ASCII_STEP + 12,
-                   ty + 1, KS_TEXT_DIM, 0, DU_ASCII_STEP);
-
-    /* 切换按钮（对应 Kate im_toggle，Ctrl+Shift+Tab） */
-    {
-        const char *tb = "CTRL+SHIFT+TAB SWITCH";
-        int bw = kstrlen(tb) * (int)DU_ASCII_STEP + 20;
-        int bx = W - 12 - bw;
-        g_im_toggle_rect[0] = bx; g_im_toggle_rect[1] = top + 7;
-        g_im_toggle_rect[2] = bw; g_im_toggle_rect[3] = 22;
-        int hover = g_mouse_x >= bx && g_mouse_x < bx + bw &&
-                    g_mouse_y >= top + 7 && g_mouse_y < top + 29;
-        if (hover) du_fill_rect(&g_fb, bx, top + 7, bw, 22, KS_ACCENT_DIM);
-        du_rect_outline(&g_fb, bx, top + 7, bw, 22, KS_BORDER, 1);
-        du_draw_string(&g_fb, tb, bx + 10, ty, KS_ACCENT, 0, DU_ASCII_STEP);
-    }
-
-    if (g_im_view == 0) {
-        /* im-split 双槽（grid 1fr 1fr, gap/padding 8px） */
-        int pad = 8, gap = 8;
-        int hy = top + 36 + pad;
-        int hh = (int)g_fb_h - hy - pad;
-        int sw = (W - 2 * pad - gap) / 2;
-        for (int i = 0; i < 2; i++) {
-            int sx = pad + i * (sw + gap);
-            draw_dashed_rect(sx, hy, sw, hh, KS_BORDER);
-        }
-        draw_missing_card(pad, hy, sw, hh,
-                          "WECHAT NOT DETECTED",
-                          "IM MODULE NOT AVAILABLE IN DESHAB",
-                          "DOWNLOAD WECHAT");
-        draw_missing_card(pad + sw + gap, hy, sw, hh,
-                          "QQ NOT DETECTED",
-                          "IM MODULE NOT AVAILABLE IN DESHAB",
-                          "DOWNLOAD QQ");
-    } else {
-        /* im-full 单槽（margin 8px） */
-        int hx = 8, hy = top + 36 + 8;
-        int hw = W - 16, hh = (int)g_fb_h - hy - 8;
-        draw_dashed_rect(hx, hy, hw, hh, KS_BORDER);
-        draw_missing_card(hx, hy, hw, hh,
-                          "WECOM NOT DETECTED",
-                          "IM MODULE NOT AVAILABLE IN DESHAB",
-                          "DOWNLOAD WECOM");
-    }
-}
-
-/* ---- 4·DESKTOP ---- */
+/* ---- 3·DESKTOP ---- */
 static void draw_desktop_page(void) {
     /* 图标网格 */
     draw_desktop_icons();
@@ -2610,8 +2550,7 @@ static void redraw_all(void) {
     /* 页面 */
     if (g_page == 1) draw_dashboard();
     else if (g_page == 2) draw_ide();
-    else if (g_page == 3) draw_im();
-    else if (g_page == 4) draw_desktop_page();
+    else if (g_page == 3) draw_desktop_page();
     else {
         int idx = -1;
         for (int i = 0; i < g_cpage_count; i++)
@@ -2672,7 +2611,7 @@ static void ws_close(int id) {
 }
 
 static void page_switch(int p) {
-    if (p < 1 || p > 4 + g_cpage_count) return;
+    if (p < 1 || p > 3 + g_cpage_count) return;
     g_page = p;
 }
 
@@ -2691,7 +2630,7 @@ static void cpage_add(void) {
         for (int i = 0; i < n; i++) cp->name[i] = g_apps[a].display_name[i];
         cp->name[n] = 0;
         for (int i = 0; i < 11; i++) cp->elf11[i] = g_apps[a].elf_name[i];
-        cp->id = 5 + g_cpage_count;
+        cp->id = 4 + g_cpage_count;
         g_cpage_count++;
         g_page = cp->id;
         return;
@@ -2703,7 +2642,7 @@ static void cpage_remove(int idx) {
     int removed_page = g_cpages[idx].id;
     for (int i = idx; i < g_cpage_count - 1; i++) g_cpages[i] = g_cpages[i + 1];
     g_cpage_count--;
-    for (int i = 0; i < g_cpage_count; i++) g_cpages[i].id = 5 + i;
+    for (int i = 0; i < g_cpage_count; i++) g_cpages[i].id = 4 + i;
     if (g_page == removed_page) g_page = 1;
     else if (g_page > removed_page) g_page--;
 }
@@ -2911,9 +2850,9 @@ static int on_left_press(void) {
         for (int i = 0; i < g_ws_count; i++)
             if (rect_hit(g_ws_rect[i], mx, my)) { ws_switch(i); return 1; }
         if (rect_hit(g_wsadd_rect, mx, my)) { ws_create(); return 1; }
-        for (int i = 0; i < 4 + g_cpage_count; i++) {
-            if (i >= 4 && rect_hit(g_pg_rm_rect[i], mx, my)) {
-                cpage_remove(i - 4);
+        for (int i = 0; i < 3 + g_cpage_count; i++) {
+            if (i >= 3 && rect_hit(g_pg_rm_rect[i], mx, my)) {
+                cpage_remove(i - 3);
                 return 1;
             }
             if (rect_hit(g_pg_rect[i], mx, my)) { page_switch(i + 1); return 1; }
@@ -2925,13 +2864,8 @@ static int on_left_press(void) {
     /* 页面内容 */
     if (g_page == 1) return dash_click(mx, my, dbl);
     if (g_page == 2) return ide_click(mx, my, dbl);
-    if (g_page == 3) {
-        /* IM 切换视图按钮（对应 Kate im_toggle） */
-        if (rect_hit(g_im_toggle_rect, mx, my)) { g_im_view ^= 1; return 1; }
-        return 0;
-    }
-    if (g_page == 4) return desktop_click(mx, my, dbl);
-    if (g_page >= 5) {
+    if (g_page == 3) return desktop_click(mx, my, dbl);
+    if (g_page >= 4) {
         int launch = 0;
         if (rect_hit(g_cp_new_rect, mx, my)) launch = 1;
         if (dbl && rect_hit(g_cp_host, mx, my)) launch = 1;
@@ -2954,7 +2888,7 @@ static int on_right_press(void) {
 
     if (g_taskview) { g_taskview = 0; return 1; }
     if (g_ctx_open) { g_ctx_open = 0; return 1; }
-    if (g_page != 4) return 0;
+    if (g_page != 3) return 0;
 
     int tb_y = (int)g_fb_h - KATE_TASKBAR_H;
     if (my >= tb_y) {
@@ -3002,12 +2936,11 @@ static int handle_key(u8 sc) {
     }
     if (g_taskview || g_ctx_open) return 0;   /* 模态期间吞掉按键 */
 
-    /* Ctrl+Tab 切页 / Ctrl+Shift+Tab 上下文菜单（IM 页为切换视图，对应 Kate imView） */
+    /* Ctrl+Tab 切页 / Ctrl+Shift+Tab 上下文菜单（DESKTOP 页） */
     if (g_ctrl && sc == 0x0F) {
         if (g_shift) {
-            if (g_page == 3) { g_im_view ^= 1; return 1; }
             /* Ctrl+Shift+Tab：对当前聚焦窗口打开"移到工作区"菜单 */
-            if (g_page == 4 && win_find(g_focused_win)) {
+            if (g_page == 3 && win_find(g_focused_win)) {
                 g_ctx_win = g_focused_win;
                 g_ctx_x = g_mouse_x; g_ctx_y = g_mouse_y;
                 g_ctx_open = 1;
@@ -3015,7 +2948,7 @@ static int handle_key(u8 sc) {
             }
             return 0;
         }
-        int maxp = 4 + g_cpage_count;
+        int maxp = 3 + g_cpage_count;
         int p = g_page + 1;
         if (p > maxp) p = 1;
         page_switch(p);
@@ -3047,7 +2980,7 @@ static int handle_key(u8 sc) {
         }
         return 0;
     }
-    if (g_page == 4) {
+    if (g_page == 3) {
         desktop_window *fw = win_find(g_focused_win);
         if (fw && fw->ws == g_ws_cur && fw->app_id >= 0 && fw->app_id < g_app_count &&
             g_apps[fw->app_id].on_event && fw->app_state) {
@@ -3095,6 +3028,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
     }
 
     du_context_init(&g_fb, g_fb_addr, g_fb_w, g_fb_h, g_fb_pitch);
+    /* 双缓冲：保存真实 fb，切换到 sprite buffer 渲染 */
+    g_real_fb = (u8 *)g_fb_addr;
+    g_fb.fb = (du_u32 *)SPRITE_BUF_ADDR;
     f32_init(g_block_read, g_block_write);
 
     tsc_calibrate();
@@ -3201,13 +3137,16 @@ void dsk_entry(const dsk_boot_context *ctx) {
         }
 
         if (need_redraw) {
-            cursor_restore_bg();
             redraw_all();
+            flip_buffer();                     /* 全屏 flip：无闪烁 */
         } else if (moved) {
-            /* 仅光标移动：局部更新 */
+            /* 仅光标移动：局部 flip（双缓冲 → 无闪烁） */
+            int old_x = g_cursor_old_x, old_y = g_cursor_old_y;
             cursor_restore_bg();
+            flip_rect(old_x, old_y, CURSOR_SIZE, CURSOR_SIZE);
             cursor_save_bg(g_mouse_x, g_mouse_y);
             cursor_draw(g_mouse_x, g_mouse_y);
+            flip_rect(g_mouse_x, g_mouse_y, CURSOR_SIZE, CURSOR_SIZE);
         }
 
         __asm__("pause");

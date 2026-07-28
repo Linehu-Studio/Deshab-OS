@@ -27,13 +27,9 @@ extern void vmx_vm_exit_handler(void);
 extern int vmexit_dispatch(void);
 extern u64 vmexit_get_count(void);
 
-/* Globals shared with vmexit_asm.S (must match vmm.c) */
-extern volatile u64 g_saved_host_rsp;
-extern volatile u64 g_saved_return_rip;
-extern volatile int g_guest_terminated;
-extern volatile u64 g_last_exit_reason;
-
-/* Host stack for VM-Exit (reuse the one from vmm.c) */
+/* g_saved_host_rsp / g_saved_return_rip / g_guest_terminated /
+ * g_last_exit_reason / g_linux_guest_active / g_guest_parked /
+ * g_guest_regs / g_host_stack 通过 <utsm/vmm.h> 声明（vmm.c 定义）。 */
 extern u8 g_host_stack[8192];
 
 /* CR helpers */
@@ -288,6 +284,8 @@ int linux_launch(void) {
     /* Reset VM-Exit state */
     g_guest_terminated = 0;
     g_last_exit_reason = 0xFFFFFFFFULL;
+    g_linux_guest_active = 1;   /* 标记当前 guest 为 Linux（HLT 时 park） */
+    g_guest_parked = 0;
 
     /* Configure VMCS */
     linux_vmcs_setup_guest_state(gi);
@@ -331,11 +329,14 @@ int linux_launch(void) {
     if (failed) {
         u64 error = vmx_vmcs_read(VMCS_VMX_INSTRUCTION_ERROR);
         log_hex64("[LINUX] vmlaunch failed, error=", error);
+        g_linux_guest_active = 0;
         return -3;
     }
 
-    /* Guest terminated */
-    log_info("[LINUX] guest terminated");
+    /* Guest parked (HLT) — Linux daemon 已驻留，等待 linux_resume() 唤醒 */
+    g_linux_guest_active = 0;   /* 回到 host 上下文，清除 active 标志 */
+    g_guest_parked = 1;         /* 标记 guest 已 park，linux_resume() 可唤醒 */
+    log_info("[LINUX] guest parked (daemon ready)");
     log_hex64("[LINUX] last exit reason=", g_last_exit_reason);
     log_hex64("[LINUX] vmexit count=", vmexit_get_count());
 

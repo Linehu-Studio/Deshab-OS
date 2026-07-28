@@ -23,11 +23,21 @@ static void log_exit_diagnostics(u64 reason, u64 qualification, u64 rip, u64 len
     log_hex64("[VMEXIT] ilen=", len);
 }
 
-/* 处理 HLT：Phase 1.1 自检场景下表示 guest 完成测试，停止 guest。 */
+/* 处理 HLT：
+ * - self-test guest：终止（guest 完成测试）
+ * - Linux guest：park（推进 RIP 越过 HLT，exit-to-host，设 g_guest_parked=1）
+ *   host 调用 linux_resume() 时 vmresume 唤醒 guest 从 HLT 之后继续执行。 */
 static int handle_hlt(u64 rip, u64 instr_len, int *out_resume) {
-    *out_resume = 0;   /* 不 resume，guest 终止 */
-    log_info("[VMEXIT] HLT - guest halted");
-    (void)rip; (void)instr_len;
+    *out_resume = 0;   /* 两种情况都 exit-to-host */
+    if (g_linux_guest_active) {
+        /* Linux guest: park — 推进 RIP 越过 HLT 指令 */
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        g_guest_parked = 1;
+        log_info("[VMEXIT] HLT - Linux guest parked");
+    } else {
+        /* self-test guest: 终止 */
+        log_info("[VMEXIT] HLT - guest halted");
+    }
     return 0;
 }
 

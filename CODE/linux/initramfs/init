@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# init — Linux guest init script for UTSM dual-kernel Linux compat layer.
+#
+# Boot sequence:
+#   1. Mount essential filesystems
+#   2. Load UTSM driver (built-in, /dev/utsm auto-created)
+#   3. Start utsm_exec_daemon (background)
+#   4. Daemon sends EXEC_READY, then HLT (park) → linux_launch() returns to UTSM
+#   5. UTSM proceeds to load DSK; Linux guest stays parked until shell
+#      invokes `linux <prog>` which triggers vmresume.
+#
+# The daemon runs forever, parking between requests. This init script
+# should NOT exit (would panic the kernel); it sleeps indefinitely after
+# starting the daemon so the kernel has a runnable init task.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+# Mount essential filesystems
+mount -t proc none /proc 2>/dev/null
+mount -t sysfs none /sys 2>/dev/null
+mount -t devtmpfs none /dev 2>/dev/null
+
+echo "[utsm-linux] init started"
+echo "[utsm-linux] kernel: $(uname -r)"
+
+# Verify /dev/utsm exists (driver is built-in, should be auto-created)
+if [ ! -e /dev/utsm ]; then
+    echo "[utsm-linux] WARNING: /dev/utsm not found — UTSM driver not loaded"
+fi
+
+# Start the exec daemon in the background.
+# The daemon sends EXEC_READY then HLTs (parks the guest).
+# UTSM's linux_launch() returns after this first HLT.
+echo "[utsm-linux] starting utsm_exec_daemon..."
+/bin/utsm_exec_daemon &
+DAEMON_PID=$!
+echo "[utsm-linux] daemon PID=$DAEMON_PID"
+
+# init must not exit — sleep forever to keep the kernel happy.
+# The daemon handles all UTSM exec requests; init just keeps the
+# root task alive so the kernel doesn't panic.
+echo "[utsm-linux] init: daemon running, entering idle hold"
+while true; do
+    sleep 3600
+done

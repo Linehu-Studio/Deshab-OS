@@ -226,6 +226,104 @@ static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *
     }
 }
 
+/* ---- PS/2 鼠标光标 ---- */
+#define CURSZ 16
+static int g_mouse_x = 400, g_mouse_y = 300;
+static int g_mouse_btn = 0;
+static u32 g_cursor_bg[CURSZ * CURSZ];
+static int g_cursor_saved = 0;
+static int g_cursor_old_x = -1, g_cursor_old_y = -1;
+static u8 g_mouse_buf[3];
+static int g_mouse_idx = 0;
+
+/* 16×16 箭头光标（与 desktop 一致） */
+static const u8 cursor_shape[16][16] = {
+    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0},
+    {1,1,1,1,1,0,1,1,0,0,0,0,0,0,0,0},
+    {1,1,1,0,0,0,1,1,0,0,0,0,0,0,0,0},
+    {1,1,0,0,0,0,0,1,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+};
+
+static void cursor_save_bg(u32 *fb, int mx, int my) {
+    for (int r = 0; r < CURSZ; r++) {
+        for (int c = 0; c < CURSZ; c++) {
+            int x = mx + c, y = my + r;
+            if (x >= 0 && (u64)x < fb_w && y >= 0 && (u64)y < fb_h) {
+                u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+                g_cursor_bg[r * CURSZ + c] = line[x];
+            } else {
+                g_cursor_bg[r * CURSZ + c] = 0;
+            }
+        }
+    }
+    g_cursor_saved = 1;
+    g_cursor_old_x = mx;
+    g_cursor_old_y = my;
+}
+
+static void cursor_restore_bg(u32 *fb) {
+    if (!g_cursor_saved) return;
+    for (int r = 0; r < CURSZ; r++) {
+        for (int c = 0; c < CURSZ; c++) {
+            int x = g_cursor_old_x + c, y = g_cursor_old_y + r;
+            if (x >= 0 && (u64)x < fb_w && y >= 0 && (u64)y < fb_h) {
+                u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+                line[x] = g_cursor_bg[r * CURSZ + c];
+            }
+        }
+    }
+    g_cursor_saved = 0;
+}
+
+static void cursor_draw(u32 *fb, int mx, int my) {
+    u32 fg = ACCENT;
+    for (int r = 0; r < CURSZ; r++) {
+        for (int c = 0; c < CURSZ; c++) {
+            if (!cursor_shape[r][c]) continue;
+            int x = mx + c, y = my + r;
+            if (x >= 0 && (u64)x < fb_w && y >= 0 && (u64)y < fb_h) {
+                u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+                line[x] = fg;
+            }
+        }
+    }
+}
+
+static int ps2_mouse_poll(void) {
+    u8 st = inb(0x64);
+    if (!(st & 1)) return 0;
+    if (!(st & 0x20)) return 0;
+    u8 data = inb(0x60);
+    g_mouse_buf[g_mouse_idx++] = data;
+    if (g_mouse_idx < 3) return 0;
+    g_mouse_idx = 0;
+    if (!(g_mouse_buf[0] & 0x08)) return 0;
+    int dx = (int)(i8)g_mouse_buf[1];
+    int dy = -(int)(i8)g_mouse_buf[2];
+    g_mouse_x += dx;
+    g_mouse_y += dy;
+    if (g_mouse_x < 0) g_mouse_x = 0;
+    if (g_mouse_y < 0) g_mouse_y = 0;
+    if (g_mouse_x >= (int)fb_w - CURSZ) g_mouse_x = (int)fb_w - CURSZ;
+    if (g_mouse_y >= (int)fb_h - CURSZ) g_mouse_y = (int)fb_h - CURSZ;
+    int old_btn = g_mouse_btn;
+    g_mouse_btn = g_mouse_buf[0] & 0x03;
+    if (dx == 0 && dy == 0 && g_mouse_btn == old_btn) return 0;
+    return 1;
+}
+
 /* ---- PS/2 scan code set 1 → ASCII ---- */
 static char scan_to_ascii(u8 sc, int shift) {
     static const char normal[58] = {
@@ -406,6 +504,7 @@ static void draw_login_card(u32 *fb, i64 card_x, i64 card_y, const char *pass, i
     u32 card = CARD_BG;
     u32 sub_fg = 0xFF9098A0;
     /* Background + card */
+    cursor_restore_bg(fb);
     fill_gradient_rect(fb, card_x - 24, card_y - 24, CARD_W + 48, CARD_H + 48);
     draw_card(fb, card_x, card_y, CARD_W, CARD_H, card);
     /* Title */
@@ -432,14 +531,19 @@ static void draw_login_card(u32 *fb, i64 card_x, i64 card_y, const char *pass, i
     /* Bottom hint */
     fb_text(fb, "Enter=login  Esc=skip  Backspace=delete",
             card_x + 40, card_y + CARD_H - 28, DIM_FG, card);
+    cursor_save_bg(fb, g_mouse_x, g_mouse_y);
+    cursor_draw(fb, g_mouse_x, g_mouse_y);
 }
 
 /* Redraw only the password input field (avoids full card redraw on each keystroke) */
 static void redraw_password_only(u32 *fb, i64 card_x, i64 card_y, const char *pass, u32 fg) {
     u32 card = CARD_BG;
     i64 fy = card_y + 240;
+    cursor_restore_bg(fb);
     fill_rect(fb, card_x + 40, fy, CARD_W - 80, 44, card);
     draw_rounded_input(fb, card_x + 40, fy, CARD_W - 80, 44, pass, 1, fg, card, 1);
+    cursor_save_bg(fb, g_mouse_x, g_mouse_y);
+    cursor_draw(fb, g_mouse_x, g_mouse_y);
 }
 
 /* ---- verify password against stored hash or encrypted conf ----
@@ -562,15 +666,26 @@ void dsk_entry(const dsk_boot_context *ctx) {
     /* Draw initial UI */
     draw_login_card(fb, card_x, card_y, pass, 1, msg, msg_color, fg);
 
+    /* 初始鼠标光标 */
+    cursor_save_bg(fb, g_mouse_x, g_mouse_y);
+    cursor_draw(fb, g_mouse_x, g_mouse_y);
+
     /* Input loop */
     int shift = 0;
     int release = 0;
     for (;;) {
+        /* 鼠标轮询：处理鼠标移动并更新光标 */
+        if (ps2_mouse_poll()) {
+            cursor_restore_bg(fb);
+            cursor_save_bg(fb, g_mouse_x, g_mouse_y);
+            cursor_draw(fb, g_mouse_x, g_mouse_y);
+        }
+
         u8 st = inb(0x64);
         if (!(st & 1)) { __asm__("pause"); continue; }
+        /* 跳过鼠标数据（由 ps2_mouse_poll 处理） */
+        if (st & 0x20) { inb(0x60); continue; }
         u8 data = inb(0x60);
-        /* Skip mouse data (bit 5 of status) */
-        if (st & 0x20) continue;
 
         u8 sc = data;
         /* Handle extended (E0) sequences — ignore (no arrow keys needed for login) */

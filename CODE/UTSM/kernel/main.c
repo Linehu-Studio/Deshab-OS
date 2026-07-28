@@ -8,6 +8,7 @@
 #include <utsm/block.h>
 #include <utsm/net.h>
 #include <utsm/ipc_shm.h>
+#include <utsm/linux_compat.h>
 
 void arch_halt_forever(void);
 
@@ -71,7 +72,10 @@ void kernel_main(void) {
 
                     int lin_st = linux_launch();
                     if (lin_st == 0) {
-                        log_info("[UTSM] Linux guest terminated");
+                        log_info("[UTSM] Linux guest parked (daemon ready)");
+                        /* Phase 3.2: 初始化 Linux 兼容层服务
+                         * （需在 linux_launch 成功 + guest park 后调用） */
+                        linux_compat_init();
                     } else {
                         log_error("[UTSM] Linux launch failed");
                         log_hex64("[UTSM] Linux st=", (u64)(i64)lin_st);

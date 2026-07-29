@@ -81,11 +81,85 @@ static u64 vmx_required_cr4(void) {
     return read_cr4() | CR4_VMXE | CR4_PAE | CR4_PGE;
 }
 
+/* Check whether we are running under a hypervisor that does NOT support
+ * nested VMX. This covers:
+ *   - WHPX: CPUID may report VMX but VMXON/CR4.VMXE causes fatal exit
+ *   - Any hypervisor without nested virtualization support
+ *
+ * Detection strategy:
+ *   1. Check CPUID.01H:ECX[31] (hypervisor present bit)
+ *   2. If hypervisor present, check CPUID.40000000H for vendor signature
+ *   3. Try reading IA32_VMX_BASIC MSR — if it returns 0, VMX is not real
+ *   4. Check Hyper-V specific: HV_CPU_MANAGEMENT_FEATURES for nested VMX
+ *
+ * If VMX CPUID flag is set but we're under a hypervisor that doesn't expose
+ * real VMX MSRs, we must not attempt CR4.VMXE or VMXON, as this will cause
+ * a fatal VM exit in WHPX (exit code 4).
+ */
+static int vmx_truly_available(void) {
+    /* Step 1: If CPUID doesn't even report VMX, definitely not available */
+    if (!vmx_supported()) return 0;
+
+    /* Step 2: Check if running under a hypervisor */
+    u32 eax, ebx, ecx, edx;
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    if (!(ecx & (1U << 31))) {
+        /* No hypervisor — bare metal, VMX should work */
+        return 1;
+    }
+    log_info("[VMX] hypervisor present bit set, checking nested VMX support");
+
+    /* Step 3: Try reading IA32_VMX_BASIC — if it's zero or faults,
+     * the hypervisor doesn't expose real VMX. */
+    /* We use a safe read: if the MSR doesn't exist, rdmsr would #GP.
+     * However, under WHPX, IA32_VMX_BASIC may return a non-zero value
+     * even though VMXON will fail. So we need another check. */
+
+    /* Step 4: Check hypervisor vendor for nested VMX support */
+    cpuid(0x40000000, &eax, &ebx, &ecx, &edx);
+
+    /* Check for Hyper-V ("Microsoft Hv") */
+    if (ebx == 0x7263694DU && ecx == 0x666F736FU && edx == 0x76482074U) {
+        log_info("[VMX] Hyper-V detected");
+        /* Check if HV_CPU_MANAGEMENT_FEATURES (MSR 0x4000000F) exists.
+         * Hyper-V CPUID leaf 0x40000003 tells us which MSRs are available.
+         * Partition_privileges bit 1 (nested virtualization) is at EBX bit 1
+         * of CPUID 0x40000000 + 3 = 0x40000003.
+         * But safer: just check the max CPUID leaf for Hyper-V. */
+        u32 hv_max_leaf = eax;
+        if (hv_max_leaf >= 0x40000003) {
+            /* CPUID 0x40000003 EBX bit 1 = AccessIntrCtrl (nested) */
+            cpuid(0x40000003, &eax, &ebx, &ecx, &edx);
+            if (ebx & (1U << 1)) {
+                log_info("[VMX] Hyper-V nested virtualization supported");
+                return 1;
+            }
+        }
+        log_warn("[VMX] Hyper-V WITHOUT nested VMX support");
+        log_warn("[VMX] CR4.VMXE / VMXON would cause fatal exit, skipping");
+        return 0;
+    }
+
+    /* Check for KVM ("KVMKVMKVM") */
+    if (ebx == 0x4B4D564BU && ecx == 0x564B4D56U && edx == 0x4D564B4DU) {
+        log_info("[VMX] KVM detected — nested VMX may be available");
+        /* KVM typically supports nested VMX if enabled */
+        return 1;
+    }
+
+    /* Unknown hypervisor — be conservative: skip VMX to avoid
+     * fatal exits. The user must explicitly enable nested VMX on
+     * their hypervisor for Linux compat to work. */
+    log_warn("[VMX] unknown hypervisor, VMX may not be truly available");
+    log_warn("[VMX] skipping VMX init to avoid potential fatal exit");
+    return 0;
+}
+
 int vmx_enable(void) {
     if (g_vmx_enabled) return 0;
 
-    if (!vmx_supported()) {
-        log_error("[VMX] CPU does not support VMX");
+    if (!vmx_truly_available()) {
+        log_warn("[VMX] VMX not truly available, skipping VMX init");
         return -1;
     }
 

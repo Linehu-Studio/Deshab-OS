@@ -27,7 +27,9 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 
-/* Shared IPC protocol header (included via build.sh -I flag) */
+/* Shared IPC protocol header (included via build.sh -I flag).
+ * We provide our own hypercall wrappers, so skip the inline ones. */
+#define UTSM_NO_INLINE_HCALL
 #include <ipc_proto.h>
 
 #define UTSM_DEV_NAME "utsm"
@@ -382,7 +384,7 @@ static int __init utsm_hcall_init(void)
 	/* 3. Query shared memory info */
 	ret = utsm_hcall_shm_info(&shm_gpa, &shm_size);
 	if (ret != 0) {
-		pr_err("[utsm] SHM_INFO hypercall failed: %ld\n", ret);
+		pr_err("[utsm] SHM_INFO hypercall failed: %d\n", ret);
 		goto err_no_shm;
 	}
 

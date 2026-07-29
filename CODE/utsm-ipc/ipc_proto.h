@@ -20,7 +20,19 @@
  *   0x04002040: payload pool (for large data transfers)
  */
 
+/* Kernel-space uses kernel types, user-space uses <stdint.h>.
+ * UTSM kernel defines __UTSM_KERNEL__, Linux kernel auto-defines __KERNEL__. */
+#if defined(__KERNEL__)
+#include <linux/types.h>
+/* Linux kernel uses __u32/__u64/__u8; map to stdint names for shared structs */
+typedef __u8  uint8_t;
+typedef __u32 uint32_t;
+typedef __u64 uint64_t;
+#elif defined(__UTSM_KERNEL__)
+#include <utsm/types.h>
+#else
 #include <stdint.h>
+#endif
 
 /* ===== Constants ===== */
 
@@ -227,9 +239,14 @@ static inline int utsm_ipc_ring_full(const struct utsm_ipc_ring *ring) {
  *   RAX = return value (UTSM_HCALL_OK or error)
  *
  * The magic in RAX distinguishes UTSM hypercalls from other VMCALL users.
+ *
+ * Define UTSM_NO_INLINE_HCALL before including this header if you provide
+ * your own hypercall wrapper implementations (e.g. Linux utsm_hcall.c).
  */
 
 #define UTSM_HCALL_MAGIC        0x5554534D48430000ULL  /* "UTSMHC\00\00" */
+
+#ifndef UTSM_NO_INLINE_HCALL
 
 static inline long utsm_hcall(uint64_t op, uint64_t a0, uint64_t a1, uint64_t a2) {
     long ret;
@@ -262,5 +279,7 @@ static inline long utsm_hcall_shm_info(uint64_t *gpa_out, uint64_t *size_out) {
 static inline long utsm_hcall_console_write(const char *buf, uint64_t len) {
     return utsm_hcall(UTSM_HCALL_CONSOLE_WRITE, (uint64_t)buf, len, 0);
 }
+
+#endif /* UTSM_NO_INLINE_HCALL */
 
 #endif /* UTSM_IPC_PROTO_H */

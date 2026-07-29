@@ -43,7 +43,11 @@ if not defined OVMF (
 
 REM ===== Accelerator selection =====
 REM QEMU_ACCEL env var can override: "whpx" / "tcg"
-REM Default: try WHPX first (for VMX/Linux compat), fallback to TCG if unavailable
+REM Default: WHPX for performance; TCG as fallback.
+REM NOTE: WHPX does NOT support nested VMX. CPUID reports vmx but VMXON
+REM       causes a fatal hypervisor exit. When QEMU_ACCEL=whpx, we disable
+REM       the VMX CPUID flag so UTSM gracefully skips VMX init.
+REM       Set QEMU_ACCEL=tcg for full software emulation (also no VMX).
 if not defined QEMU_ACCEL set "QEMU_ACCEL=whpx"
 
 REM Detect whether Linux compat layer is enabled (bzImage present in IMG)
@@ -53,44 +57,38 @@ if not errorlevel 1 (
     set "LINUX_ENABLED=1"
 )
 
+REM Build CPU model string: disable VMX under WHPX (no nested virtualization)
+set "QEMU_CPU=qemu64"
+if "%QEMU_ACCEL%"=="whpx" (
+    set "QEMU_CPU=qemu64,-vmx"
+)
+
 echo [qemu] Using: %QEMU%
 echo [qemu] UEFI:  %OVMF%
 echo [qemu] Image: %IMG%
 echo [qemu] Accel: %QEMU_ACCEL%
+echo [qemu] CPU:   %QEMU_CPU%
 if "%LINUX_ENABLED%"=="1" (
-    echo [qemu] Linux compat: ENABLED (requires WHPX or real hardware for VMX)
-    echo [qemu]   If VMX unavailable, UTSM will auto-skip Linux and continue to DSK
+    echo [qemu] Linux compat: ENABLED (modules present)
+    if "%QEMU_ACCEL%"=="whpx" (
+        echo [qemu]   WARNING: WHPX does not support nested VMX
+        echo [qemu]   Linux guest will NOT run under WHPX; VMX CPUID flag disabled
+        echo [qemu]   Use QEMU_ACCEL=tcg or run on real hardware for VMX support
+    ) else if "%QEMU_ACCEL%"=="tcg" (
+        echo [qemu]   WARNING: TCG does not support VMX
+        echo [qemu]   Linux guest will NOT run under TCG
+    ) else (
+        echo [qemu]   VMX may be available for Linux guest
+    )
 ) else (
     echo [qemu] Linux compat: disabled (build via CODE/linux/build.sh to enable)
 )
 if exist "%SATA_IMG%" (
     echo [qemu] SATA:  %SATA_IMG%
-    "%QEMU%" ^
-        -accel %QEMU_ACCEL% ^
-        -machine q35 ^
-        -m 512M ^
-        -cpu qemu64 ^
-        -serial stdio ^
-        -drive if=pflash,format=raw,readonly=on,file="%OVMF%" ^
-        -drive format=raw,file="%IMG%",if=virtio ^
-        -drive id=sata0,format=raw,file="%SATA_IMG%",if=none ^
-        -device ide-hd,drive=sata0,bus=ide.0 ^
-        -netdev user,id=net0 ^
-        -device e1000,netdev=net0,mac=52:54:00:12:34:56 ^
-        -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 512M -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" -drive format=raw,file="%IMG%",if=virtio -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
 ) else (
     echo [qemu] SATA image not found, booting without block device
-    "%QEMU%" ^
-        -accel %QEMU_ACCEL% ^
-        -machine q35 ^
-        -m 512M ^
-        -cpu qemu64 ^
-        -serial stdio ^
-        -drive if=pflash,format=raw,readonly=on,file="%OVMF%" ^
-        -drive format=raw,file="%IMG%",if=virtio ^
-        -netdev user,id=net0 ^
-        -device e1000,netdev=net0 ^
-        -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 512M -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" -drive format=raw,file="%IMG%",if=virtio -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on
 )
 
 endlocal

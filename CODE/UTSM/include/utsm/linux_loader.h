@@ -135,9 +135,10 @@ struct linux_setup_header {
 
 #define VIRTIO_MMIO_BLK_GPA     (VIRTIO_MMIO_GPA_BASE + 0 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4000000 */
 #define VIRTIO_MMIO_NET_GPA     (VIRTIO_MMIO_GPA_BASE + 1 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4001000 */
+#define VIRTIO_MMIO_ROOTFS_GPA  (VIRTIO_MMIO_GPA_BASE + 2 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4002000 */
 
 /* 判断 GPA 是否落在 virtio-mmio 设备区（含两端） */
-#define VIRTIO_MMIO_GPA_END     (VIRTIO_MMIO_GPA_BASE + 2 * VIRTIO_MMIO_GPA_STRIDE)
+#define VIRTIO_MMIO_GPA_END     (VIRTIO_MMIO_GPA_BASE + 3 * VIRTIO_MMIO_GPA_STRIDE)
 #define IS_VIRTIO_MMIO_GPA(gpa) ((gpa) >= VIRTIO_MMIO_GPA_BASE && (gpa) < VIRTIO_MMIO_GPA_END)
 
 /* ===== Linux loader API ===== */
@@ -161,6 +162,10 @@ struct linux_guest_info {
  * Returns pointer to the module data, or NULL if not found.
  * Sets *size_out to the module size. */
 void *linux_find_bzimage_module(u64 *size_out);
+
+/* Find the Arch rootfs image boot module (path contains "rootfs").
+ * Exposed to Linux guest via memory-backed virtio-blk as /dev/vdb. */
+void *linux_find_rootfs_module(u64 *size_out);
 
 /* Parse bzImage header and extract key parameters.
  * Returns 0 on success, negative on error. */
@@ -194,6 +199,7 @@ int linux_launch(void);
     "no_timer_check loglevel=7 nohlt idle=poll " \
     "noapic nolapic nosmp " \
     "virtio_mmio.device=4K@0xF4000000:5 " \
-    "virtio_mmio.device=4K@0xF4001000:6"
+    "virtio_mmio.device=4K@0xF4001000:6 " \
+    "virtio_mmio.device=4K@0xF4002000:7"
 
 #endif

@@ -21,6 +21,7 @@
 #include <utsm/ept.h>
 #include <utsm/vmm.h>
 #include <utsm/ipc_shm.h>
+#include <utsm/linux_compat.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <ipc_proto.h>
@@ -179,6 +180,80 @@ static long hcall_console_read(u64 a0, u64 a1, u64 a2) {
     return UTSM_HCALL_NOSYS;
 }
 
+/* ===== Phase 3: Linux guest ↔ UTSM FAT32 file transfer =====
+ *
+ * payload_pool at offset 0 is the bulk data buffer. ABI details are
+ * documented in ipc_proto.h ("Linux ↔ UTSM FAT32 hypercalls").
+ *
+ * Return packing for FILE_READ (positive RAX):
+ *   low 20 bits = staged byte count (pool capacity < 1MB → fits)
+ *   RAX >> 20   = total file size (FAT32 root files ≤ 256KB → fits) */
+
+/* Read a NUL-terminated file name (max 63 chars) from guest memory. */
+static int hcall_read_name(u64 gpa, char out[64]) {
+    if (guest_read_buf(gpa, out, 64) != 0) return -1;
+    out[63] = '\0';
+    return 0;
+}
+
+/* Map lxc_f32_* error codes to hypercall return codes. */
+static long hcall_f32_err(int rc) {
+    if (rc == -10) return UTSM_HCALL_INVAL;  /* illegal file name */
+    if (rc == -11) return UTSM_HCALL_NOENT;  /* not found */
+    if (rc == -9)  return UTSM_HCALL_IO;     /* no block device */
+    return UTSM_HCALL_IO;
+}
+
+static long hcall_file_read(u64 a0, u64 a1, u64 a2) {
+    /* a0 = name GPA, a1 = file offset, a2 = max bytes to stage */
+    if (a0 == 0) return UTSM_HCALL_INVAL;
+
+    char name[64];
+    if (hcall_read_name(a0, name) != 0) return UTSM_HCALL_INVAL;
+
+    u8 *fdata = (u8 *)0;
+    u32 fsize = 0;
+    int rc = lxc_f32_read_file(name, &fdata, &fsize);
+    if (rc != 0) return hcall_f32_err(rc);
+
+    u64 cap = ipc_shm_payload_capacity();
+    u64 want = a2;
+    if (want > cap) want = cap;
+
+    u64 n = 0;
+    if (a1 < (u64)fsize) {
+        n = (u64)fsize - a1;
+        if (n > want) n = want;
+    }
+
+    if (n > 0) {
+        u8 *pool = (u8 *)ipc_shm_payload_ptr(0);
+        if (!pool) return UTSM_HCALL_NOMEM;
+        for (u64 i = 0; i < n; i++) pool[i] = fdata[a1 + i];
+    }
+
+    return (long)(((u64)fsize << 20) | n);
+}
+
+static long hcall_file_write(u64 a0, u64 a1, u64 a2) {
+    /* a0 = name GPA, a1 = reserved (0), a2 = bytes staged at pool[0] */
+    (void)a1;
+    if (a0 == 0) return UTSM_HCALL_INVAL;
+    if (a2 > ipc_shm_payload_capacity() || a2 > 262144) {
+        return UTSM_HCALL_INVAL;   /* fat32_io 单文件上限 256KB */
+    }
+
+    char name[64];
+    if (hcall_read_name(a0, name) != 0) return UTSM_HCALL_INVAL;
+
+    const u8 *pool = (const u8 *)ipc_shm_payload_ptr(0);
+    if (!pool && a2 > 0) return UTSM_HCALL_NOMEM;
+
+    int rc = lxc_f32_write_file(name, pool, (u32)a2);
+    if (rc != 0) return hcall_f32_err(rc);
+    return (long)a2;
+}
+
 /* ===== Main hypercall dispatcher ===== */
 
 int hypercall_handle(u64 guest_rax, u64 guest_rdi, u64 guest_rsi, u64 guest_rdx,
@@ -226,6 +301,12 @@ int hypercall_handle(u64 guest_rax, u64 guest_rdi, u64 guest_rsi, u64 guest_rdx,
         break;
     case UTSM_HCALL_CONSOLE_READ:
         result = hcall_console_read(guest_rdi, guest_rsi, guest_rdx);
+        break;
+    case UTSM_HCALL_FILE_READ:
+        result = hcall_file_read(guest_rdi, guest_rsi, guest_rdx);
+        break;
+    case UTSM_HCALL_FILE_WRITE:
+        result = hcall_file_write(guest_rdi, guest_rsi, guest_rdx);
         break;
     default:
         log_hex64("[HCALL] unknown op: ", op);

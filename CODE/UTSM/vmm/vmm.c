@@ -402,6 +402,10 @@ int vmm_init(void) {
 
     g_vmm_ready = 1;
     log_info("[VMM] init ok");
+
+    /* 真机支持检查：INVVPID/INVEPT */
+    ept_check_vpid_support();
+
     return 0;
 }
 

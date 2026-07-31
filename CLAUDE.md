@@ -55,6 +55,10 @@ DMP
 PCKC
     Per-CPU Key Cache
     每 CPU 密钥缓存
+
+FUCK
+    内核启动配置文件
+    INI 分区格式，控制启动行为/驱动开关/算法参数/桌面行为
 ```
 
 ## 关键设计约束
@@ -80,6 +84,15 @@ SYSTEM/
 
 SYSTEM/driver/manifest.json
     内核启动驱动模块清单，控制 ELF .drv 驱动的分阶段加载。
+
+SYSTEM/system/deshab64/FUCK
+    内核启动配置文件（INI 分区格式），控制启动行为开关、驱动加载开关、UTSM 算法参数、DSK 桌面行为。
+    UTSM 通过 Limine boot module 预加载读取（cmdline="fuck:config")。
+    DSK 通过 FAT32 子目录遍历读取（路径 "SYSTEM  /DESHAB64 /FUCK    ")。
+    缺失或为空时使用硬编码默认值，行为与无配置文件时一致。
+
+CODE/UTSM/kernel/ini_parser.h / ini_parser.c
+    UTSM INI 配置解析器，支持分区格式解析、key/value 查询、整型和布尔值便捷获取。
 
 CODE/DKM/README.md
     DKM 驱动模块系统说明，记录驱动加载目标、ABI、loader、状态机和实现清单。
@@ -150,5 +163,56 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 4. **网络数据路径**: 在 DMA/IRQ 完成后推进 e1000 RX/TX ring 与 virtio-net feature negotiation/virtqueue/RX-TX。
 5. **VFS 与真实块设备接入**: 将 FAT32 从测试镜像迁移到 AHCI/NVMe block provider，完善挂载、读取、目录遍历和错误路径。
 6. **DKM 工程化收尾**: 统一驱动本地 ABI 头、清理 warning、补充自动化 QEMU 场景（e1000/virtio-net/nvme/ahci）。
-7. **FirstInit 完善**: 修复按键崩溃（fb_text 优化问题）、实现鼠标光标移动、user.conf 写盘（需 block write API）、网络配置界面。
-8. **鼠标输入驱动**: 从 mouseInit stub 升级为完整 PS/2 鼠标 IRQ12 + 包解码 + 光标移动。
+7. **FirstInit 完善**: ~~修复按键崩溃（fb_text 优化问题）~~（B6 已验证未复现）、~~实现鼠标光标移动~~（M1 已完成）、~~user.conf 写盘~~（已完成）、网络配置界面。
+8. ~~**鼠标输入驱动**: 从 mouseInit stub 升级为完整 PS/2 鼠标 IRQ12 + 包解码 + 光标移动~~（M1 已完成）。
+
+## M1 里程碑完成状态（2026-07-29）
+
+### 任务 A: B6 FirstInit 按键崩溃修复
+**状态**: [RESOLVED-NOT-REPRODUCIBLE]
+
+**验证结果**: 
+- QEMU 复现测试完成，系统完整运行 FirstInit 流程无崩溃
+- 按键扫描码处理正常，字段输入正确（测试序列: a, b, Enter, shift+comma, Enter, 1, 2, Enter）
+- user.conf 成功写入磁盘，firstInit.txt 成功更新为 "1"
+- 系统继续加载 desktop
+
+**证据**: `.build_tmp/qemu_serial_b6.log` 串口日志，调试记录 `debug-firstinit-key-crash.md`
+
+**结论**: B6 崩溃在当前构建中未复现，可能已在之前的修改中修复，或崩溃条件较特殊未触发。
+
+### 任务 B: PS/2 鼠标完整实现
+**状态**: [COMPLETED]
+
+**实现内容**:
+1. **完整初始化序列** (`CODE/mouse/main.c`):
+   - ps2_drain() 冲刷控制器残留数据
+   - 读配置字节 → 启用 AUX 时钟/IRQ/翻译 → 写回
+   - 启用 AUX 端口
+   - 复位鼠标 → 验证 ACK/自检/设备 ID
+   - Set Defaults → 采样率 100 → 分辨率 2 → 启用数据报告
+   - 全程超时保护（100000 次），单步失败只记日志继续
+
+2. **IRQ12 中断处理**:
+   - 经 kernel_api.irq_register 注册 IRQ12 handler
+   - 读数据前检查 AUX 位（键盘数据留给键盘路径）
+   - 3 字节包解码：同步位验证、溢出检测、9 位有符号位移合成
+   - 坐标累计并钳位到 framebuffer 边界
+   - 安全不变式：注册但不解屏蔽 PIC，DSK 阶段 IF=0
+
+3. **共享状态接口**:
+   - `mouse_state_t` 结构体（magic/version/x/y/buttons/计数器/边界）
+   - `g_mouse_state` 导出全局符号
+   - `mouse_poll_state()` 只读快照查询接口
+
+**验证结果**:
+- mouseInit 初始化成功：`cfg byte=0x47`, `data reporting enabled`, `IRQ12 handler registered`
+- FirstInit 中鼠标轮询正常：AUX 端口启用、复位、自检、流模式启用成功
+- 鼠标数据包正确接收和解码（串口日志显示 "[mouse] pkt"）
+
+**证据**: `.build_tmp/qemu_serial_mouse.log` 串口日志
+
+**技术要点**:
+- 严格遵守"任何单步失败只记日志继续执行，绝不阻塞或崩溃首次启动"准则
+- handler 存活性结论：镜像会被后续模块覆盖，IRQ12 保持屏蔽避免野指针执行
+- 后续集成路径：DKM 输入驱动 或 DSK 加载器增加"常驻"标志

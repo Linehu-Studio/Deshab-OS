@@ -8,6 +8,7 @@
 #include <utsm/dma.h>
 #include <utsm/linux_loader.h>
 #include <utsm/virtio_mmio.h>
+#include <utsm/instr.h>
 #include "../arch/x86_64/limine.h"
 
 /* VM-Exit 处理器：从 VMCS 读取 exit reason 与 guest 状态，分发处理。
@@ -35,6 +36,17 @@ extern u64  serial_tsc_per_ms(void);
 extern void serial_putc(char c);
 
 static u64 g_vmexit_count;
+
+/* ---- 插桩: VM-Exit 统计计数器 (热路径，仅 STAT_INC) ---- */
+INSTR_STAT_DECL(vmexit_total);
+INSTR_STAT_DECL(ept_violation);
+INSTR_STAT_DECL(ext_irq);
+INSTR_STAT_DECL(cpuid_exit);
+INSTR_STAT_DECL(io_exit);
+INSTR_STAT_DECL(intr_window);
+INSTR_STAT_DECL(preempt_timer);
+INSTR_STAT_DECL(msr_exit);
+INSTR_STAT_DECL(pre_resume);
 
 static void log_exit_diagnostics(u64 reason, u64 qualification, u64 rip, u64 len) {
     log_hex64("[VMEXIT] reason=", reason);
@@ -473,11 +485,14 @@ int vmx_preemption_timer_supported(void) {
 
 /* 每次 vmresume 前调用（vmexit_dispatch resume=1 路径末尾）。
  * 重新 arm preemption timer（1ms 周期 exit），轮询 host 串口 RX，
- * 推进 PIT tick，注入 pending IRQ。 */
+ * 推进 PIT tick，注入 pending IRQ。
+ * 同时轮询 virtio-net RX：guest 投满 RX buffer 后不再 notify，
+ * host 网卡收到的包靠这里周期性填充并注入 IRQ6。 */
 static void vmexit_before_resume(void) {
     if (!g_linux_guest_active) return;
     vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum_1ms());
     poll_host_serial_to_guest();
+    virtio_net_poll();
     pit_tick_update();
     maybe_inject_irq();
 }
@@ -677,36 +692,70 @@ int vmexit_dispatch(void) {
     int resume = 0;
 
     g_vmexit_count++;
+    INSTR_STAT_INC(vmexit_total);
 
     switch (reason) {
     case EXIT_HLT:
         handle_hlt(rip, instr_len, &resume);
         break;
     case EXIT_EPT_VIOLATION:
+        INSTR_STAT_INC(ept_violation);
         handle_ept_violation(qualification, rip, &resume);
         break;
     case EXIT_EPT_MISCONFIG:
         /* MMIO 区域权限配置错误或硬件 EPT 表损坏。诊断后终止。 */
+        INSTR_PROBE(EPTM, vmx_vmcs_read(VMCS_GUEST_PHYSICAL_ADDR), rip, 0, 0);
         log_error("[VMEXIT] EPT misconfig");
         log_hex64("[VMEXIT] gpa=", vmx_vmcs_read(VMCS_GUEST_PHYSICAL_ADDR));
         resume = 0;
         break;
     case EXIT_EXCEPTION_NMI:
+        INSTR_PROBE(EXCP, qualification, rip, 0, 0);
         handle_exception(qualification, rip, &resume);
         break;
     case EXIT_TRIPLE_FAULT:
+        INSTR_PROBE(EXCP, 0, rip, 0, 0);
         log_error("[VMEXIT] triple fault");
         resume = 0;
         break;
+    case EXIT_EXTERNAL_INTERRUPT:
+        INSTR_STAT_INC(ext_irq);
+        /* 外部中断到达 host（真机比 QEMU 更频繁触发）。
+         * 当前 UTSM 不处理 host 外部中断（依赖 PIC/IDT），
+         * 直接 resume guest。真机上此 exit 由 PIN_EXT_INTERRUPT_EXITING
+         * 触发，不应终止 guest。 */
+        resume = 1;
+        break;
+    case EXIT_INIT_SIGNAL:
+        /* INIT 信号在 VMX root 下被阻断，但 non-root 会 exit。
+         * 真机 BSP 向 AP 发 INIT-IPI-SIPI 时可能触发。
+         * 吞掉：不执行 INIT，直接 resume。 */
+        resume = 1;
+        break;
+    case EXIT_INVD:
+        /* INVD（cache flush）：吞掉，直接 resume。 */
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        resume = 1;
+        break;
+    case EXIT_MONITOR:
+    case EXIT_MWAIT:
+        /* MONITOR/MWAIT：在 noapic 模式下 Linux 不会主动使用，
+         * 但某些驱动路径可能触发。直接 resume。 */
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        resume = 1;
+        break;
     case EXIT_CPUID:
+        INSTR_STAT_INC(cpuid_exit);
         /* host passthrough + 屏蔽 VMX/hypervisor 位（handle_cpuid 内推进 RIP） */
         handle_cpuid(rip, instr_len, &resume);
         break;
     case EXIT_IO_INSTRUCTION:
+        INSTR_STAT_INC(io_exit);
         /* legacy 设备模拟：COM1 UART / PIC / PIT / 其余端口吞掉 */
         handle_io(qualification, rip, instr_len, &resume);
         break;
     case EXIT_INTERRUPT_WINDOW:
+        INSTR_STAT_INC(intr_window);
         /* guest 刚开中断（RFLAGS.IF=1）：尝试注入 pending IRQ */
         {
             u64 cpu = vmx_vmcs_read(VMCS_CPU_BASED_VM_EXEC_CONTROL);
@@ -717,16 +766,90 @@ int vmexit_dispatch(void) {
         }
         break;
     case EXIT_VMX_PREEMPTION_TIMER:
+        INSTR_STAT_INC(preempt_timer);
         /* 1ms 周期 exit：resume 前由 vmexit_before_resume 统一
          * 轮询 host 串口 RX / 推进 PIT tick / 注入 pending IRQ */
         resume = 1;
         break;
     case EXIT_RDMSR:
-    case EXIT_WRMSR:
+    case EXIT_WRMSR: {
+        INSTR_STAT_INC(msr_exit);
+        /* 真机 MSR 访问比 QEMU 严格得多。Linux guest 会访问许多 MSR：
+         *   - IA32_MISC_ENABLE (0x1A0): QEMU 忽略，真机需要返回合理值
+         *   - IA32_APIC_BASE (0x1B): APIC base 地址
+         *   - IA32_TSC_AUX (0xC0000103): RDTSCP auxiliary
+         *   - IA32_FS_BASE/GS_BASE (0xC0000100/1): 已由 VMCS 管理
+         *   - IA32_KERNEL_GS_BASE (0xC0000102): swapgs 目标
+         *   - IA32_BNDCFGS (0xD90): MPX bound config（某些 Intel 有）
+         * 当前策略：直接 passthrough host MSR 值（读），或忽略写。
+         * 注意：WRMSR 写入某些 MSR 可能影响 host，需要白名单保护。
+         */
+        u64 msr = g_guest_regs.rcx & 0xFFFFFFFFULL;
+        if (reason == EXIT_RDMSR) {
+            u64 val = 0;
+            /* 白名单：允许读取的 MSR（passthrough host 值） */
+            int allowed = 0;
+            /* 通用允许列表 */
+            if (msr == 0x1A0 ||   /* IA32_MISC_ENABLE */
+                msr == 0x1B   ||  /* IA32_APIC_BASE */
+                msr == 0xC0000100 || /* IA32_FS_BASE */
+                msr == 0xC0000101 || /* IA32_GS_BASE */
+                msr == 0xC0000102 || /* IA32_KERNEL_GS_BASE */
+                msr == 0xC0000103 || /* IA32_TSC_AUX */
+                msr == 0xD90  ||    /* IA32_BNDCFGS */
+                msr == 0x3A  ||     /* IA32_FEATURE_CONTROL */
+                msr == 0x8B  ||     /* IA32_BIOS_SIGN (microcode) */
+                msr == 0x17  ||     /* IA32_PLATFORM_ID */
+                msr == 0x4B  ||     /* IA32_UCODE_REV (some CPUs) */
+                msr == 0xCE  ||     /* IA32_PLATFORM_INFO */
+                msr == 0x198 ||     /* IA32_PERF_STATUS */
+                msr == 0x199 ||     /* IA32_PERF_CTL */
+                msr == 0x1AD ||     /* IA32_THREAD_FEEDBACK_CHAR (Raptor Lake) */
+                msr == 0x1AE ||     /* IA32_CORE_THREAD_COUNT */
+                (msr >= 0x0 && msr <= 0x1F) || /* Basic CPUID MSRs */
+                (msr >= 0x30 && msr <= 0x3F) || /* PMC MSRs */
+                (msr >= 0x186 && msr <= 0x18F) || /* Perf MSRs */
+                (msr >= 0xC0000000 && msr <= 0xC0000103) /* SYSENTER/EFER etc */
+            ) {
+                allowed = 1;
+            }
+            if (allowed) {
+                /* 安全读取：用 rdmsr 可能 #GP，用 try-catch 模式 */
+                __asm__ volatile(
+                    "1: rdmsr\n"
+                    "   jmp 2f\n"
+                    ".section .text\n"
+                    "2:\n"
+                    : "=a"(((u32*)&val)[0]), "=d"(((u32*)&val)[1])
+                    : "c"(msr)
+                );
+            }
+            g_guest_regs.rax = val & 0xFFFFFFFFULL;
+            g_guest_regs.rdx = (val >> 32) & 0xFFFFFFFFULL;
+        } else {
+            /* WRMSR：白名单保护，防止 guest 修改 host MSR */
+            int allowed = 0;
+            if (msr == 0xC0000100 || /* IA32_FS_BASE — VMCS 管理，忽略 */
+                msr == 0xC0000101 || /* IA32_GS_BASE — VMCS 管理，忽略 */
+                msr == 0xC0000102 || /* IA32_KERNEL_GS_BASE — 可安全 passthrough */
+                msr == 0xC0000103 || /* IA32_TSC_AUX */
+                msr == 0x1B   ||     /* IA32_APIC_BASE — 忽略（guest noapic） */
+                msr == 0xD90  ||     /* IA32_BNDCFGS — 忽略 */
+                msr == 0x199       /* IA32_PERF_CTL — 忽略 */
+            ) {
+                allowed = 1;
+            }
+            /* 不允许的写直接吞掉 */
+            if (!allowed) {
+                log_hex64("[VMEXIT] WRMSR blocked msr=", msr);
+            }
+        }
         vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
         resume = 1;
         break;
+    }
     case EXIT_VMCALL:
+        INSTR_PROBE(HCALL, g_guest_regs.rax, g_guest_regs.rdi, g_guest_regs.rsi, rip);
         /* VMCALL hypercall: read guest GPRs from g_guest_regs (saved by
          * vmexit_asm.S), dispatch to the hypercall handler, and write
          * the return value into g_guest_regs.rax. The handler also
@@ -750,6 +873,7 @@ int vmexit_dispatch(void) {
     /* resume 前例行工作：arm preemption timer + host 串口 RX 轮询 +
      * PIT tick 推进 + pending IRQ 注入（仅 Linux guest active 时） */
     if (resume) {
+        INSTR_STAT_INC(pre_resume);
         vmexit_before_resume();
     }
     return resume;

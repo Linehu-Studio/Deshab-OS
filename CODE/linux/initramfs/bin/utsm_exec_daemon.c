@@ -23,9 +23,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 /* Shared IPC protocol — must match UTSM side */
 #include "../../../utsm-ipc/ipc_proto.h"
@@ -35,6 +37,8 @@
 #define UTSM_IOCTL_SEND_MSG  _IOWR('U', 2, struct utsm_ioctl_msg)
 #define UTSM_IOCTL_PARK      _IO('U', 3)
 #define UTSM_IOCTL_GET_READY _IOR('U', 4, int)
+#define UTSM_IOCTL_WRITE_POOL _IOW('U', 5, struct utsm_ioctl_pool)
+#define UTSM_IOCTL_READ_POOL  _IOWR('U', 6, struct utsm_ioctl_pool)
 
 struct utsm_ioctl_msg {
     unsigned int type;
@@ -42,6 +46,13 @@ struct utsm_ioctl_msg {
     unsigned int reserved;
     unsigned int buf_size;
     unsigned char data[UTSM_IPC_MSG_DATA_SIZE];
+};
+
+/* Pool transfer descriptor — must match utsm_hcall.c driver */
+struct utsm_ioctl_pool {
+    unsigned int offset;
+    unsigned int len;
+    unsigned long long user_buf;
 };
 
 static int g_utsm_fd = -1;
@@ -75,6 +86,14 @@ static int recv_msg(struct utsm_ioctl_msg *umsg)
 static int park(void)
 {
     return ioctl(g_utsm_fd, UTSM_IOCTL_PARK);
+}
+
+/* Best-effort write to the child's stderr (exec failure path);
+ * the result is intentionally ignored. */
+static void err_write(const char *s, unsigned int len)
+{
+    ssize_t n = write(STDERR_FILENO, s, len);
+    (void)n;
 }
 
 /* ===== Exec request handler =====
@@ -138,13 +157,13 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         execv(req->path, argv);
         /* execv only returns on failure */
         const char *err1 = "utsm_exec_daemon: exec failed: ";
-        write(STDERR_FILENO, err1, strlen(err1));
-        write(STDERR_FILENO, req->path, strnlen(req->path, UTSM_EXEC_PATH_MAX));
+        err_write(err1, (unsigned int)strlen(err1));
+        err_write(req->path, (unsigned int)strnlen(req->path, UTSM_EXEC_PATH_MAX));
         const char *err2 = ": ";
-        write(STDERR_FILENO, err2, strlen(err2));
+        err_write(err2, (unsigned int)strlen(err2));
         const char *emsg = strerror(errno);
-        write(STDERR_FILENO, emsg, strlen(emsg));
-        write(STDERR_FILENO, "\n", 1);
+        err_write(emsg, (unsigned int)strlen(emsg));
+        err_write("\n", 1);
         _exit(127);
     }
 
@@ -174,6 +193,232 @@ static void handle_exec_request(const struct ipc_exec_request *req)
     send_msg(UTSM_MSG_EXEC_EXIT, &ex, sizeof(ex));
 }
 
+/* ===== File transfer handlers (Phase 3) =====
+ *
+ * UTSM sends FILE_LIST_REQUEST / FILE_READ_REQUEST with an ipc_file_request
+ * payload. Bulk result data is staged into the shared payload_pool via
+ * UTSM_IOCTL_WRITE_POOL, then a FILE_RESPONSE message (ipc_file_response)
+ * carries status + data_len + total_size back to UTSM.
+ *
+ * Directory listing format: one entry per line, directories suffixed '/'. */
+
+/* Staging buffer for file reads / listings (capped by pool capacity ~1MB) */
+#define FT_STAGE_SIZE (768 * 1024)
+static unsigned char g_ft_stage[FT_STAGE_SIZE];
+
+static int pool_write(unsigned int offset, const void *buf, unsigned int len)
+{
+    struct utsm_ioctl_pool p;
+    p.offset = offset;
+    p.len = len;
+    p.user_buf = (unsigned long long)(uintptr_t)buf;
+    return ioctl(g_utsm_fd, UTSM_IOCTL_WRITE_POOL, &p);
+}
+
+static int pool_read(unsigned int offset, void *buf, unsigned int len)
+{
+    struct utsm_ioctl_pool p;
+    p.offset = offset;
+    p.len = len;
+    p.user_buf = (unsigned long long)(uintptr_t)buf;
+    return ioctl(g_utsm_fd, UTSM_IOCTL_READ_POOL, &p);
+}
+
+static unsigned int errno_to_file_status(int e)
+{
+    switch (e) {
+    case ENOENT:  return UTSM_FILE_ERR_NOENT;
+    case ENOTDIR: return UTSM_FILE_ERR_NOTDIR;
+    case EISDIR:  return UTSM_FILE_ERR_ISDIR;
+    case EACCES:  return UTSM_FILE_ERR_PERM;
+    case ENOSPC:
+    case EFBIG:   return UTSM_FILE_ERR_NOSPC;
+    default:      return UTSM_FILE_ERR_IO;
+    }
+}
+
+static void send_file_response(unsigned int status, unsigned int data_len,
+                               unsigned long long total_size)
+{
+    struct ipc_file_response resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.status = status;
+    resp.data_len = data_len;
+    resp.total_size = total_size;
+    send_msg(UTSM_MSG_FILE_RESPONSE, &resp, sizeof(resp));
+}
+
+/* FILE_LIST_REQUEST: list directory entries as "name\n" ("name/\n" for dirs) */
+static void handle_file_list(const struct ipc_file_request *req)
+{
+    char path[UTSM_FILE_PATH_MAX + 1];
+    memcpy(path, req->path, UTSM_FILE_PATH_MAX);
+    path[UTSM_FILE_PATH_MAX] = '\0';
+
+    if (req->pool_capacity == 0 || req->pool_offset >= UTSM_IPC_PAYLOAD_SIZE) {
+        send_file_response(UTSM_FILE_ERR_INVAL, 0, 0);
+        return;
+    }
+
+    DIR *d = opendir(path);
+    if (!d) {
+        send_file_response(errno_to_file_status(errno), 0, 0);
+        return;
+    }
+
+    unsigned int cap = req->pool_capacity;
+    if (cap > FT_STAGE_SIZE) cap = FT_STAGE_SIZE;
+
+    unsigned int used = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        /* Determine directory flag: d_type if available, else stat */
+        int is_dir = 0;
+        if (de->d_type == DT_DIR) {
+            is_dir = 1;
+        } else if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) {
+            struct stat st;
+            char full[512];
+            snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+            if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+                is_dir = 1;
+        }
+        int nl = snprintf((char *)g_ft_stage + used, cap - used,
+                          "%s%s\n", de->d_name, is_dir ? "/" : "");
+        if (nl < 0) break;
+        if ((unsigned int)nl >= cap - used) {
+            /* 缓冲已满：本条未完整写入，截断结束 */
+            used = cap;
+            break;
+        }
+        used += (unsigned int)nl;
+    }
+    closedir(d);
+
+    if (used > 0 && pool_write(req->pool_offset, g_ft_stage, used) != 0) {
+        send_file_response(UTSM_FILE_ERR_IO, 0, 0);
+        return;
+    }
+    send_file_response(UTSM_FILE_OK, used, 0);
+}
+
+/* FILE_READ_REQUEST: read up to pool_capacity bytes at file_offset */
+static void handle_file_read(const struct ipc_file_request *req)
+{
+    char path[UTSM_FILE_PATH_MAX + 1];
+    memcpy(path, req->path, UTSM_FILE_PATH_MAX);
+    path[UTSM_FILE_PATH_MAX] = '\0';
+
+    if (req->pool_capacity == 0 || req->pool_offset >= UTSM_IPC_PAYLOAD_SIZE) {
+        send_file_response(UTSM_FILE_ERR_INVAL, 0, 0);
+        return;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        send_file_response(errno_to_file_status(errno), 0, 0);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        send_file_response(UTSM_FILE_ERR_ISDIR, 0, (unsigned long long)st.st_size);
+        return;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        send_file_response(errno_to_file_status(errno), 0,
+                           (unsigned long long)st.st_size);
+        return;
+    }
+
+    unsigned int cap = req->pool_capacity;
+    if (cap > FT_STAGE_SIZE) cap = FT_STAGE_SIZE;
+
+    off_t off = (off_t)req->file_offset;
+    ssize_t n = pread(fd, g_ft_stage, cap, off);
+    int saved = errno;
+    close(fd);
+
+    if (n < 0) {
+        send_file_response(errno_to_file_status(saved), 0,
+                           (unsigned long long)st.st_size);
+        return;
+    }
+
+    if (n > 0 && pool_write(req->pool_offset, g_ft_stage, (unsigned int)n) != 0) {
+        send_file_response(UTSM_FILE_ERR_IO, 0, (unsigned long long)st.st_size);
+        return;
+    }
+    send_file_response(UTSM_FILE_OK, (unsigned int)n,
+                       (unsigned long long)st.st_size);
+}
+
+/* FILE_WRITE_REQUEST: write payload_pool data to file at file_offset.
+ * UTSM pre-stages req->pool_capacity bytes at req->pool_offset in the pool.
+ * Convention: file_offset == 0 truncates the file first (push = replace);
+ * the file is created with mode 0644 if missing. Data is moved in
+ * FT_STAGE_SIZE pieces so a full pool (~1MB) can be consumed per request. */
+static void handle_file_write(const struct ipc_file_request *req)
+{
+    char path[UTSM_FILE_PATH_MAX + 1];
+    memcpy(path, req->path, UTSM_FILE_PATH_MAX);
+    path[UTSM_FILE_PATH_MAX] = '\0';
+
+    if (req->pool_offset >= UTSM_IPC_PAYLOAD_SIZE ||
+        req->pool_capacity > UTSM_IPC_PAYLOAD_SIZE - req->pool_offset) {
+        send_file_response(UTSM_FILE_ERR_INVAL, 0, 0);
+        return;
+    }
+
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        send_file_response(UTSM_FILE_ERR_ISDIR, 0, 0);
+        return;
+    }
+
+    int flags = O_WRONLY | O_CREAT;
+    if (req->file_offset == 0)
+        flags |= O_TRUNC;
+    int fd = open(path, flags, 0644);
+    if (fd < 0) {
+        send_file_response(errno_to_file_status(errno), 0, 0);
+        return;
+    }
+
+    unsigned int remaining = req->pool_capacity;
+    unsigned int done = 0;
+    while (remaining > 0) {
+        unsigned int chunk = remaining;
+        if (chunk > FT_STAGE_SIZE) chunk = FT_STAGE_SIZE;
+
+        if (pool_read(req->pool_offset + done, g_ft_stage, chunk) != 0) {
+            close(fd);
+            send_file_response(UTSM_FILE_ERR_IO, 0, 0);
+            return;
+        }
+        ssize_t n = pwrite(fd, g_ft_stage, chunk,
+                           (off_t)(req->file_offset + done));
+        if (n < 0) {
+            int saved = errno;
+            close(fd);
+            send_file_response(errno_to_file_status(saved), done, 0);
+            return;
+        }
+        done += (unsigned int)n;
+        remaining -= (unsigned int)n;
+        if ((unsigned int)n < chunk)
+            break;  /* short write (e.g. ENOSPC on next call would fail) */
+    }
+
+    unsigned long long total = 0;
+    if (fstat(fd, &st) == 0)
+        total = (unsigned long long)st.st_size;
+    close(fd);
+    send_file_response(UTSM_FILE_OK, done, total);
+}
+
 /* ===== Main loop ===== */
 
 int main(void)
@@ -197,19 +442,26 @@ int main(void)
 
         /* Drain any pending messages (there may be multiple if UTSM
          * queued several before vmresume). */
-        int got_request = 0;
         while (recv_msg(&umsg) == 0) {
             if (umsg.type == UTSM_MSG_EXEC_REQUEST &&
                 umsg.data_len >= sizeof(struct ipc_exec_request)) {
                 handle_exec_request((const struct ipc_exec_request *)umsg.data);
-                got_request = 1;
+            } else if (umsg.type == UTSM_MSG_FILE_LIST_REQUEST &&
+                       umsg.data_len >= sizeof(struct ipc_file_request)) {
+                handle_file_list((const struct ipc_file_request *)umsg.data);
+            } else if (umsg.type == UTSM_MSG_FILE_READ_REQUEST &&
+                       umsg.data_len >= sizeof(struct ipc_file_request)) {
+                handle_file_read((const struct ipc_file_request *)umsg.data);
+            } else if (umsg.type == UTSM_MSG_FILE_WRITE_REQUEST &&
+                       umsg.data_len >= sizeof(struct ipc_file_request)) {
+                handle_file_write((const struct ipc_file_request *)umsg.data);
             }
             /* Ignore other message types (HELLO, PING, etc.) */
         }
 
-        /* If we processed a request, the response is already sent.
-         * Park to let UTSM read the response and return to shell.
-         * If no request (spurious wakeup), just park again. */
+        /* Responses (if any) are already queued. Park to let UTSM read
+         * them and return to the shell; a spurious wakeup with no
+         * request simply parks again. */
         park();
     }
 

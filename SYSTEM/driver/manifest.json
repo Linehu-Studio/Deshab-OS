@@ -92,6 +92,14 @@
           "provides": ["block"]
         },
         {
+          "name": "xhci",
+          "path": "driver/block/xhci.drv",
+          "class": "storage",
+          "required": false,
+          "depends": ["pci", "irq"],
+          "provides": ["block"]
+        },
+        {
           "name": "bootfs",
           "path": "driver/fs/bootfs.drv",
           "class": "fs",

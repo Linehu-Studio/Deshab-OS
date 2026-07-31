@@ -52,6 +52,10 @@
 #define UTSM_IOCTL_SEND_MSG  _IOWR('U', 2, struct utsm_ioctl_msg)
 #define UTSM_IOCTL_PARK      _IO('U', 3)
 #define UTSM_IOCTL_GET_READY _IOR('U', 4, int)
+#define UTSM_IOCTL_WRITE_POOL _IOW('U', 5, struct utsm_ioctl_pool)
+#define UTSM_IOCTL_READ_POOL  _IOWR('U', 6, struct utsm_ioctl_pool)
+#define UTSM_IOCTL_HOST_READ  _IOWR('U', 7, struct utsm_ioctl_hostfile)
+#define UTSM_IOCTL_HOST_WRITE _IOW('U', 8, struct utsm_ioctl_hostfile)
 
 /* Ioctl message wrapper: carries type + data in a single call */
 struct utsm_ioctl_msg {
@@ -60,6 +64,29 @@ struct utsm_ioctl_msg {
     u32 reserved;
     u32 buf_size;      /* capacity of data buffer (in) */
     u8  data[UTSM_IPC_MSG_DATA_SIZE]; /* payload */
+};
+
+/* Pool transfer descriptor for WRITE_POOL / READ_POOL ioctls.
+ * Used by the exec daemon to stage large file-transfer payloads into the
+ * shared payload_pool (bulk data channel for UTSM_MSG_FILE_RESPONSE). */
+struct utsm_ioctl_pool {
+    u32 offset;        /* byte offset into payload_pool */
+    u32 len;           /* bytes to transfer */
+    u64 user_buf;      /* userspace buffer pointer */
+};
+
+/* Host-file transfer descriptor for HOST_READ / HOST_WRITE ioctls.
+ * Gives Linux userspace access to files on the UTSM-side FAT32 system disk
+ * (root directory, 8.3-convertible names, whole-file semantics, max 256KB)
+ * via the UTSM_HCALL_FILE_READ / UTSM_HCALL_FILE_WRITE hypercalls.
+ * payload_pool at offset 0 is the bulk data buffer in both directions. */
+struct utsm_ioctl_hostfile {
+    u64 offset;        /* in: file offset (HOST_READ; must be 0 for HOST_WRITE) */
+    u32 len;           /* in: requested length; out: bytes transferred */
+    u32 reserved;
+    u64 total;         /* out: total file size (HOST_READ) */
+    u64 user_buf;      /* userspace buffer pointer */
+    char name[64];     /* UTSM FAT32 root file name (NUL-terminated) */
 };
 
 /* ===== Hypercall ABI =====
@@ -119,6 +146,23 @@ static inline long utsm_hcall_shm_info(u64 *gpa_out, u64 *size_out)
 static inline long utsm_hcall_console_write(const char *buf, u64 len)
 {
 	return utsm_hcall(UTSM_HCALL_CONSOLE_WRITE, (u64)buf, len, 0);
+}
+
+/* UTSM FAT32 file read: stages file[offset..offset+len) into payload_pool.
+ * Returns positive packed value (low 20 bits = staged bytes, >> 20 = total
+ * file size) or a negative UTSM_HCALL_* error. The name pointer follows the
+ * same GVA==GPA identity-mapping convention as the other hypercalls. */
+static inline long utsm_hcall_file_read(const char *name, u64 offset, u64 len)
+{
+	return utsm_hcall(UTSM_HCALL_FILE_READ, (u64)name, offset, len);
+}
+
+/* UTSM FAT32 file write: writes len bytes staged at payload_pool[0] as the
+ * whole new content of the named root file (create or replace).
+ * Returns bytes written or a negative UTSM_HCALL_* error. */
+static inline long utsm_hcall_file_write(const char *name, u64 len)
+{
+	return utsm_hcall(UTSM_HCALL_FILE_WRITE, (u64)name, 0, len);
 }
 
 /* ===== Shared memory state ===== */
@@ -281,6 +325,111 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         int ready = (g_shm->header.utsm_ready && g_shm->header.linux_ready) ? 1 : 0;
         if (copy_to_user((void __user *)arg, &ready, sizeof(ready)))
             return -EFAULT;
+        return 0;
+    }
+
+    case UTSM_IOCTL_WRITE_POOL: {
+        /* Copy userspace data into payload_pool (daemon → UTSM bulk data) */
+        struct utsm_ioctl_pool p;
+
+        if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+            return -EFAULT;
+        if (p.offset > UTSM_IPC_PAYLOAD_SIZE ||
+            p.len > UTSM_IPC_PAYLOAD_SIZE - p.offset)
+            return -EINVAL;
+        if (p.len == 0)
+            return 0;
+        if (copy_from_user(g_shm->payload_pool + p.offset,
+                           (void __user *)(uintptr_t)p.user_buf, p.len))
+            return -EFAULT;
+        mb();  /* ensure pool data visible to UTSM before response msg */
+        return 0;
+    }
+
+    case UTSM_IOCTL_READ_POOL: {
+        /* Copy payload_pool data to userspace (UTSM → daemon bulk data) */
+        struct utsm_ioctl_pool p;
+
+        if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+            return -EFAULT;
+        if (p.offset > UTSM_IPC_PAYLOAD_SIZE ||
+            p.len > UTSM_IPC_PAYLOAD_SIZE - p.offset)
+            return -EINVAL;
+        if (p.len == 0)
+            return 0;
+        if (copy_to_user((void __user *)(uintptr_t)p.user_buf,
+                         g_shm->payload_pool + p.offset, p.len))
+            return -EFAULT;
+        return 0;
+    }
+
+    case UTSM_IOCTL_HOST_READ: {
+        /* Read a file from the UTSM FAT32 disk into userspace.
+         * Hypercall stages the chunk into payload_pool, we relay it out. */
+        struct utsm_ioctl_hostfile hf;
+        char kname[64];
+        long ret;
+        u32 n;
+
+        if (copy_from_user(&hf, (void __user *)arg, sizeof(hf)))
+            return -EFAULT;
+        if (hf.len == 0 || hf.len > UTSM_IPC_PAYLOAD_SIZE)
+            return -EINVAL;
+        if (!hf.user_buf)
+            return -EINVAL;
+        memcpy(kname, hf.name, sizeof(kname));
+        kname[sizeof(kname) - 1] = '\0';
+
+        ret = utsm_hcall_file_read(kname, hf.offset, hf.len);
+        if (ret < 0) {
+            if (ret == UTSM_HCALL_NOENT) return -ENOENT;
+            if (ret == UTSM_HCALL_INVAL) return -EINVAL;
+            if (ret == UTSM_HCALL_NOMEM) return -ENOMEM;
+            return -EIO;
+        }
+
+        n = (u32)(ret & 0xFFFFF);
+        hf.total = (u64)ret >> 20;
+        if (n > hf.len)
+            n = hf.len;  /* defensive: never overflow the user buffer */
+        if (n > 0 &&
+            copy_to_user((void __user *)(uintptr_t)hf.user_buf,
+                         g_shm->payload_pool, n))
+            return -EFAULT;
+        hf.len = n;
+        if (copy_to_user((void __user *)arg, &hf, sizeof(hf)))
+            return -EFAULT;
+        return 0;
+    }
+
+    case UTSM_IOCTL_HOST_WRITE: {
+        /* Write userspace data as the whole content of a UTSM FAT32 file.
+         * Stage into payload_pool first, then hypercall to commit. */
+        struct utsm_ioctl_hostfile hf;
+        char kname[64];
+        long ret;
+
+        if (copy_from_user(&hf, (void __user *)arg, sizeof(hf)))
+            return -EFAULT;
+        if (hf.len > UTSM_IPC_PAYLOAD_SIZE)
+            return -EINVAL;
+        if (hf.len > 0 && !hf.user_buf)
+            return -EINVAL;
+        memcpy(kname, hf.name, sizeof(kname));
+        kname[sizeof(kname) - 1] = '\0';
+
+        if (hf.len > 0 &&
+            copy_from_user(g_shm->payload_pool,
+                           (void __user *)(uintptr_t)hf.user_buf, hf.len))
+            return -EFAULT;
+        mb();  /* ensure pool data visible to UTSM before the hypercall */
+
+        ret = utsm_hcall_file_write(kname, hf.len);
+        if (ret < 0) {
+            if (ret == UTSM_HCALL_INVAL) return -EINVAL;
+            if (ret == UTSM_HCALL_NOMEM) return -ENOMEM;
+            return -EIO;
+        }
         return 0;
     }
 

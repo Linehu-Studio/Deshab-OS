@@ -13,11 +13,11 @@
  *   2. VMCALL hypercall (sync request/response)
  *   3. IPI notification (UTSM → Linux via guest IRQ injection)
  *
- * Shared memory layout (at GPA 0x04000000, 1MB total):
+ * Shared memory layout (at GPA 0x04000000, 1MB total, packed struct):
  *   0x04000000: utsm_ipc_shm_header (64 bytes)
- *   0x04000040: utsm_ipc_ring utsm_to_linux (UTSM writes, Linux reads)
- *   0x04001040: utsm_ipc_ring linux_to_utsm (Linux writes, UTSM reads)
- *   0x04002040: payload pool (for large data transfers)
+ *   0x04000040: utsm_ipc_ring utsm_to_linux (UTSM writes, Linux reads, 16400 B)
+ *   0x04004050: utsm_ipc_ring linux_to_utsm (Linux writes, UTSM reads, 16400 B)
+ *   0x04008060: payload pool (UTSM_IPC_PAYLOAD_SIZE bytes, ends exactly at +1MB)
  */
 
 /* Kernel-space uses kernel types, user-space uses <stdint.h>.
@@ -44,7 +44,14 @@ typedef __u64 uint64_t;
 
 #define UTSM_IPC_QUEUE_DEPTH    64                     /* messages per ring */
 #define UTSM_IPC_MSG_DATA_SIZE  240                    /* inline data per message */
-#define UTSM_IPC_PAYLOAD_SIZE   (UTSM_IPC_SHM_SIZE - 2 * 1024 - 64) /* ~1MB */
+
+/* Derived region sizes (packed layout, both kernels must agree):
+ *   message  = 16-byte header + inline data
+ *   ring     = 16-byte header + QUEUE_DEPTH messages
+ *   SHM      = 64-byte header + 2 rings + payload pool = exactly 1MB */
+#define UTSM_IPC_MSG_SIZE       (16 + UTSM_IPC_MSG_DATA_SIZE)                 /* 256 */
+#define UTSM_IPC_RING_SIZE      (16 + UTSM_IPC_QUEUE_DEPTH * UTSM_IPC_MSG_SIZE) /* 16400 */
+#define UTSM_IPC_PAYLOAD_SIZE   (UTSM_IPC_SHM_SIZE - 64 - 2 * UTSM_IPC_RING_SIZE) /* 1015712 */
 
 /* ===== Hypercall operations ===== */
 
@@ -58,6 +65,10 @@ enum utsm_hcall_op {
     UTSM_HCALL_DRR_CHECKPOINT= 0x0040,  /* Trigger DRR checkpoint */
     UTSM_HCALL_CONSOLE_WRITE = 0x0050,  /* Write to UTSM serial console */
     UTSM_HCALL_CONSOLE_READ  = 0x0051,  /* Read from UTSM serial console */
+    /* Phase 3 file transfer: Linux guest ↔ UTSM FAT32 disk (payload_pool as
+     * the bulk data buffer; see "Linux ↔ UTSM FAT32 hypercalls" below) */
+    UTSM_HCALL_FILE_READ     = 0x0060,  /* Read UTSM FAT32 root file into payload_pool */
+    UTSM_HCALL_FILE_WRITE    = 0x0061,  /* Write payload_pool content to UTSM FAT32 root file */
 };
 
 /* Hypercall return codes */
@@ -66,6 +77,8 @@ enum utsm_hcall_op {
 #define UTSM_HCALL_PERM         (-2)
 #define UTSM_HCALL_NOMEM        (-3)
 #define UTSM_HCALL_NOSYS        (-4)
+#define UTSM_HCALL_NOENT        (-5)   /* file not found */
+#define UTSM_HCALL_IO           (-6)   /* disk / generic I/O error */
 
 /* ===== Message types ===== */
 
@@ -85,6 +98,14 @@ enum utsm_ipc_msg_type {
     UTSM_MSG_EXEC_STDERR  = 18, /* Linux→UTSM: stderr chunk (payload=raw bytes) */
     UTSM_MSG_EXEC_EXIT    = 19, /* Linux→UTSM: process exited (payload=ipc_exec_exit) */
     UTSM_MSG_EXEC_READY   = 20, /* Linux→UTSM: daemon ready to accept exec requests */
+    /* Linux compat file transfer protocol (payload via payload_pool) */
+    UTSM_MSG_FILE_LIST_REQUEST = 24, /* UTSM→Linux: list directory (payload=ipc_file_request) */
+    UTSM_MSG_FILE_READ_REQUEST = 25, /* UTSM→Linux: read file chunk (payload=ipc_file_request) */
+    UTSM_MSG_FILE_RESPONSE     = 26, /* Linux→UTSM: result header (payload=ipc_file_response),
+                                      * bulk data already in payload_pool */
+    UTSM_MSG_FILE_WRITE_REQUEST= 27, /* UTSM→Linux: write file chunk (payload=ipc_file_request),
+                                      * bulk data pre-staged in payload_pool by UTSM;
+                                      * result via UTSM_MSG_FILE_RESPONSE */
 };
 
 /* ===== Linux compat exec payload structures =====
@@ -115,6 +136,92 @@ struct ipc_exec_exit {
     uint32_t exit_code;                              /* process exit status */
     uint32_t reserved;
 } __attribute__((packed));
+
+/* ===== Linux compat file transfer payload structures =====
+ *
+ * Flow (synchronous with park-and-resume, same as exec):
+ *   1. UTSM writes UTSM_MSG_FILE_LIST_REQUEST / FILE_READ_REQUEST into the
+ *      utsm_to_linux ring, then linux_resume() wakes the daemon.
+ *   2. Linux daemon performs opendir/readdir or open/pread, writes the bulk
+ *      result data DIRECTLY into payload_pool at req.pool_offset (via
+ *      UTSM_IOCTL_WRITE_POOL), then enqueues UTSM_MSG_FILE_RESPONSE carrying
+ *      ipc_file_response (status + data_len + total_size), then HLTs.
+ *   3. UTSM drains the ring, reads the response header, then copies
+ *      resp.data_len bytes out of payload_pool + req.pool_offset.
+ *
+ * Write flow (UTSM → Linux, UTSM_MSG_FILE_WRITE_REQUEST):
+ *   1. UTSM stages the data into payload_pool at req.pool_offset (offset 0,
+ *      exclusive use — the model is synchronous), sets req.pool_capacity to
+ *      the staged byte count and req.file_offset to the write position.
+ *   2. Linux daemon reads req.pool_capacity bytes out of payload_pool (via
+ *      UTSM_IOCTL_READ_POOL) and pwrite()s them to req.path at
+ *      req.file_offset. Convention: file_offset == 0 opens with O_TRUNC
+ *      (a push always replaces the file); offset > 0 writes in place.
+ *      The file is created with mode 0644 if missing.
+ *   3. Daemon replies UTSM_MSG_FILE_RESPONSE with data_len = bytes written
+ *      and total_size = resulting file size.
+ *
+ * payload_pool is ~1MB (UTSM_IPC_PAYLOAD_SIZE), so a single round trip can
+ * move up to that much data. For larger files the caller loops with
+ * increasing file_offset. Directory listings are formatted as plain text,
+ * one entry per line ("name" or "name/" for directories).
+ *
+ * All strings are NUL-terminated. */
+
+#define UTSM_FILE_PATH_MAX   200
+
+/* Status codes for ipc_file_response.status */
+#define UTSM_FILE_OK         0
+#define UTSM_FILE_ERR_NOENT  1   /* path does not exist */
+#define UTSM_FILE_ERR_IO     2   /* generic I/O error */
+#define UTSM_FILE_ERR_NOTDIR 3   /* LIST on a non-directory */
+#define UTSM_FILE_ERR_ISDIR  4   /* READ/WRITE on a directory */
+#define UTSM_FILE_ERR_PERM   5   /* permission denied */
+#define UTSM_FILE_ERR_INVAL  6   /* malformed request */
+#define UTSM_FILE_ERR_NOSPC  7   /* no space left on device / file too large */
+
+struct ipc_file_request {
+    uint32_t pool_offset;                          /* payload_pool offset of bulk data */
+    uint32_t pool_capacity;                        /* LIST/READ: max bytes daemon may write;
+                                                    * WRITE: staged data byte count */
+    uint64_t file_offset;                          /* READ: read offset; WRITE: write offset
+                                                    * (0 also implies O_TRUNC); LIST: 0 */
+    char     path[UTSM_FILE_PATH_MAX];             /* absolute Linux path (NUL-terminated) */
+} __attribute__((packed));
+
+struct ipc_file_response {
+    uint32_t status;                               /* UTSM_FILE_* */
+    uint32_t data_len;                             /* LIST/READ: bytes written into payload_pool;
+                                                    * WRITE: bytes written to the file */
+    uint64_t total_size;                           /* READ: total file size;
+                                                    * WRITE: resulting file size; LIST: 0 */
+} __attribute__((packed));
+
+/* ===== Linux ↔ UTSM FAT32 hypercalls (UTSM_HCALL_FILE_READ/WRITE) =====
+ *
+ * These give the Linux guest direct access to files on the UTSM-side FAT32
+ * system disk (root directory, 8.3-convertible names, whole-file semantics,
+ * max 256KB per file). payload_pool at offset 0 is the bulk data buffer.
+ *
+ * UTSM_HCALL_FILE_READ:  a0 = GPA of NUL-terminated file name (max 63 chars)
+ *                        a1 = file offset (u64)
+ *                        a2 = max bytes to stage (clamped to pool capacity)
+ *   UTSM reads the file via its block/FAT32 path, stages
+ *   payload_pool[0..n) = file[a1 .. a1+n), and returns in RAX:
+ *       low 20 bits  = n (bytes staged; pool capacity < 1MB so 20 bits fit)
+ *       high bits    = total file size (RAX >> 20)
+ *   Negative RAX = UTSM_HCALL_* error (INVAL bad name, NOENT missing,
+ *   NOMEM pool unavailable, IO disk error). n == 0 with a1 >= size means EOF.
+ *
+ * UTSM_HCALL_FILE_WRITE: a0 = GPA of NUL-terminated file name (max 63 chars)
+ *                        a1 = reserved (0)
+ *                        a2 = byte count staged at payload_pool[0]
+ *   Whole-file replace: the staged bytes become the new file content
+ *   (create or replace). Returns bytes written (== a2) or a negative
+ *   UTSM_HCALL_* error.
+ *
+ * Concurrency note: payload_pool is a single-writer channel; the guest must
+ * not run these hypercalls concurrently with a ring-based file transfer. */
 
 /* ===== Ring buffer structures ===== */
 
@@ -161,6 +268,11 @@ struct utsm_ipc_shm {
     struct utsm_ipc_ring linux_to_utsm;   /* Linux writes, UTSM reads */
     uint8_t payload_pool[UTSM_IPC_PAYLOAD_SIZE];
 } __attribute__((packed));
+
+/* Compile-time guard: the packed SHM layout must fit in the 1MB region
+ * (UTSM allocates exactly UTSM_IPC_SHM_SIZE bytes and EPT-maps only that). */
+_Static_assert(sizeof(struct utsm_ipc_shm) <= UTSM_IPC_SHM_SIZE,
+               "utsm_ipc_shm exceeds the 1MB shared memory region");
 
 /* ===== Ring buffer operations (inline, usable by both kernels) ===== */
 

@@ -59,6 +59,21 @@ static void sputc(char c) {
 static void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static void logl(const char *s) { swrite(s); swrite("\n"); }
 
+/* [debug-point b6-io] */
+/* B6 forensics: log every byte consumed from the i8042 in the input loops */
+static void dbgb(const char *tag, u8 st, u8 d) {
+    static const char hx[] = "0123456789abcdef";
+    char b[48]; int p = 0;
+    while (tag[p]) { b[p] = tag[p]; p++; }
+    b[p++]=' '; b[p++]='s'; b[p++]='t'; b[p++]='=';
+    b[p++]=hx[(st>>4)&15]; b[p++]=hx[st&15];
+    b[p++]=' '; b[p++]='d'; b[p++]='=';
+    b[p++]=hx[(d>>4)&15]; b[p++]=hx[d&15];
+    b[p]=0;
+    logl(b);
+}
+/* [/debug-point] */
+
 /* ---- PS/2 controller / mouse helpers (timeout-protected, TSC-based) ---- */
 static int ps2_wait_write(void) {
     u64 deadline = rdtsc_fi() + g_tsc_per_ms * 100;  /* 100ms 超时 */
@@ -506,6 +521,9 @@ static int read_field(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char
         u8 st = inb(0x64);
         if (!(st & 1)) { __asm__("pause"); continue; }
         u8 data = inb(0x60);
+        /* [debug-point b6-io] */
+        dbgb("[RF]", st, data);
+        /* [/debug-point] */
         if (st & 0x20) {
             /* mouse data: assemble 3-byte packet, sync on bit 3 */
             if (mcnt == 0 && !(data & 0x08)) continue;
@@ -550,6 +568,9 @@ static int read_field(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char
         if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
         if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
         if (sc & 0x80) continue;
+        /* BUG-010 防御: scan_to_ascii 内部有 sc>=58 返回 0，
+         * 但防止未来变更导致越界访问 */
+        if (sc >= 58) continue;
         char c = scan_to_ascii(sc, shift);
         if (!c) continue;
         if (c == '\n') {
@@ -750,6 +771,9 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
         u8 st = inb(0x64);
         if (!(st & 1)) { __asm__("pause"); continue; }
         u8 data = inb(0x60);
+        /* [debug-point b6-io] */
+        dbgb("[PR]", st, data);
+        /* [/debug-point] */
         if (st & 0x20) {
             if (mcnt == 0 && !(data & 0x08)) continue;
             mpkt[mcnt++] = data;
@@ -1126,6 +1150,9 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
         u8 st = inb(0x64);
         if (!(st & 1)) { __asm__("pause"); continue; }
         u8 data = inb(0x60);
+        /* [debug-point b6-io] */
+        dbgb("[NP]", st, data);
+        /* [/debug-point] */
         if (st & 0x20) {
             if (mcnt == 0 && !(data & 0x08)) continue;
             mpkt[mcnt++] = data;
@@ -1427,6 +1454,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
             while (field < 3) {
                 field = read_field(fb, card_x, card_y, field, pc, user, pass, &mx, &my, bg, fg);
             }
+            /* [debug-point b6-io] */
+            logl("[RF] fields done, content:");
+            logl(pc); logl(user); logl(pass);
+            /* [/debug-point] */
             /* Validate: all fields must be non-empty */
             if (pc[0] != 0 && user[0] != 0 && pass[0] != 0) break;
             /* Show warning message on card (overwrite hint area) */
@@ -1452,6 +1483,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
                     u8 st = inb(0x64);
                     if (!(st & 1)) { __asm__("pause"); continue; }
                     u8 data = inb(0x60);
+                    /* [debug-point b6-io] */
+                    dbgb("[VW]", st, data);
+                    /* [/debug-point] */
                     if (st & 0x20) {
                         /* 鼠标数据:组装 3 字节包，同步位 bit 3 */
                         if (mcnt == 0 && !(data & 0x08)) continue;

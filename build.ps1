@@ -479,6 +479,31 @@ finally {
 }
 
 Write-Host '[build] Building DSK main kernel...'
+# Generate logo_data.c from Logo.png (RGBA8888 embedded data)
+$LogoPng = Join-Path $Root 'Logo.png'
+$LogoDataC = Join-Path $DskDir 'logo_data.c'
+$PngToRgba = Join-Path $DskDir 'png_to_rgba.py'
+if (Test-Path $LogoPng) {
+    # Find Python
+    $Python = $null
+    foreach ($p in @('C:\Users\林濬哲\AppData\Local\Programs\Python\Python312\python.exe',
+                     'C:\msys64\mingw64\bin\python.exe',
+                     'python', 'python3')) {
+        try { $cmd = Get-Command $p -ErrorAction Stop; $Python = $cmd.Source; break } catch {}
+    }
+    if ($Python) {
+        # Regenerate if Logo.png is newer than logo_data.c
+        if (-not (Test-Path $LogoDataC) -or ((Get-Item $LogoPng).LastWriteTime -gt (Get-Item $LogoDataC).LastWriteTime)) {
+            Write-Host '[build] Generating logo_data.c from Logo.png...'
+            & $Python $PngToRgba $LogoPng $LogoDataC
+            if ($LASTEXITCODE -ne 0) { Write-Host '[build] WARNING: logo_data.c generation failed, using existing file' }
+        }
+    } else {
+        Write-Host '[build] WARNING: Python not found, cannot regenerate logo_data.c'
+    }
+} else {
+    Write-Host '[build] WARNING: Logo.png not found'
+}
 try {
     & $make -C "$DskDir" -f MAKEFILE "CC=$clang" "LD=$lld"
     if ($LASTEXITCODE -ne 0) {
@@ -647,6 +672,10 @@ foreach ($tool in $toolApps) {
 Write-Host '[build] Building DKM framebuffer driver...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\console_fb\console_fb.c') (Join-Path $SystemDir 'driver\console\console_fb.drv')
 
+Write-Host '[build] Building DKM storage drivers...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\nvme\nvme.c') (Join-Path $SystemDir 'driver\block\nvme.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\xhci\xhci.c') (Join-Path $SystemDir 'driver\block\xhci.drv')
+
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
@@ -655,7 +684,7 @@ Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir
 Write-Host "[build] Output: $Output"
 Write-Host "[build] DSK Output: $DskOutput"
 Write-Host '[build] Packaging SYSTEM to GPT + FAT32 IMG...'
-New-GptFat32Image $SystemDir $ImagePath 128
+New-GptFat32Image $SystemDir $ImagePath 768
 Write-Host "[build] Done: $ImagePath"
 
 # Rebuild SATA FAT32 disk image (DSK reads deshab.elf/FirstInit.elf/mouseInit.elf from here)
@@ -670,4 +699,40 @@ if (Test-Path $MkFat32Ps) {
     Write-Host "[build] SATA IMG: $(Join-Path $BuildTmp 'sata_fat32_dsk.img')"
 } else {
     Write-Host '[build] WARNING: mkfat32.ps1 not found, SATA image not rebuilt'
+}
+
+# NVMe 测试盘镜像 (64MB, LBA0 带 DESHABNVME0 签名, 用于验证 NVMe block 数据路径)
+$NvmeImg = Join-Path $BuildTmp 'nvme_test.img'
+if (-not (Test-Path $NvmeImg)) {
+    Write-Host '[build] Creating NVMe test disk image...'
+    $nfs = [System.IO.File]::Open($NvmeImg, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $nfs.SetLength(64MB)
+        $sigSector = [byte[]]::new(512)
+        $sigText = [System.Text.Encoding]::ASCII.GetBytes('DESHABNVME0')
+        for ($i = 0; $i -lt 512; $i++) { $sigSector[$i] = $sigText[$i % $sigText.Length] }
+        Write-At $nfs 0 $sigSector
+    }
+    finally {
+        $nfs.Close()
+    }
+    Write-Host "[build] NVMe IMG: $NvmeImg"
+}
+
+# USB xHCI test disk image (64MB, for USB Mass Storage driver testing)
+$UsbImg = Join-Path $BuildTmp 'usb_test.img'
+if (-not (Test-Path $UsbImg)) {
+    Write-Host '[build] Creating USB test disk image...'
+    $ufs = [System.IO.File]::Open($UsbImg, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $ufs.SetLength(64MB)
+        $sigSector = [byte[]]::new(512)
+        $sigText = [System.Text.Encoding]::ASCII.GetBytes('DESHABUSB00')
+        for ($i = 0; $i -lt 512; $i++) { $sigSector[$i] = $sigText[$i % $sigText.Length] }
+        Write-At $ufs 0 $sigSector
+    }
+    finally {
+        $ufs.Close()
+    }
+    Write-Host "[build] USB IMG: $UsbImg"
 }

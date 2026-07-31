@@ -1,0 +1,24 @@
+[package]
+name = "deaicup-pe"
+version = "0.1.0"
+edition = "2021"
+
+# Deaicup Software — Windows PE64 target for Deshab UTSM PE compat layer.
+# egui UI logic is kept; the eframe runtime is replaced by a hand-written
+# Win32 backend (user32 window + GDI DIB blit) plus a pure-Rust software
+# rasterizer for egui tessellated primitives.
+
+[[bin]]
+name = "deaicup"
+path = "src/main.rs"
+
+[dependencies]
+egui = { version = "=0.27.2", default-features = false, features = ["default_fonts"] }
+
+[profile.release]
+opt-level = 2
+debug = false
+debug-assertions = false
+lto = "thin"
+codegen-units = 1
+panic = "abort"

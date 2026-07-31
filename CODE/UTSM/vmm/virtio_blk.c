@@ -252,3 +252,199 @@ void virtio_blk_backend_init(void) {
 
     virtio_mmio_register(&g_blk_backend);
 }
+
+/* ===== Memory-backed rootfs virtio-blk 后端 =====
+ *
+ * 第二个 virtio-blk 设备，后端为内存中的 Arch rootfs 镜像（Limine boot module）。
+ * guest 看到 /dev/vdb，挂载为真实根文件系统（ext4），switch_root 进入 Arch。
+ *
+ * 读写直接操作内存（memcpy），无需块设备 API。 */
+
+/* byte-wise memcpy helper (freestanding, no libc) */
+static void rf_memcpy(void *dst, const void *src, u64 n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    while (n--) *d++ = *s++;
+}
+
+static const u8 *g_rootfs_data;     /* rootfs 镜像内存指针（HHDM 虚拟地址） */
+static u64 g_rootfs_size;           /* rootfs 镜像大小（字节） */
+static u64 g_rootfs_capacity;       /* rootfs 容量（扇区数，512B 单位） */
+
+static u32 rootfs_blk_read_config(u32 offset, int width) {
+    (void)width;
+    struct virtio_blk_config cfg;
+    u8 *c = (u8 *)&cfg;
+    for (u32 i = 0; i < sizeof(cfg); i++) c[i] = 0;
+    cfg.capacity = g_rootfs_capacity;
+    cfg.size_max = 128;
+    cfg.seg_max = 32;
+    cfg.blk_size = 512;
+    if (offset + 4 <= sizeof(cfg)) {
+        u32 val = 0;
+        rf_memcpy(&val, c + offset, 4);
+        return val;
+    }
+    if (offset < sizeof(cfg)) {
+        u32 val = 0;
+        rf_memcpy(&val, c + offset, 4);
+        return val;
+    }
+    return 0;
+}
+
+/* rootfs 请求处理：直接内存拷贝 */
+static u32 rootfs_blk_handle_chain(struct virtq_desc *desc, u16 head, u32 qnum) {
+    (void)qnum;
+    struct virtio_blk_outhdr hdr;
+    u8 *hptr = (u8 *)virtio_gpa_to_host(desc[head].addr);
+    if (!hptr) return 0;
+    rf_memcpy(&hdr, hptr, sizeof(hdr));
+
+    u32 type = hdr.type;
+    u64 sector = hdr.sector;
+
+    u16 data_idx = 0xFFFF;
+    u16 status_idx = 0xFFFF;
+    if (desc[head].flags & VIRTQ_DESC_F_NEXT) {
+        data_idx = desc[head].next;
+        u16 cur = data_idx;
+        int hops = 0;
+        while ((desc[cur].flags & VIRTQ_DESC_F_NEXT) && hops < 16) {
+            cur = desc[cur].next;
+            hops++;
+        }
+        status_idx = cur;
+    }
+
+    u8 *status = (u8 *)0;
+    if (status_idx != 0xFFFF && (desc[status_idx].flags & VIRTQ_DESC_F_WRITE)) {
+        status = (u8 *)virtio_gpa_to_host(desc[status_idx].addr);
+    }
+
+    u32 bytes_done = 0;
+    u8 result = VIRTIO_BLK_S_OK;
+
+    switch (type) {
+    case VIRTIO_BLK_T_IN: {  /* 读：rootfs 内存 → guest */
+        if (data_idx == 0xFFFF || !g_rootfs_data) {
+            result = VIRTIO_BLK_S_IOERR;
+            break;
+        }
+        u8 *dbuf = (u8 *)virtio_gpa_to_host(desc[data_idx].addr);
+        u32 dlen = desc[data_idx].len;
+        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
+        u64 offset = sector * 512ULL;
+        if (offset + dlen > g_rootfs_size) {
+            /* 超出范围：截断或填零 */
+            u64 avail = (offset < g_rootfs_size) ? (g_rootfs_size - offset) : 0;
+            if (avail > 0) {
+                rf_memcpy(dbuf, g_rootfs_data + offset, avail);
+            }
+            /* 剩余部分填零 */
+            if (dlen > avail) {
+                u8 *p = dbuf + avail;
+                u32 rem = dlen - (u32)avail;
+                while (rem--) *p++ = 0;
+            }
+            bytes_done = dlen;
+        } else {
+            rf_memcpy(dbuf, g_rootfs_data + offset, dlen);
+            bytes_done = dlen;
+        }
+        break;
+    }
+    case VIRTIO_BLK_T_OUT:   /* 写：暂不支持（rootfs 只读） */
+        result = VIRTIO_BLK_S_IOERR;
+        break;
+    case VIRTIO_BLK_T_GET_ID:
+        if (data_idx != 0xFFFF) {
+            char *idbuf = (char *)virtio_gpa_to_host(desc[data_idx].addr);
+            if (idbuf) {
+                const char *id = "DESHAB-ROOTFS";
+                u32 i = 0;
+                for (; id[i] && i < desc[data_idx].len - 1; i++) idbuf[i] = id[i];
+                idbuf[i] = 0;
+                bytes_done = i + 1;
+            }
+        }
+        break;
+    case VIRTIO_BLK_T_FLUSH:
+        result = VIRTIO_BLK_S_OK;
+        break;
+    default:
+        result = VIRTIO_BLK_S_UNSUPP;
+        break;
+    }
+
+    if (status) *status = result;
+    return bytes_done;
+}
+
+static u16 g_rootfs_last_avail;
+
+static void rootfs_blk_queue_notify(u32 queue_idx) {
+    struct virtq_desc *desc;
+    struct virtq_avail *avail;
+    struct virtq_used *used;
+    u32 qnum;
+
+    if (virtio_queue_get_ptrs(VIRTIO_ID_BLOCK, queue_idx,
+                              &desc, &avail, &used, &qnum) != 0) {
+        return;
+    }
+
+    u16 cur = g_rootfs_last_avail;
+    u16 used_idx = used->idx;
+    while (cur != avail->idx) {
+        u16 head = avail->ring[cur % qnum];
+        u32 len = rootfs_blk_handle_chain(desc, head, qnum);
+        used->ring[used_idx % qnum].id = head;
+        used->ring[used_idx % qnum].len = len;
+        used_idx++;
+        cur++;
+    }
+    virtio_queue_bump_used(used, used_idx);
+    g_rootfs_last_avail = cur;
+}
+
+static void rootfs_blk_reset(void) {
+    g_rootfs_last_avail = 0;
+}
+
+static struct virtio_backend g_rootfs_blk_backend = {
+    .device_id = VIRTIO_ID_BLOCK,
+    .gpa_base = VIRTIO_MMIO_ROOTFS_GPA,
+    .irq = 7,                   /* guest ISA IRQ7（cmdline :7，vector 0x37） */
+    .num_queues = 1,
+    .queue_size = 128,
+    .device_features = (1ULL << VIRTIO_F_VERSION_1) |
+                       (1ULL << VIRTIO_BLK_F_SIZE_MAX) |
+                       (1ULL << VIRTIO_BLK_F_SEG_MAX) |
+                       (1ULL << VIRTIO_BLK_F_BLK_SIZE) |
+                       (1ULL << VIRTIO_BLK_F_FLUSH),
+    .config_len = sizeof(struct virtio_blk_config),
+    .read_config = rootfs_blk_read_config,
+    .queue_notify = rootfs_blk_queue_notify,
+    .reset = rootfs_blk_reset,
+};
+
+void virtio_rootfs_blk_init(void) {
+    u64 rootfs_size = 0;
+    void *rootfs = linux_find_rootfs_module(&rootfs_size);
+    if (!rootfs || rootfs_size == 0) {
+        log_warn("[VBLK] no rootfs module, rootfs-blk backend not registered");
+        return;
+    }
+
+    g_rootfs_data = (const u8 *)rootfs;
+    g_rootfs_size = rootfs_size;
+    g_rootfs_capacity = rootfs_size / 512;  /* 扇区数 */
+    if (rootfs_size % 512) g_rootfs_capacity++;
+
+    log_info("[VBLK] rootfs-blk backend bound to memory module");
+    log_hex64("[VBLK] rootfs size=", rootfs_size);
+    log_hex64("[VBLK] rootfs capacity(sectors)=", g_rootfs_capacity);
+
+    virtio_mmio_register(&g_rootfs_blk_backend);
+}

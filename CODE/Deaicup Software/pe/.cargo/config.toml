@@ -1,0 +1,16 @@
+# Build for Windows PE64 without any MSVC toolchain:
+#   - lld-link (LLVM) links directly in MSVC flavor
+#   - all Win32 imports use raw-dylib (no import .lib files needed)
+#   - no CRT: we provide mainCRTStartup ourselves and link /NODEFAULTLIB
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+linker = "C:/Program Files/LLVM/bin/lld-link.exe"
+rustflags = [
+    "-C", "link-arg=/NODEFAULTLIB",
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE",
+    "-C", "link-arg=/ENTRY:mainCRTStartup",
+    "-C", "link-arg=/STACK:4194304",
+    "-C", "link-arg=/DEBUG:NONE",
+]

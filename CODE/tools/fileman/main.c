@@ -255,6 +255,7 @@ static void redraw_all(void) {
 }
 
 /* ---- 打开文件/目录 ---- */
+static void go_up(void);  /* 前向声明：open_selected 调用 go_up */
 static void open_selected(void) {
     if (selected < 0 || selected >= file_count) return;
     fm_entry *f = &files[selected];

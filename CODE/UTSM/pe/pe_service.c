@@ -1,15 +1,15 @@
-/* pe_service.c — PE 兼容层服务装配。
+/* pe_service.c — PE 兼容层服务装配.
  *
- * 将 pe_loader + pe_shim + x86emu32 整合为统一的 pe_service，
- * 通过 pe_get_service() 暴露给 DSK/cmd.elf（经 dsk_boot_context.reserved[4]）。
+ * 将 pe_loader + pe_shim + x86emu32 整合为统一的 pe_service,
+ * 通过 pe_get_service() 暴露给 DSK/cmd.elf(经 dsk_boot_context.reserved[4]).
  *
- * 执行策略：
- *   PE32+ (64位)：pe_load_image 加载（actual_base 重定位），
- *                 IAT 填 ms_abi shim 函数地址，Ring0 原生执行入口。
- *                 ExitProcess 经 __builtin_longjmp 跳回 pe_service_run。
- *   PE32  (32位)：直接以 preferred_base 加载到一块含栈/堆的大缓冲区，
- *                 无需重定位。IAT 填合成地址（0x00010000 | shim_idx），
- *                 x86emu32 解释执行，CALL 合成地址时拦截分发到 shim32。
+ * 执行策略:
+ *   PE32+ (64位):pe_load_image 加载(actual_base 重定位),
+ *                 IAT 填 ms_abi shim 函数地址,Ring0 原生执行入口.
+ *                 ExitProcess 经 __builtin_longjmp 跳回 pe_service_run.
+ *   PE32  (32位):直接以 preferred_base 加载到一块含栈/堆的大缓冲区,
+ *                 无需重定位.IAT 填合成地址(0x00010000 | shim_idx),
+ *                 x86emu32 解释执行,CALL 合成地址时拦截分发到 shim32.
  */
 
 #include "pe_loader.h"
@@ -25,11 +25,11 @@
 #define PE32_HEAP_SIZE   (256 * 1024)  /* 256KB 堆 */
 #define PE32_MAX_IAT     256
 
-/* 合成 shim 地址范围（与 pe_loader.c 一致） */
+/* 合成 shim 地址范围(与 pe_loader.c 一致) */
 #define PE32_SHIM_ADDR_BASE 0x00010000u
 #define PE32_SHIM_UNIMPL    0x0001FFFFu
 
-/* 前向声明（服务表引用） */
+/* 前向声明(服务表引用) */
 int  pe_service_load(const void *pe_data, u64 size, pe_image_info *out);
 int  pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit_code);
 void pe_service_unload(pe_image_info *info);
@@ -46,7 +46,7 @@ const pe_service *pe_get_service(void) {
     return &g_pe_service;
 }
 
-/* ===== 加载（不执行）===== */
+/* ===== 加载(不执行)===== */
 int pe_service_load(const void *pe_data, u64 size, pe_image_info *out) {
     if (!pe_data || !out) return -1;
     return pe_load_image(pe_data, size, out);
@@ -56,7 +56,7 @@ void pe_service_unload(pe_image_info *info) {
     pe_unload_image(info);
 }
 
-/* ===== PE32 专用加载器（加载到指定缓冲区，base=preferred_base，无重定位）===== */
+/* ===== PE32 专用加载器(加载到指定缓冲区,base=preferred_base,无重定位)===== */
 typedef struct {
     u8 *mem;                /* 大缓冲区起始 */
     u32 mem_size;           /* 缓冲区总大小 */
@@ -93,7 +93,7 @@ static int pe32_load_into(const void *pe_data, u64 size, pe32_interp_image *img)
     const image_section_header *sections = (const image_section_header *)
         ((const u8 *)opt + fh->size_of_optional_header);
 
-    /* 分配大缓冲区：[0 .. preferred_base + image_size + stack + heap] */
+    /* 分配大缓冲区:[0 .. preferred_base + image_size + stack + heap] */
     u32 total = preferred_base + image_size + PE32_STACK_SIZE + PE32_HEAP_SIZE;
     u8 *mem = (u8 *)kmem_alloc_aligned((u64)total, 0x1000);
     if (!mem) return -9;
@@ -118,11 +118,11 @@ static int pe32_load_into(const void *pe_data, u64 size, pe32_interp_image *img)
         for (u32 j = 0; j < copy_size; j++) img_start[va + j] = base[raw_off + j];
     }
 
-    /* 解析 imports，填充 IAT（合成地址） */
+    /* 解析 imports,填充 IAT(合成地址) */
     img->iat_count = 0;
     const image_data_directory *import_dir = &oh->data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir->virtual_address != 0 && import_dir->size != 0) {
-        /* RVA→offset 辅助 */
+        /* RVA->offset 辅助 */
         for (int dll_idx = 0; ; dll_idx++) {
             u32 imp_rva = import_dir->virtual_address + (u32)dll_idx * sizeof(image_import_descriptor);
             /* imp_rva 在 image 内 */
@@ -198,12 +198,61 @@ static int pe32_load_into(const void *pe_data, u64 size, pe32_interp_image *img)
     return 0;
 }
 
+/* ===== SSE/SSE2 启用 =====
+ * UTSM 自身用 -mno-sse -msoft-float 编译(启动早期安全),但 PE32+ 原生
+ * 代码(MSVC/LLVM x86_64 ABI)假定 SSE2 可用——浮点参数走 XMM0-3,
+ * egui 的 f32/f64 运算也全部编译为 SSE 指令.跳转 PE 入口前必须:
+ *   CR0.EM=0, CR0.TS=0, CR0.MP=1, CR0.NE=1
+ *   CR4.OSFXSR=1, CR4.OSXMMEXCPT=1
+ *   MXCSR=0x1F80(屏蔽全部异常、round-to-nearest,Windows 默认)
+ * 内核 C 代码不带 SSE 指令,开启后对内核自身无副作用. */
+static void pe_enable_sse(void) {
+    u64 cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~((1ULL << 2) | (1ULL << 3));  /* EM=0, TS=0 */
+    cr0 |=  (1ULL << 1) | (1ULL << 5);    /* MP=1, NE=1 */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);    /* OSFXSR=1, OSXMMEXCPT=1 */
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    __asm__ volatile("fninit");
+    {
+        u32 mxcsr = 0x1F80;
+        __asm__ volatile("ldmxcsr %0" :: "m"(mxcsr));
+    }
+    log_info("[PE] SSE/SSE2 enabled for native PE32+ execution");
+}
+
+/* ===== PE 专用大栈 =====
+ * 调用链 UTSM->DSK->cmd->pe_service 全部运行在 16KB 内核栈上,
+ * Rust/egui 渲染(tessellate + 软光栅)栈需求远超 16KB,
+ * 因此跳转 PE 入口前切换到 arena 分配的 1MB 独立栈.
+ * 正常 ret 时由 trampoline 恢复旧 RSP;ExitProcess longjmp 路径
+ * 由 setjmp 时保存的内核 RSP 恢复,两条路径都安全. */
+#define PE_STACK_BYTES (1024ULL * 1024ULL)
+static u64 g_pe_saved_rsp;
+
+typedef void (*pe_entry_fn)(void);
+
+static void pe_call_on_stack(pe_entry_fn fn, u64 stack_top) {
+    __asm__ volatile(
+        "mov %%rsp, %0\n\t"
+        "mov %1, %%rsp\n\t"
+        "call *%2\n\t"
+        "mov %0, %%rsp\n\t"
+        : "=m"(g_pe_saved_rsp)
+        : "r"(stack_top), "r"(fn)
+        : "memory", "cc",
+          "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11");
+}
+
 /* ===== 运行 =====
- * 加载 + 执行 + 卸载。返回 0 成功，*exit_code 为进程退出码。 */
+ * 加载 + 执行 + 卸载.返回 0 成功,*exit_code 为进程退出码. */
 int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit_code) {
     if (!pe_data || size == 0) return -1;
 
-    /* 初始化 shim 状态（cmdline for GetCommandLineA） */
+    /* 初始化 shim 状态(cmdline for GetCommandLineA) */
     pe_shim_init(cmdline ? cmdline : "");
 
     /* 先解析 PE 判断 32/64 位 */
@@ -224,14 +273,23 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
             return -5;
         }
         log_info("[PE] running PE32+ natively");
+        pe_enable_sse();
+
+        /* 独立 1MB 栈(内核栈仅 16KB,egui 渲染会溢出) */
+        u8 *pe_stack = (u8 *)kmem_alloc_aligned(PE_STACK_BYTES, 4096);
+        if (!pe_stack) {
+            log_error("[PE] stack alloc failed");
+            return -9;
+        }
+        u64 stack_top = (u64)pe_stack + PE_STACK_BYTES;  /* 4096 对齐 -> 16 对齐 */
 
         u64 code = 0;
         int jumped = pe_shim_setup_exit();
         if (jumped == 0) {
-            typedef void (*pe_entry_fn)(void);
             pe_entry_fn entry = (pe_entry_fn)info.entry_point;
             log_hex64("[PE] entry=", (u64)entry);
-            entry();
+            log_hex64("[PE] stack_top=", stack_top);
+            pe_call_on_stack(entry, stack_top);
             code = 0;
         } else {
             code = pe_shim_get_exit_code();

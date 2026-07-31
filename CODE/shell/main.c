@@ -13,6 +13,11 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 typedef long long          i64;
 
+/* freestanding 无 stddef.h，本地提供 offsetof */
+#ifndef offsetof
+#define offsetof(type, member) __builtin_offsetof(type, member)
+#endif
+
 #define COM1 0x3F8
 
 static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
@@ -85,6 +90,33 @@ typedef int (*shell_block_write_fn)(u32 index, u64 lba, u32 count, const void *b
 static shell_block_read_fn  g_block_read;
 static shell_block_write_fn g_block_write;
 
+/* ---- BUG-021 修复: kernel_api 镜像结构体 + 编译期偏移校验 ---- */
+typedef struct shell_block_api_mirror {
+    void *pad0; void *pad1;  /* register_device, device_count */
+    shell_block_read_fn  read;
+    shell_block_write_fn write;
+} shell_block_api_mirror;
+
+typedef struct shell_kernel_api_mirror {
+    u32 version; u32 size; u64 feature_bits;
+    const void *log; const void *mem; const void *utsm;
+    const void *irq; const void *pci; const void *dma;
+    const void *vfs; const void *net; const void *timer; const void *drr;
+    const void *rsdp_address; const void *fb_address;
+    u64 fb_width; u64 fb_height; u64 fb_pitch; u16 fb_bpp; u16 _pad_bpp;
+    const void *boot_modules_response;
+    int (*irq_register)(u8 irq, void *handler);
+    u64 hhdm_offset;
+    const shell_block_api_mirror *block;  /* 必须在偏移 0xA8 */
+    const void *mmio;
+    void *(*mm_map_mmio)(u64 phys, u64 size);
+    void (*mm_unmap_mmio)(void *virt, u64 size);
+} shell_kernel_api_mirror;
+_Static_assert(offsetof(shell_kernel_api_mirror, block) == 0xA8,
+    "shell_kernel_api_mirror.block offset must be 0xA8 (matching dkm_kernel_api)");
+_Static_assert(offsetof(shell_block_api_mirror, read) == 16,
+    "shell_block_api_mirror.read offset must be 16 (matching dkm_block_api)");
+
 /* FAT32 BPB / 目录项结构（与 DSK 一致，packed） */
 typedef struct __attribute__((packed)) {
     u8 jmp[3]; char oem[8]; u16 bps; u8 spc; u16 rsvd; u8 fc; u16 root_ent;
@@ -102,7 +134,8 @@ typedef struct __attribute__((packed)) {
 
 static u32 sh_r32(const u8 *p) { return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24); }
 static u16 sh_r16(const u8 *p) { return (u16)p[0]|((u16)p[1]<<8); }
-static int sh_neq11(const char *a, const char *b) { for(int i=0;i<11;i++) if(a[i]!=b[i]) return 0; return 1; }
+/* BUG-20260730: 8.3 短名比较改为大小写不敏感，兼容 Windows NTRes 小写扩展 */
+static int sh_neq11(const char *a, const char *b) { for(int i=0;i<11;i++){char ca=a[i],cb=b[i];if(ca>='a'&&ca<='z')ca-=32;if(cb>='a'&&cb<='z')cb-=32;if(ca!=cb)return 0;}return 1; }
 
 /* 批量读写缓冲区（与 DSK 对齐：256 扇区覆盖 BPB+FAT+根目录+小文件） */
 static u8 g_disk[131072];      /* 256 扇区 BPB+FAT+根目录缓存 */
@@ -122,6 +155,25 @@ static int sh_disk_load(void) {
     if (bpb->spf == 0 || bpb->root_clus < 2) return -3;
     g_disk_loaded = 1;
     return 0;
+}
+
+/* BUG-019 修复: FAT 按需扇区读取缓冲区 + 辅助函数。
+ * 读取路径: 当 FAT 条目超出 g_disk 缓冲区时，按需读取单扇区。 */
+static u8 g_sh_fat_sec[512];
+
+static u32 sh_fat32_get_next_cluster(u32 fat_byte_off, u32 clus, u32 fat_rsvd_sec) {
+    u32 ent_off = fat_byte_off + clus * 4;
+    /* 情况 1: 在预读缓冲区内 */
+    if (ent_off + 4 <= sizeof(g_disk)) {
+        return sh_r32(g_disk + ent_off) & 0x0FFFFFFF;
+    }
+    /* 情况 2: 超出预读缓冲区——按需读取单扇区 */
+    u32 fat_byte_in_fat = clus * 4;
+    u32 sec_idx = fat_byte_in_fat / 512;
+    u32 off_in_sec = fat_byte_in_fat % 512;
+    u32 sec_lba = fat_rsvd_sec + sec_idx;
+    if (sh_read_sectors(sec_lba, 1, g_sh_fat_sec) != 0) return 0x0FFFFFFF;
+    return sh_r32(g_sh_fat_sec + off_in_sec) & 0x0FFFFFFF;
 }
 
 /* 把 "file.txt" / "NAME" 转为 11 字符 8.3 名（大写，空格填充）
@@ -221,9 +273,8 @@ static int fat32_find_dir(u32 dir_clus, const char *name11, u32 *out_clus) {
                 return 0;
             }
         }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取 */
+        clus = sh_fat32_get_next_cluster(fat_byte_off, clus, bpb->rsvd);
     }
 done_dir:
     return -1;
@@ -253,9 +304,8 @@ static int fat32_read_file_in_dir(u32 dir_clus, const char *name11,
             cb = g_cluster;
         }
         if (fat32_find_in_root(cb, spc, name11, &found_clus, &found_size, 0) == 0) { found = 1; break; }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取 */
+        clus = sh_fat32_get_next_cluster(fat_byte_off, clus, bpb->rsvd);
     }
     if (!found) return -5;
     if (found_size > sizeof(g_fdata)) return -6;
@@ -274,9 +324,8 @@ static int fat32_read_file_in_dir(u32 dir_clus, const char *name11,
         }
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
         dst += fc_bytes; remaining -= fc_bytes;
-        u32 fo = fat_byte_off + fc * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        fc = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取 */
+        fc = sh_fat32_get_next_cluster(fat_byte_off, fc, bpb->rsvd);
     }
     *out_data = g_fdata; *out_size = found_size;
     return 0;
@@ -313,6 +362,63 @@ static int get_bin_cluster(u32 *out_clus) {
     return 0;
 }
 
+/* /SYSTEM/system/deshab64 目录首簇号缓存
+ * 实际 FAT32 路径: ROOT → SYSTEM → system → deshab64
+ * 注意: "system" 大写化后与 "SYSTEM" 同名，但它们在不同层级，不冲突 */
+static u32 g_deshab64_clus = 0;
+static int g_deshab64_checked = 0;
+
+static int get_deshab64_cluster(u32 *out_clus) {
+    if (g_deshab64_checked) {
+        if (g_deshab64_clus == 0) return -1;
+        *out_clus = g_deshab64_clus;
+        return 0;
+    }
+    g_deshab64_checked = 1;
+    if (sh_disk_load() != 0) { g_deshab64_clus = 0; return -1; }
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    /* 第1级: ROOT → SYSTEM (8.3 名 "SYSTEM   ") */
+    char sys83[11] = {'S','Y','S','T','E','M',' ',' ',' ',' ',' '};
+    u32 sys_clus = 0;
+    if (fat32_find_dir(bpb->root_clus, sys83, &sys_clus) != 0) {
+        g_deshab64_clus = 0; return -1;
+    }
+    /* 第2级: SYSTEM → system (8.3 名也是 "SYSTEM   ") */
+    char sub83[11] = {'S','Y','S','T','E','M',' ',' ',' ',' ',' '};
+    u32 sub_clus = 0;
+    if (fat32_find_dir(sys_clus, sub83, &sub_clus) != 0) {
+        g_deshab64_clus = 0; return -1;
+    }
+    /* 第3级: system → deshab64 (8.3 名 "DESHAB64  ") */
+    char d6483[11] = {'D','E','S','H','A','B','6','4',' ',' ',' '};
+    if (fat32_find_dir(sub_clus, d6483, &g_deshab64_clus) != 0) {
+        g_deshab64_clus = 0; return -1;
+    }
+    *out_clus = g_deshab64_clus;
+    return 0;
+}
+
+/* /deshab64/dev 目录首簇号缓存 */
+static u32 g_dev_clus = 0;
+static int g_dev_checked = 0;
+
+static int get_dev_cluster(u32 *out_clus) {
+    if (g_dev_checked) {
+        if (g_dev_clus == 0) return -1;
+        *out_clus = g_dev_clus;
+        return 0;
+    }
+    g_dev_checked = 1;
+    u32 d64_clus = 0;
+    if (get_deshab64_cluster(&d64_clus) != 0) { g_dev_clus = 0; return -1; }
+    char dev83[11] = {'D','E','V',' ',' ',' ',' ',' ',' ',' ',' '};
+    if (fat32_find_dir(d64_clus, dev83, &g_dev_clus) != 0) {
+        g_dev_clus = 0; return -1;
+    }
+    *out_clus = g_dev_clus;
+    return 0;
+}
+
 /* 写入根目录下指定 8.3 名文件（存在则替换，不存在则新建）。
  * 依赖 g_disk 已加载 BPB+FAT。返回 0 成功。 */
 static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
@@ -328,10 +434,304 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
     u32 root_clus = bpb->root_clus;
     u32 cluster_bytes = spc * 512;
 
-    u32 root_lba = data_lba + (root_clus - 2) * spc;
-    u8 *root_buf = g_disk + (u64)root_lba * 512;
+    /* BUG-20260730-P13: Follow the entire FAT chain when scanning root directory.
+     * Previously only the first cluster was scanned; when it was full,
+     * writes failed with "no free dir entry" even though later clusters
+     * might have free entries. */
+    u32 scan_clus = root_clus;
+    u8 root_dir_buf[4096];
+    u8 *root_buf = 0;
+    int root_in_gdisk = 0;
+    u32 root_dir_clus = 0;     /* cluster number of the dir buf we are scanning */
+    shell_fat32_de *dir = 0;   /* dir entry array pointer for the current cluster */
+    int free_entry = -1;
+    u32 existing_clus = 0;
+    int found = 0;
+    u32 existing_idx = 0;
+
+    while (scan_clus >= 2 && scan_clus < 0x0FFFFFF8) {
+        u32 scan_lba = data_lba + (scan_clus - 2) * spc;
+        root_in_gdisk = ((u64)scan_lba * 512 + cluster_bytes <= 256ULL * 512);
+        if (root_in_gdisk) {
+            root_buf = g_disk + (u64)scan_lba * 512;
+        } else {
+            if (sh_read_sectors(scan_lba, spc, root_dir_buf) != 0) return -2;
+            root_buf = root_dir_buf;
+        }
+        root_dir_clus = scan_clus;
+
+        u32 max_entries = cluster_bytes / 32;
+        dir = (shell_fat32_de *)root_buf;
+        for (u32 e = 0; e < max_entries; e++) {
+            if (dir[e].name[0] == 0) {
+                if (free_entry < 0) free_entry = (int)e;
+                goto scan_done;  /* end-of-dir, no need to check further clusters */
+            }
+            if ((u8)dir[e].name[0] == 0xE5) {
+                if (free_entry < 0) free_entry = (int)e;
+                continue;
+            }
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            if (sh_neq11(dir[e].name, name11)) {
+                existing_clus = (u32)sh_r16((const u8*)&dir[e].clow) | ((u32)sh_r16((const u8*)&dir[e].chigh) << 16);
+                found = 1; existing_idx = e;
+                if (free_entry < 0) free_entry = (int)e;
+                goto scan_done;
+            }
+        }
+        /* No free entry and no match in this cluster — follow FAT chain */
+        scan_clus = sh_fat32_get_next_cluster(fat_byte_off, scan_clus, bpb->rsvd);
+    }
+scan_done:
+    ;
+    /* root_buf / root_dir_clus / root_in_gdisk now reflect the cluster
+     * where the free entry or existing entry was found (or the last
+     * cluster if nothing was found — allocation will be needed). */
+
+    u32 bytes_needed = size > 0 ? size : 1;
+    u32 clusters_needed = (bytes_needed + cluster_bytes - 1) / cluster_bytes;
+    u32 first_clus = 0;
+    u32 prev_clus = 0;
+
+    if (found && existing_clus >= 2) {
+        first_clus = existing_clus;
+        u32 cur = existing_clus;
+        u32 count = 0;
+        while (cur >= 2 && cur < 0x0FFFFFF8 && count < clusters_needed) {
+            prev_clus = cur;
+            u32 fo = fat_byte_off + cur * 4;
+            if (fo + 4 > sizeof(g_disk)) break;
+            cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+            count++;
+        }
+        while (count < clusters_needed) {
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) return -3;
+            /* BUG-20260730-P01: Mark newly allocated cluster as EOC immediately to prevent re-allocation */
+            {
+                u32 nfo = fat_byte_off + newc * 4;
+                if (nfo + 4 <= sizeof(g_disk)) {
+                    g_disk[nfo] = 0xF8; g_disk[nfo+1] = 0xFF; g_disk[nfo+2] = 0xFF; g_disk[nfo+3] = (g_disk[nfo+3] & 0xF0) | 0x0F;
+                }
+            }
+            u32 pfo = fat_byte_off + prev_clus * 4;
+            if (pfo + 4 <= sizeof(g_disk)) {
+                g_disk[pfo] = (u8)(newc & 0xFF);
+                g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                g_disk[pfo+3] = (g_disk[pfo+3] & 0xF0) | (u8)((newc >> 24) & 0x0F);
+            }
+            prev_clus = newc;
+            count++;
+        }
+        /* BUG-20260730-P02: Save original next pointer before overwriting with EOC, then free old chain tail */
+        if (prev_clus >= 2) {
+            u32 fo = fat_byte_off + prev_clus * 4;
+            u32 original_next = 0;
+            if (fo + 4 <= sizeof(g_disk)) {
+                original_next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+                /* Write EOC (already EOC if just allocated, but set for existing chain truncation) */
+                g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = (g_disk[fo+3] & 0xF0) | 0x0F;
+            }
+            /* Free old cluster chain tail beyond the truncation point */
+            u32 next = original_next;
+            while (next >= 2 && next < 0x0FFFFFF8) {
+                u32 nfo = fat_byte_off + next * 4;
+                u32 nn = 0;
+                if (nfo + 4 <= sizeof(g_disk)) nn = sh_r32(g_disk + nfo) & 0x0FFFFFFF;
+                /* BUG-20260730-P11: Preserve high 4 bits when clearing FAT entry */
+                if (nfo + 4 <= sizeof(g_disk)) { g_disk[nfo] = 0; g_disk[nfo+1] = 0; g_disk[nfo+2] = 0; g_disk[nfo+3] = g_disk[nfo+3] & 0xF0; }
+                next = nn;
+            }
+        }
+    } else {
+        /* New file — need a free directory entry */
+        if (free_entry < 0) {
+            /* BUG-20260730-P13: No free entry in any existing cluster.
+             * Allocate a new cluster, append it to the root dir FAT chain,
+             * zero it, and use the first entry. */
+            u32 new_dir_clus = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { new_dir_clus = c; break; }
+            }
+            if (new_dir_clus == 0) return -4;
+            /* Mark new cluster as EOC */
+            {
+                u32 nfo = fat_byte_off + new_dir_clus * 4;
+                if (nfo + 4 <= sizeof(g_disk)) {
+                    g_disk[nfo] = 0xF8; g_disk[nfo+1] = 0xFF; g_disk[nfo+2] = 0xFF; g_disk[nfo+3] = (g_disk[nfo+3] & 0xF0) | 0x0F;
+                }
+            }
+            /* Find the tail of the root dir FAT chain and link the new cluster */
+            u32 tail = root_clus;
+            for (;;) {
+                u32 tfo = fat_byte_off + tail * 4;
+                u32 next;
+                if (tfo + 4 <= sizeof(g_disk))
+                    next = sh_r32(g_disk + tfo) & 0x0FFFFFFF;
+                else
+                    next = sh_fat32_get_next_cluster(fat_byte_off, tail, bpb->rsvd);
+                if (next >= 2 && next < 0x0FFFFFF8) {
+                    tail = next;
+                } else {
+                    /* tail is the last cluster — link new_dir_clus after it */
+                    if (tfo + 4 <= sizeof(g_disk)) {
+                        g_disk[tfo] = (u8)(new_dir_clus & 0xFF);
+                        g_disk[tfo+1] = (u8)((new_dir_clus >> 8) & 0xFF);
+                        g_disk[tfo+2] = (u8)((new_dir_clus >> 16) & 0xFF);
+                        g_disk[tfo+3] = (g_disk[tfo+3] & 0xF0) | (u8)((new_dir_clus >> 24) & 0x0F);
+                    }
+                    break;
+                }
+            }
+            /* Zero the new directory cluster on disk */
+            u32 new_lba = data_lba + (new_dir_clus - 2) * spc;
+            for (u32 b = 0; b < cluster_bytes; b++) g_cluster[b] = 0;
+            if (sh_write_sectors(new_lba, spc, g_cluster) != 0) return -4;
+            /* Set up root_buf/dir to point at the new cluster */
+            root_dir_clus = new_dir_clus;
+            root_in_gdisk = 0;
+            /* root_dir_buf may have stale data; copy zeroes from g_cluster */
+            for (u32 b = 0; b < cluster_bytes; b++) root_dir_buf[b] = 0;
+            root_buf = root_dir_buf;
+            dir = (shell_fat32_de *)root_buf;
+            free_entry = 0;
+        }
+        for (u32 i = 0; i < clusters_needed; i++) {
+            u32 newc = 0;
+            for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
+                u32 fo = fat_byte_off + c * 4;
+                if (fo + 4 > sizeof(g_disk)) break;
+                if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
+            }
+            if (newc == 0) return -3;
+            /* BUG-20260730-P01: Mark newly allocated cluster as EOC immediately to prevent re-allocation */
+            {
+                u32 nfo = fat_byte_off + newc * 4;
+                if (nfo + 4 <= sizeof(g_disk)) {
+                    g_disk[nfo] = 0xF8; g_disk[nfo+1] = 0xFF; g_disk[nfo+2] = 0xFF; g_disk[nfo+3] = (g_disk[nfo+3] & 0xF0) | 0x0F;
+                }
+            }
+            if (i == 0) first_clus = newc;
+            if (prev_clus >= 2) {
+                u32 pfo = fat_byte_off + prev_clus * 4;
+                if (pfo + 4 <= sizeof(g_disk)) {
+                    g_disk[pfo] = (u8)(newc & 0xFF);
+                    g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
+                    g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
+                    g_disk[pfo+3] = (g_disk[pfo+3] & 0xF0) | (u8)((newc >> 24) & 0x0F);
+                }
+            }
+            prev_clus = newc;
+        }
+        /* EOC already set during allocation — no need to write again */
+    }
+
+    /* 写数据到簇 */
+    u32 remaining = size;
+    const u8 *src = data;
+    u32 cur = first_clus;
+    u32 ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        u32 chunk = remaining < cluster_bytes ? remaining : cluster_bytes;
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            u8 *dst = g_disk + (u64)clba * 512;
+            for (u32 b = 0; b < chunk; b++) dst[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) dst[b] = 0;
+        } else {
+            if (sh_read_sectors(clba, spc, g_cluster) != 0) return -5;
+            for (u32 b = 0; b < chunk; b++) g_cluster[b] = src[b];
+            for (u32 b = chunk; b < cluster_bytes; b++) g_cluster[b] = 0;
+            if (sh_write_sectors(clba, spc, g_cluster) != 0) return -6;
+        }
+        src += chunk; remaining -= chunk; ci++;
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+    }
+
+    /* 更新目录项 */
+    u32 entry_idx = found ? existing_idx : (u32)free_entry;
+    shell_fat32_de *e = &dir[entry_idx];
+    if (!found) {
+        for (int i = 0; i < 11; i++) e->name[i] = name11[i];
+        e->attr = 0x20; e->ntr = 0; e->ctenth = 0; e->ctime = 0; e->cdate = 0; e->adate = 0;
+    }
+    e->chigh = (u16)((first_clus >> 16) & 0xFFFF);
+    e->clow = (u16)(first_clus & 0xFFFF);
+    e->fsize = size;
+
+    /* BUG-20260730-P03: Only write back FAT sectors within g_disk buffer bounds (256 sectors) */
+    for (u32 f = 0; f < bpb->fc; f++) {
+        u32 flba = fat_lba + f * fat_sectors;
+        if (flba >= 256) continue;  /* FAT copy entirely beyond buffer */
+        u32 sectors_to_write = fat_sectors;
+        if (flba + sectors_to_write > 256) sectors_to_write = 256 - flba;
+        if (sectors_to_write > 0) {
+            if (sh_write_sectors(flba, sectors_to_write, g_disk + (u64)flba * 512) != 0) return -7;
+        }
+    }
+    /* BUG-20260730-P13: Write back the correct cluster that was modified,
+     * which may not be the first cluster of the root directory. */
+    u32 root_dir_lba = data_lba + (root_dir_clus - 2) * spc;
+    /* BUG-20260730-P12: Write back root dir using the correct buffer */
+    if (root_in_gdisk) {
+        /* root_buf points into g_disk, already updated in-place */
+        if (sh_write_sectors(root_dir_lba, spc, g_disk + (u64)root_dir_lba * 512) != 0) return -8;
+    } else {
+        /* root_buf points to root_dir_buf, write it directly */
+        if (sh_write_sectors(root_dir_lba, spc, root_dir_buf) != 0) return -8;
+    }
+    cur = first_clus; ci = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
+        u32 clba = data_lba + (cur - 2) * spc;
+        if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
+            if (sh_write_sectors(clba, spc, g_disk + (u64)clba * 512) != 0) return -9;
+        }
+        u32 fo = fat_byte_off + cur * 4;
+        if (fo + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        ci++;
+    }
+    g_disk_loaded = 0;  /* 下次操作重新加载，避免使用脏缓存 */
+    return 0;
+}
+
+/* 向指定目录簇写入文件（存在则替换，不存在则新建）。
+ * dir_clus: 目录起始簇号。name11: 8.3 名。
+ * dev/ 等小目录通常只有 1 簇，简化为单簇处理。
+ * 返回 0 成功。 */
+static int fat32_write_file_in_dir(u32 dir_clus, const char *name11, const u8 *data, u32 size) {
+    if (sh_disk_load() != 0) return -1;
+    if (sh_read_sectors(0, 256, g_disk) != 0) return -2;
+    const shell_fat32_bpb *bpb = (const shell_fat32_bpb *)g_disk;
+    u32 spc = bpb->spc;
+    u32 fat_lba = bpb->rsvd;
+    u32 fat_sectors = bpb->spf;
+    u32 data_lba = bpb->rsvd + (u32)bpb->fc * bpb->spf;
+    u32 fat_byte_off = bpb->rsvd * 512;
+    u32 cluster_bytes = spc * 512;
+
+    /* 读取目录簇到 g_cluster */
+    u32 dir_lba = data_lba + (dir_clus - 2) * spc;
+    u8 dir_buf[4096];  /* 临时目录缓冲，避免覆盖 g_cluster */
+    if ((u64)dir_lba * 512 + cluster_bytes <= 256ULL * 512) {
+        for (u32 b = 0; b < cluster_bytes; b++) dir_buf[b] = g_disk[(u64)dir_lba * 512 + b];
+    } else {
+        if (sh_read_sectors(dir_lba, spc, dir_buf) != 0) return -3;
+    }
+
     u32 max_entries = cluster_bytes / 32;
-    shell_fat32_de *dir = (shell_fat32_de *)root_buf;
+    shell_fat32_de *dir = (shell_fat32_de *)dir_buf;
     int free_entry = -1;
     u32 existing_clus = 0;
     int found = 0;
@@ -372,36 +772,44 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
                 if (fo + 4 > sizeof(g_disk)) break;
                 if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
             }
-            if (newc == 0) return -3;
+            if (newc == 0) return -4;
+            /* BUG-20260730-P01: Mark newly allocated cluster as EOC immediately to prevent re-allocation */
+            {
+                u32 nfo = fat_byte_off + newc * 4;
+                if (nfo + 4 <= sizeof(g_disk)) {
+                    g_disk[nfo] = 0xF8; g_disk[nfo+1] = 0xFF; g_disk[nfo+2] = 0xFF; g_disk[nfo+3] = (g_disk[nfo+3] & 0xF0) | 0x0F;
+                }
+            }
             u32 pfo = fat_byte_off + prev_clus * 4;
             if (pfo + 4 <= sizeof(g_disk)) {
                 g_disk[pfo] = (u8)(newc & 0xFF);
                 g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
                 g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
-                g_disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+                g_disk[pfo+3] = (g_disk[pfo+3] & 0xF0) | (u8)((newc >> 24) & 0x0F);
             }
             prev_clus = newc;
             count++;
         }
+        /* BUG-20260730-P02: Save original next pointer before overwriting with EOC, then free old chain tail */
         if (prev_clus >= 2) {
             u32 fo = fat_byte_off + prev_clus * 4;
+            u32 original_next = 0;
             if (fo + 4 <= sizeof(g_disk)) {
-                g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = 0x0F;
+                original_next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+                g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = (g_disk[fo+3] & 0xF0) | 0x0F;
+            }
+            u32 next = original_next;
+            while (next >= 2 && next < 0x0FFFFFF8) {
+                u32 nfo = fat_byte_off + next * 4;
+                u32 nn = 0;
+                if (nfo + 4 <= sizeof(g_disk)) nn = sh_r32(g_disk + nfo) & 0x0FFFFFFF;
+                /* BUG-20260730-P11: Preserve high 4 bits when clearing FAT entry */
+                if (nfo + 4 <= sizeof(g_disk)) { g_disk[nfo] = 0; g_disk[nfo+1] = 0; g_disk[nfo+2] = 0; g_disk[nfo+3] = g_disk[nfo+3] & 0xF0; }
+                next = nn;
             }
         }
-        /* 释放多余旧簇 */
-        u32 next = 0;
-        u32 fo = fat_byte_off + prev_clus * 4;
-        if (fo + 4 <= sizeof(g_disk)) next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
-        while (next >= 2 && next < 0x0FFFFFF8) {
-            u32 nfo = fat_byte_off + next * 4;
-            u32 nn = 0;
-            if (nfo + 4 <= sizeof(g_disk)) nn = sh_r32(g_disk + nfo) & 0x0FFFFFFF;
-            g_disk[nfo] = 0; g_disk[nfo+1] = 0; g_disk[nfo+2] = 0; g_disk[nfo+3] = 0;
-            next = nn;
-        }
     } else {
-        if (free_entry < 0) return -4;
+        if (free_entry < 0) return -5;
         for (u32 i = 0; i < clusters_needed; i++) {
             u32 newc = 0;
             for (u32 c = 2; c < (fat_sectors * 512) / 4; c++) {
@@ -409,21 +817,25 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
                 if (fo + 4 > sizeof(g_disk)) break;
                 if ((sh_r32(g_disk + fo) & 0x0FFFFFFF) == 0) { newc = c; break; }
             }
-            if (newc == 0) return -3;
+            if (newc == 0) return -4;
+            /* BUG-20260730-P01: Mark newly allocated cluster as EOC immediately to prevent re-allocation */
+            {
+                u32 nfo = fat_byte_off + newc * 4;
+                if (nfo + 4 <= sizeof(g_disk)) {
+                    g_disk[nfo] = 0xF8; g_disk[nfo+1] = 0xFF; g_disk[nfo+2] = 0xFF; g_disk[nfo+3] = (g_disk[nfo+3] & 0xF0) | 0x0F;
+                }
+            }
             if (i == 0) first_clus = newc;
             if (prev_clus >= 2) {
                 u32 pfo = fat_byte_off + prev_clus * 4;
                 g_disk[pfo] = (u8)(newc & 0xFF);
                 g_disk[pfo+1] = (u8)((newc >> 8) & 0xFF);
                 g_disk[pfo+2] = (u8)((newc >> 16) & 0xFF);
-                g_disk[pfo+3] = (u8)((newc >> 24) & 0x0F);
+                g_disk[pfo+3] = (g_disk[pfo+3] & 0xF0) | (u8)((newc >> 24) & 0x0F);
             }
             prev_clus = newc;
         }
-        if (prev_clus >= 2) {
-            u32 fo = fat_byte_off + prev_clus * 4;
-            g_disk[fo] = 0xF8; g_disk[fo+1] = 0xFF; g_disk[fo+2] = 0xFF; g_disk[fo+3] = 0x0F;
-        }
+        /* EOC already set during allocation — no need to write again */
     }
 
     /* 写数据到簇 */
@@ -439,15 +851,14 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
             for (u32 b = 0; b < chunk; b++) dst[b] = src[b];
             for (u32 b = chunk; b < cluster_bytes; b++) dst[b] = 0;
         } else {
-            if (sh_read_sectors(clba, spc, g_cluster) != 0) return -5;
             for (u32 b = 0; b < chunk; b++) g_cluster[b] = src[b];
             for (u32 b = chunk; b < cluster_bytes; b++) g_cluster[b] = 0;
             if (sh_write_sectors(clba, spc, g_cluster) != 0) return -6;
         }
         src += chunk; remaining -= chunk; ci++;
-        u32 fo = fat_byte_off + cur * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        u32 fo2 = fat_byte_off + cur * 4;
+        if (fo2 + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo2) & 0x0FFFFFFF;
     }
 
     /* 更新目录项 */
@@ -461,27 +872,36 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
     e->clow = (u16)(first_clus & 0xFFFF);
     e->fsize = size;
 
-    /* 回写 FAT（两份）+ 根目录 + 缓冲区内的数据簇 */
+    /* BUG-20260730-P03: Only write back FAT sectors within g_disk buffer bounds (256 sectors) */
     for (u32 f = 0; f < bpb->fc; f++) {
         u32 flba = fat_lba + f * fat_sectors;
-        if (sh_write_sectors(flba, fat_sectors, g_disk + (u64)flba * 512) != 0) return -7;
+        if (flba >= 256) continue;
+        u32 sectors_to_write = fat_sectors;
+        if (flba + sectors_to_write > 256) sectors_to_write = 256 - flba;
+        if (sectors_to_write > 0) {
+            if (sh_write_sectors(flba, sectors_to_write, g_disk + (u64)flba * 512) != 0) return -7;
+        }
     }
-    u32 root_dir_lba = data_lba + (root_clus - 2) * spc;
-    if ((u64)root_dir_lba * 512 + cluster_bytes <= 256ULL * 512) {
-        if (sh_write_sectors(root_dir_lba, spc, g_disk + (u64)root_dir_lba * 512) != 0) return -8;
+    /* 回写目录簇 */
+    if ((u64)dir_lba * 512 + cluster_bytes <= 256ULL * 512) {
+        for (u32 b = 0; b < cluster_bytes; b++) g_disk[(u64)dir_lba * 512 + b] = dir_buf[b];
+        if (sh_write_sectors(dir_lba, spc, g_disk + (u64)dir_lba * 512) != 0) return -8;
+    } else {
+        if (sh_write_sectors(dir_lba, spc, dir_buf) != 0) return -8;
     }
+    /* 回写数据簇（仅在 g_disk 缓冲内） */
     cur = first_clus; ci = 0;
     while (cur >= 2 && cur < 0x0FFFFFF8 && ci < clusters_needed) {
         u32 clba = data_lba + (cur - 2) * spc;
         if ((u64)clba * 512 + cluster_bytes <= 256ULL * 512) {
             if (sh_write_sectors(clba, spc, g_disk + (u64)clba * 512) != 0) return -9;
         }
-        u32 fo = fat_byte_off + cur * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        cur = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        u32 fo2 = fat_byte_off + cur * 4;
+        if (fo2 + 4 > sizeof(g_disk)) break;
+        cur = sh_r32(g_disk + fo2) & 0x0FFFFFFF;
         ci++;
     }
-    g_disk_loaded = 0;  /* 下次操作重新加载，避免使用脏缓存 */
+    g_disk_loaded = 0;
     return 0;
 }
 
@@ -499,7 +919,16 @@ static int fat32_delete_root_file(const char *name11) {
     u32 root_clus = bpb->root_clus;
 
     u32 root_lba = data_lba + (root_clus - 2) * spc;
-    u8 *root_buf = g_disk + (u64)root_lba * 512;
+    /* BUG-20260730-P12: Use temporary buffer if root dir is beyond g_disk bounds */
+    u8 del_dir_buf[4096];
+    u8 *root_buf;
+    int root_in_gdisk = ((u64)root_lba * 512 + (u64)spc * 512 <= 256ULL * 512);
+    if (root_in_gdisk) {
+        root_buf = g_disk + (u64)root_lba * 512;
+    } else {
+        if (sh_read_sectors(root_lba, spc, del_dir_buf) != 0) return -3;
+        root_buf = del_dir_buf;
+    }
     u32 max_entries = (spc * 512) / 32;
     shell_fat32_de *dir = (shell_fat32_de *)root_buf;
     u32 found_idx = 0xFFFFFFFFu;
@@ -518,18 +947,29 @@ static int fat32_delete_root_file(const char *name11) {
         u32 fo = fat_byte_off + cur * 4;
         u32 next = 0;
         if (fo + 4 <= sizeof(g_disk)) next = sh_r32(g_disk + fo) & 0x0FFFFFFF;
-        g_disk[fo] = 0; g_disk[fo+1] = 0; g_disk[fo+2] = 0; g_disk[fo+3] = 0;
+        /* BUG-20260730-P01: Preserve high 4 bits when clearing FAT entry */
+        if (fo + 4 <= sizeof(g_disk)) { g_disk[fo] = 0; g_disk[fo+1] = 0; g_disk[fo+2] = 0; g_disk[fo+3] = g_disk[fo+3] & 0xF0; }
         cur = next;
     }
     /* 标记目录项为已删除 */
     dir[found_idx].name[0] = (char)0xE5;
 
-    /* 回写 FAT + 根目录 */
+    /* BUG-20260730-P03: Only write back FAT sectors within g_disk buffer bounds (256 sectors) */
     for (u32 f = 0; f < bpb->fc; f++) {
         u32 flba = fat_lba + f * fat_sectors;
-        if (sh_write_sectors(flba, fat_sectors, g_disk + (u64)flba * 512) != 0) return -4;
+        if (flba >= 256) continue;
+        u32 sectors_to_write = fat_sectors;
+        if (flba + sectors_to_write > 256) sectors_to_write = 256 - flba;
+        if (sectors_to_write > 0) {
+            if (sh_write_sectors(flba, sectors_to_write, g_disk + (u64)flba * 512) != 0) return -4;
+        }
     }
-    if (sh_write_sectors(root_lba, spc, g_disk + (u64)root_lba * 512) != 0) return -5;
+    /* BUG-20260730-P12: Write back root dir using the correct buffer */
+    if (root_in_gdisk) {
+        if (sh_write_sectors(root_lba, spc, g_disk + (u64)root_lba * 512) != 0) return -5;
+    } else {
+        if (sh_write_sectors(root_lba, spc, del_dir_buf) != 0) return -5;
+    }
     g_disk_loaded = 0;
     return 0;
 }
@@ -561,13 +1001,80 @@ static int fat32_list_root(int (*emit)(const char *name, u32 size, u8 attr, void
             name_from_83(dir[e].name, disp);
             if (emit(disp, dir[e].fsize, dir[e].attr, u) != 0) goto done;
         }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(g_disk)) break;
-        clus = sh_r32(g_disk + fo) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取 */
+        clus = sh_fat32_get_next_cluster(fat_byte_off, clus, bpb->rsvd);
     }
 done:
     return 0;
 }
+
+/* ---- Shell 内嵌 INI 解析器（移植自 DSK，用于 $check_config 指令） ---- */
+typedef struct { char section[32]; char key[32]; char value[64]; } sh_ini_entry;
+typedef struct { sh_ini_entry entries[64]; u32 count; } sh_ini_config;
+
+static int sh_ini_streq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+
+static int sh_ini_streq_n(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) { if (!a[i] || !b[i] || a[i] != b[i]) return 0; }
+    return 1;
+}
+
+static int sh_ini_parse(const char *text, u32 size, sh_ini_config *cfg) {
+    if (!text || !cfg) return -1;
+    cfg->count = 0;
+    char cur_sec[32]; for (int i = 0; i < 32; i++) cur_sec[i] = 0;
+    u32 pos = 0;
+    while (pos < size) {
+        while (pos < size && (text[pos] == ' ' || text[pos] == '\t')) pos++;
+        if (pos >= size) break;
+        char c = text[pos];
+        if (c == '\n') { pos++; continue; }
+        if (c == '#' || c == ';') { while (pos < size && text[pos] != '\n') pos++; continue; }
+        if (c == '[') {
+            pos++;
+            u32 si = 0;
+            while (pos < size && text[pos] != ']' && text[pos] != '\n' && si + 1 < 32) cur_sec[si++] = text[pos++];
+            cur_sec[si] = 0;
+            while (pos < size && text[pos] != '\n') pos++;
+            continue;
+        }
+        if (cfg->count >= 64) break;
+        sh_ini_entry *e = &cfg->entries[cfg->count];
+        u32 ki = 0;
+        while (pos < size && text[pos] != '=' && text[pos] != '\n' && !(text[pos] == ' ' || text[pos] == '\t') && ki + 1 < 32) e->key[ki++] = text[pos++];
+        e->key[ki] = 0;
+        while (pos < size && (text[pos] == ' ' || text[pos] == '\t') && text[pos] != '\n') pos++;
+        if (pos >= size || text[pos] != '=') { while (pos < size && text[pos] != '\n') pos++; continue; }
+        pos++;
+        while (pos < size && (text[pos] == ' ' || text[pos] == '\t') && text[pos] != '\n') pos++;
+        u32 vi = 0;
+        while (pos < size && text[pos] != '\n' && vi + 1 < 64) e->value[vi++] = text[pos++];
+        while (vi > 0 && (e->value[vi-1] == ' ' || e->value[vi-1] == '\t')) vi--;
+        e->value[vi] = 0;
+        for (int i = 0; i < 32; i++) e->section[i] = cur_sec[i];
+        cfg->count++;
+    }
+    return 0;
+}
+
+static const char *sh_ini_get(const sh_ini_config *cfg, const char *sec, const char *key) {
+    if (!cfg || !sec || !key) return 0;
+    for (u32 i = 0; i < cfg->count; i++)
+        if (sh_ini_streq(cfg->entries[i].section, sec) && sh_ini_streq(cfg->entries[i].key, key))
+            return cfg->entries[i].value;
+    return 0;
+}
+
+/* ---- 测试脚本前向声明 ---- */
+#define SCRIPT_BUF_MAX 65536
+static char g_script_buf[SCRIPT_BUF_MAX];
+static int run_script(const char *data, u32 size);
+static void cmd_test(void);
+static void cmd_probe(const char *args);
 
 /* ---- 风格令牌（引用 deshab_ui.h 语义色） ---- */
 #define BG_COLOR      DS_DARK_BG_PRIMARY
@@ -877,7 +1384,14 @@ static void cmd_help(void) {
     term_puts("  about         关于 Deshab\n");
     term_puts("  pci           列出 PCI 设备\n");
     term_puts("  run <NAME.ELF> 运行根目录下的工具程序\n");
-    term_puts("  linux <prog> [args] 通过双内核兼容层运行 Linux 程序\n");
+    term_puts("  dsl <prog> [args]  通过双内核兼容层运行 Linux 程序\n");
+    term_puts("  dsl ls [path]      列出 Linux 目录\n");
+    term_puts("  dsl cat <path>     显示 Linux 文件内容\n");
+    term_puts("  dsl push <本地> <linux路径>  上传 FAT32 文件到 Linux\n");
+    term_puts("  dsl pull <linux路径> <本地>  下载 Linux 文件到 FAT32\n");
+    term_puts("  （Tab 可补全 dsl 后的 Linux 程序名）\n");
+    term_puts("  test          执行 dev/test.bas 自动测试脚本\n");
+    term_puts("  probe [N]     读取探测缓冲（stat/tags/条目数）\n");
     term_puts("  reboot        重启系统\n");
     term_puts("  halt          关机（停止 CPU）\n");
     term_putc('\n');
@@ -1312,6 +1826,7 @@ static void cmd_pci(void) {
 static u64 g_kernel_api = 0;
 static const dsk_boot_context *g_boot_ctx = 0;
 static const linux_compat_service *g_lxc_svc = 0;
+static const probe_info *g_probe_info = 0;
 
 /* ============================================================
  *  run 命令：从 FAT32 根目录加载并跳转 PIE ELF 工具
@@ -1464,17 +1979,23 @@ static int path_search_and_run(const char *name, const char *args) {
 }
 
 /* ============================================================
- *  linux 命令：通过双内核兼容层执行 Linux 程序
+ *  dsl 命令：通过双内核兼容层执行 Linux 程序 / 文件传输
  *
- *  用法:
- *    linux                显示兼容层状态
- *    linux <prog> [args]  执行 /bin/<prog>（或完整路径）
- *    linux ls -la         → 执行 /bin/ls -la
- *    linux uname -a       → 执行 /bin/uname -a
+ *  统一语法（取代旧 linux/lls/lcat 命令）:
+ *    dsl                     显示兼容层状态
+ *    dsl <prog> [args]       执行 /bin/<prog>（或完整路径）
+ *    dsl ls [path]           列出 Linux 目录（原 lls）
+ *    dsl cat <path>          显示 Linux 文件内容（原 lcat）
+ *    dsl push <本地> <远程>  上传 FAT32 根目录文件到 Linux
+ *    dsl pull <远程> <本地>  下载 Linux 文件到 FAT32 根目录
  *
  *  依赖 UTSM+Linux 双内核架构: Linux guest 作为 daemon park 在 VMX
  *  guest 中,shell 通过 g_lxc_svc->exec 写 IPC 请求并 vmresume 唤醒。
  * ============================================================ */
+
+/* push/pull 子命令实现见文件后部（Phase 3 文件传输区） */
+static void cmd_dsl_push(const char *local, const char *remote);
+static void cmd_dsl_pull(const char *remote, const char *local);
 
 /* 简单 token 分词：将 args 按空格切分为 argv[]，返回 argc。
  * 不支持引号转义（保持与 shell 其余部分一致的简单分词）。 */
@@ -1494,13 +2015,73 @@ static int split_args(const char *args, char argv[16][64], int max_argc) {
     return argc;
 }
 
-static void cmd_linux(const char *args) {
+/* 打印兼容层错误码对应的提示 */
+static void dsl_print_err(const char *ctx, int rc) {
+    term_puts_color(ctx, ERROR_FG);
+    term_puts_color(": ", ERROR_FG);
+    switch (rc) {
+    case -1: term_puts_color("兼容层不可用\n", ERROR_FG); break;
+    case -2: term_puts_color("IPC 发送失败\n", ERROR_FG); break;
+    case -3: term_puts_color("linux_resume 失败\n", ERROR_FG); break;
+    case -4: term_puts_color("无响应（daemon 未就绪?）\n", ERROR_FG); break;
+    case -5: term_puts_color("Linux 侧错误（路径不存在或不可读）\n", ERROR_FG); break;
+    default: term_puts_color("未知错误\n", ERROR_FG); break;
+    }
+}
+
+/* dsl ls [path] — 列出 Linux 目录（原 lls） */
+static void dsl_ls(const char *args) {
+    while (*args == ' ') args++;
+    const char *path = (*args) ? args : "/";
+
+    static char list_buf[65536];
+    u64 list_len = 0;
+    int rc = g_lxc_svc->file_list(path, list_buf, sizeof(list_buf) - 1, &list_len);
+    if (rc < 0 && rc != -6) { dsl_print_err("dsl ls", rc); return; }
+
+    if (list_len > 0) {
+        list_buf[list_len] = 0;
+        term_puts(list_buf);
+        if (list_buf[list_len - 1] != '\n') term_putc('\n');
+    }
+    if (rc == -6) term_puts_color("[dsl ls: 输出已截断]\n", DIM_FG);
+}
+
+/* dsl cat <path> — 显示 Linux 文件内容（原 lcat，自动分块读取大文件） */
+static void dsl_cat(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == 0) {
+        term_puts_color("用法: dsl cat <linux绝对路径>\n", DIM_FG);
+        return;
+    }
+
+    static char chunk[32768];
+    u64 offset = 0;
+    u64 total = 0;
+    int first = 1;
+    for (;;) {
+        u64 got = 0;
+        int rc = g_lxc_svc->file_read(args, offset, chunk, sizeof(chunk), &got, &total);
+        if (rc < 0 && rc != -6) {
+            if (first) dsl_print_err("dsl cat", rc);
+            else term_puts_color("\n[dsl cat: 读取中断]\n", ERROR_FG);
+            return;
+        }
+        first = 0;
+        if (got == 0) break;  /* EOF */
+        for (u64 i = 0; i < got; i++) term_putc(chunk[i]);
+        offset += got;
+        if (offset >= total) break;
+    }
+}
+
+static void cmd_dsl(const char *args) {
     if (!g_lxc_svc) {
-        term_puts_color("linux: 兼容层服务未初始化（boot context 未提供）\n", ERROR_FG);
+        term_puts_color("dsl: 兼容层服务未初始化（boot context 未提供）\n", ERROR_FG);
         return;
     }
     if (!g_lxc_svc->is_available()) {
-        term_puts_color("linux: 兼容层不可用（Linux guest 未驻留或 IPC 未就绪）\n", ERROR_FG);
+        term_puts_color("dsl: 兼容层不可用（Linux guest 未驻留或 IPC 未就绪）\n", ERROR_FG);
         char status[128];
         g_lxc_svc->status(status, sizeof(status));
         term_puts_color(status, ERROR_FG);
@@ -1512,8 +2093,13 @@ static void cmd_linux(const char *args) {
     while (*args == ' ') args++;
     if (*args == 0) {
         term_puts_color("Linux 兼容层已就绪 (双内核 park-and-resume)\n", OK_FG);
-        term_puts_color("用法: linux <程序> [参数...]\n", DIM_FG);
-        term_puts_color("示例: linux ls -la / linux uname -a / linux cat /etc/hostname\n", DIM_FG);
+        term_puts_color("用法: dsl <程序> [参数...]\n", DIM_FG);
+        term_puts_color("示例: dsl ls -la / dsl uname -a / dsl cat /etc/hostname\n", DIM_FG);
+        term_puts_color("内建: dsl ls [path]  列出 Linux 目录\n", DIM_FG);
+        term_puts_color("      dsl cat <path> 显示 Linux 文件\n", DIM_FG);
+        term_puts_color("文件传输:\n", DIM_FG);
+        term_puts_color("  dsl push <本地文件> <linux路径>  上传 FAT32 文件到 Linux\n", DIM_FG);
+        term_puts_color("  dsl pull <linux路径> <本地文件>  下载 Linux 文件到 FAT32\n", DIM_FG);
         return;
     }
 
@@ -1521,11 +2107,46 @@ static void cmd_linux(const char *args) {
     char argv_buf[16][64];
     int argc = split_args(args, argv_buf, 16);
     if (argc == 0) {
-        term_puts_color("linux: 参数解析失败\n", ERROR_FG);
+        term_puts_color("dsl: 参数解析失败\n", ERROR_FG);
         return;
     }
 
-    /* 构造程序路径：
+    /* push/pull 文件传输子命令（FAT32 根目录 ↔ Linux rootfs） */
+    if (str_eq(argv_buf[0], "push")) {
+        if (argc < 3) {
+            term_puts_color("用法: dsl push <本地文件> <linux绝对路径>\n", DIM_FG);
+            return;
+        }
+        cmd_dsl_push(argv_buf[1], argv_buf[2]);
+        return;
+    }
+    if (str_eq(argv_buf[0], "pull")) {
+        if (argc < 3) {
+            term_puts_color("用法: dsl pull <linux绝对路径> <本地文件>\n", DIM_FG);
+            return;
+        }
+        cmd_dsl_pull(argv_buf[1], argv_buf[2]);
+        return;
+    }
+
+    /* 内建快捷方式: dsl ls [path] → 列目录, dsl cat <path> → 读文件 */
+    if (str_eq(argv_buf[0], "ls")) {
+        /* 把 "ls" 之后的参数拼回一个字符串作为路径参数 */
+        const char *rest = args;
+        while (*rest == ' ') rest++;
+        while (*rest && *rest != ' ') rest++;  /* 跳过 "ls" */
+        dsl_ls(rest);
+        return;
+    }
+    if (str_eq(argv_buf[0], "cat")) {
+        const char *rest = args;
+        while (*rest == ' ') rest++;
+        while (*rest && *rest != ' ') rest++;  /* 跳过 "cat" */
+        dsl_cat(rest);
+        return;
+    }
+
+    /* 通用程序执行：构造程序路径
      *   - 以 '/' 开头视为绝对路径
      *   - 否则前缀 "/bin/" */
     char path[160];
@@ -1553,14 +2174,14 @@ static void cmd_linux(const char *args) {
     u64 stdout_len = 0;
     u64 exit_code = 0;
 
-    logl("[shell] linux: exec ");
+    logl("[shell] dsl: exec ");
     logl(path);
     int rc = g_lxc_svc->exec(path, argc, argv_ptrs,
                              stdout_buf, sizeof(stdout_buf) - 1,
                              &stdout_len, &exit_code);
 
     if (rc != 0) {
-        term_puts_color("linux: 执行失败 (code=", ERROR_FG);
+        term_puts_color("dsl: 执行失败 (code=", ERROR_FG);
         char num[16];
         int neg = rc < 0;
         unsigned int v = neg ? (unsigned int)(-rc) : (unsigned int)rc;
@@ -1596,6 +2217,102 @@ static void cmd_linux(const char *args) {
     }
 }
 
+/* ============================================================
+ *  dsl push / dsl pull — Phase 3 文件传输（FAT32 ↔ Linux rootfs）
+ * ============================================================ */
+
+/* dsl push <本地文件> <linux路径> — 把 FAT32 根目录文件写入 Linux rootfs。
+ * 本地文件经 fat32_read_root_file 读入 g_fdata（上限 256KB），
+ * 再经 g_lxc_svc->file_write 分块上传（单块上限为 IPC payload pool）。 */
+static void cmd_dsl_push(const char *local, const char *remote) {
+    if (!g_block_read) { term_puts_color("dsl push: 无块设备\n", ERROR_FG); return; }
+    char n83[11];
+    if (name_to_83(local, n83) != 0) {
+        term_puts_color("dsl push: 无效本地文件名（需 8.3 格式）\n", ERROR_FG);
+        return;
+    }
+    u8 *data = 0; u32 size = 0;
+    if (fat32_read_root_file(n83, &data, &size) != 0) {
+        term_puts_color("dsl push: 本地文件不存在: ", ERROR_FG);
+        term_puts_color(local, ERROR_FG);
+        term_putc('\n');
+        return;
+    }
+
+    logl("[shell] dsl push: uploading");
+    u64 offset = 0;
+    for (;;) {
+        u64 written = 0;
+        int rc = g_lxc_svc->file_write(remote, offset, (const char *)data + offset,
+                                       (u64)size - offset, &written);
+        if (rc != 0) { dsl_print_err("dsl push", rc); return; }
+        offset += written;
+        if (offset >= (u64)size) break;  /* 含 size==0：单次调用创建/截断空文件 */
+        if (written == 0) {
+            term_puts_color("dsl push: 写入中断（无进度）\n", ERROR_FG);
+            return;
+        }
+    }
+
+    term_puts_color("push: ", OK_FG);
+    term_puts_color(local, OK_FG);
+    term_puts_color(" -> ", DIM_FG);
+    term_puts_color(remote, OK_FG);
+    term_puts_color(" (", DIM_FG);
+    char sz[12]; u32_to_dec(sz, size);
+    term_puts_color(sz, DIM_FG);
+    term_puts_color(" B)\n", DIM_FG);
+}
+
+/* dsl pull <linux路径> <本地文件> — 读取 Linux 文件写入 FAT32 根目录。
+ * 数据直接分块读入 g_fdata（上限 256KB，超出截断并提示），
+ * 读完后一次性经 fat32_write_root_file 落盘。 */
+static void cmd_dsl_pull(const char *remote, const char *local) {
+    if (!g_block_read) { term_puts_color("dsl pull: 无块设备\n", ERROR_FG); return; }
+    char n83[11];
+    if (name_to_83(local, n83) != 0) {
+        term_puts_color("dsl pull: 无效本地文件名（需 8.3 格式）\n", ERROR_FG);
+        return;
+    }
+
+    logl("[shell] dsl pull: downloading");
+    u64 offset = 0;
+    u64 total = 0;
+    for (;;) {
+        u64 cap = (u64)sizeof(g_fdata) - offset;
+        if (cap == 0) break;  /* 本地缓冲已满 → 截断 */
+        u64 got = 0;
+        int rc = g_lxc_svc->file_read(remote, offset, (char *)g_fdata + offset,
+                                      cap, &got, &total);
+        if (rc != 0 && rc != -6) {
+            if (offset == 0) { dsl_print_err("dsl pull", rc); return; }
+            term_puts_color("dsl pull: 读取中断\n", ERROR_FG);
+            return;
+        }
+        if (got == 0) break;  /* EOF */
+        offset += got;
+        if (offset >= total) break;
+    }
+
+    if (fat32_write_root_file(n83, g_fdata, (u32)offset) != 0) {
+        term_puts_color("dsl pull: 本地写盘失败\n", ERROR_FG);
+        return;
+    }
+    g_disk_loaded = 0;  /* 失效 FAT 缓存，与 cp/mv/echo 一致 */
+
+    term_puts_color("pull: ", OK_FG);
+    term_puts_color(remote, OK_FG);
+    term_puts_color(" -> ", DIM_FG);
+    term_puts_color(local, OK_FG);
+    term_puts_color(" (", DIM_FG);
+    char sz[12]; u32_to_dec(sz, (u32)offset);
+    term_puts_color(sz, DIM_FG);
+    term_puts_color(" B)\n", DIM_FG);
+    if (offset < total) {
+        term_puts_color("[dsl pull: 文件超出 256KB 本地缓冲，已截断]\n", DIM_FG);
+    }
+}
+
 static void execute_command(const char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == 0) return;
@@ -1623,7 +2340,9 @@ static void execute_command(const char *cmd) {
     else if (str_eq(name, "mv")) cmd_mv(args);
     else if (str_eq(name, "rm") || str_eq(name, "del")) cmd_rm(args);
     else if (str_eq(name, "run")) cmd_run(args);
-    else if (str_eq(name, "linux")) cmd_linux(args);
+    else if (str_eq(name, "dsl")) cmd_dsl(args);
+    else if (str_eq(name, "test")) cmd_test();
+    else if (str_eq(name, "probe")) cmd_probe(args);
     else if (str_eq(name, "cd")) cmd_not_impl("cd");
     else if (str_eq(name, "pwd")) { term_puts("/\n"); }
     else if (str_eq(name, "whoami")) { term_puts("root\n"); }
@@ -1666,6 +2385,26 @@ static void redraw_input_line(void) {
     for (int i = 0; i < input_len; i++) {
         i64 x = term_start_x + (i64)(prompt_len + i) * (i64)DU_ASCII_STEP;
         du_draw_char(&g_ctx, input_buf[i], x, y, TEXT_FG, BG_COLOR);
+    }
+    /* BUG-005 修复: 同步更新终端缓冲区，防止 term_redraw_all()
+     * 时旧输入文字残留在缓冲区导致错位渲染 */
+    if (cur_row >= 0 && cur_row < term_h) {
+        for (int i = 0; i < prompt_len && i < term_w; i++) {
+            int idx = cur_row * TERM_COLS + i;
+            term_ch[idx] = (u8)PROMPT[i];
+            term_fg[idx] = PROMPT_FG;
+        }
+        for (int i = 0; i < input_len && (prompt_len + i) < term_w; i++) {
+            int idx = cur_row * TERM_COLS + prompt_len + i;
+            term_ch[idx] = (u8)input_buf[i];
+            term_fg[idx] = TEXT_FG;
+        }
+        /* 清除输入行残余（输入缩短时旧字符残留） */
+        for (int i = prompt_len + input_len; i < term_w; i++) {
+            int idx = cur_row * TERM_COLS + i;
+            term_ch[idx] = ' ';
+            term_fg[idx] = TEXT_FG;
+        }
     }
     cur_col = prompt_len + input_cursor;
     term_redraw_cursor();
@@ -1754,51 +2493,734 @@ static void kill_line(void) {
     redraw_input_line();
 }
 
-/* 开发者模式:自动测试命令序列（ls/echo>/cat/cp/mv/rm）
- * 由 DSK 在 firstInit.txt 第二行=1 时触发，reserved[3]=1 */
-static void run_dev_tests(void) {
-    term_puts_color("=== 开发者模式:自动测试命令 ===\n", PROMPT_FG);
+/* ============================================================
+ *  Tab 补全（Phase 3）：仅对 "dsl <前缀>" 补全 Linux 程序名
+ *
+ *  行为（类 bash）：
+ *   - 唯一匹配：补全到完整程序名并追加空格
+ *   - 多匹配：扩展到最长公共前缀；已无扩展空间时列出候选
+ *   - 仅补全第一个 token（程序名），参数区不处理
+ *  候选来源：file_list("/usr/bin")（Arch: /bin → /usr/bin 软链）
+ * ============================================================ */
+static void handle_tab_complete(void) {
+    /* 输入必须以 "dsl " 开头 */
+    if (input_len < 4) return;
+    if (!(input_buf[0] == 'd' && input_buf[1] == 's' && input_buf[2] == 'l' &&
+          input_buf[3] == ' '))
+        return;
+    if (!g_lxc_svc || !g_lxc_svc->is_available()) return;
+
+    /* 取 "dsl " 之后到光标的前缀；遇到空格说明在参数区，不补全 */
+    char prefix[64];
+    int plen = 0;
+    for (int i = 4; i < input_cursor; i++) {
+        char c = input_buf[i];
+        if (c == ' ') return;
+        if (plen >= 63) return;
+        prefix[plen++] = c;
+    }
+    prefix[plen] = 0;
+
+    /* 查询 Linux /usr/bin 程序列表 */
+    static char list_buf[65536];
+    u64 list_len = 0;
+    int rc = g_lxc_svc->file_list("/usr/bin", list_buf, sizeof(list_buf) - 1, &list_len);
+    if ((rc < 0 && rc != -6) || list_len == 0) return;
+    list_buf[list_len] = 0;
+
+    /* 扫描匹配项：统计数量、最长公共前缀、首个匹配 */
+    int match_count = 0;
+    char common[64];
+    int common_len = 0;
+    const char *p = list_buf;
+    while (*p) {
+        const char *eol = p;
+        while (*eol && *eol != '\n') eol++;
+        int len = (int)(eol - p);
+        int is_dir = (len > 0 && p[len - 1] == '/');
+        int nlen = is_dir ? len - 1 : len;
+        if (!is_dir && nlen > 0 && nlen < 64 && nlen >= plen) {
+            int ok = 1;
+            for (int i = 0; i < plen; i++) {
+                if (p[i] != prefix[i]) { ok = 0; break; }
+            }
+            if (ok) {
+                if (match_count == 0) {
+                    for (int i = 0; i < nlen; i++) common[i] = p[i];
+                    common_len = nlen;
+                } else {
+                    int i = 0;
+                    while (i < common_len && i < nlen && common[i] == p[i]) i++;
+                    common_len = i;
+                }
+                match_count++;
+            }
+        }
+        p = (*eol == '\n') ? eol + 1 : eol;
+    }
+
+    if (match_count == 0) return;
+
+    if (common_len > plen) {
+        /* 扩展到公共前缀（唯一匹配时即完整程序名） */
+        for (int i = plen; i < common_len; i++) insert_char(common[i]);
+        if (match_count == 1) insert_char(' ');
+        return;
+    }
+
+    /* 公共前缀 == 已输入前缀 */
+    if (match_count == 1) {
+        /* 已完整输入唯一匹配：追加空格 */
+        insert_char(' ');
+        return;
+    }
+
+    /* 多匹配且无扩展空间：列出候选（最多 64 个） */
     term_putc('\n');
+    int shown = 0;
+    int col = 0;
+    p = list_buf;
+    while (*p && shown < 64) {
+        const char *eol = p;
+        while (*eol && *eol != '\n') eol++;
+        int len = (int)(eol - p);
+        int is_dir = (len > 0 && p[len - 1] == '/');
+        int nlen = is_dir ? len - 1 : len;
+        if (!is_dir && nlen > 0 && nlen < 64 && nlen >= plen) {
+            int ok = 1;
+            for (int i = 0; i < plen; i++) {
+                if (p[i] != prefix[i]) { ok = 0; break; }
+            }
+            if (ok) {
+                for (int i = 0; i < nlen; i++) term_putc(p[i]);
+                term_puts("  ");
+                col += nlen + 2;
+                if (col >= 60) { term_putc('\n'); col = 0; }
+                shown++;
+            }
+        }
+        p = (*eol == '\n') ? eol + 1 : eol;
+    }
+    if (col != 0) term_putc('\n');
+    if (match_count > shown) {
+        term_puts_color("... (更多候选未显示)\n", DIM_FG);
+    }
+    draw_prompt();
+    redraw_input_line();
+}
 
-    term_puts_color("[1] ls — 列出根目录\n", ACCENT_FG);
-    cmd_ls();
+/* ---- 测试脚本系统 ---- */
+
+/* g_script_buf 和 SCRIPT_BUF_MAX 已在前向声明段定义 */
+
+/* 测试日志缓冲 */
+#define TEST_LOG_BUF_MAX 8192
+static char g_test_log[TEST_LOG_BUF_MAX];
+static u32 g_test_log_len = 0;
+
+static void test_log_append(const char *msg) {
+    while (*msg && g_test_log_len < TEST_LOG_BUF_MAX - 1)
+        g_test_log[g_test_log_len++] = *msg++;
+}
+
+static void test_log_append_char(char c) {
+    if (g_test_log_len < TEST_LOG_BUF_MAX - 1)
+        g_test_log[g_test_log_len++] = c;
+}
+
+static void test_log_append_u32(u32 v) {
+    if (v >= 100) { test_log_append_char((v/100)+'0'); v %= 100; }
+    if (v >= 10) { test_log_append_char((v/10)+'0'); v %= 10; }
+    test_log_append_char(v+'0');
+}
+
+static void test_log_flush(void) {
+    if (g_test_log_len == 0) return;
+    u32 dev_clus = 0;
+    if (get_dev_cluster(&dev_clus) != 0) {
+        /* BUG-20260730: dev/ 目录未找到时回退写入根目录 DEVLOG 文件 */
+        logl("[test] dev dir not found, fallback to root");
+        char rootlog83[11] = {'D','E','V','L','O','G',' ',' ',' ',' '};
+        if (fat32_write_root_file(rootlog83, (const u8 *)g_test_log, g_test_log_len) != 0)
+            logl("[test] root log write also failed");
+        else
+            logl("[test] log written to root DEVLOG");
+        g_test_log_len = 0;
+        return;
+    }
+    char log83[11] = {'L','O','G',' ',' ',' ',' ',' ',' ',' ',' '};
+    if (fat32_write_file_in_dir(dev_clus, log83, (const u8 *)g_test_log, g_test_log_len) != 0) {
+        /* 子目录写入失败也回退根目录 */
+        logl("[test] dev/LOG write failed, fallback to root");
+        char rootlog83[11] = {'D','E','V','L','O','G',' ',' ',' ',' '};
+        if (fat32_write_root_file(rootlog83, (const u8 *)g_test_log, g_test_log_len) != 0)
+            logl("[test] root log write also failed");
+        else
+            logl("[test] log written to root DEVLOG");
+    } else {
+        logl("[test] log written");
+    }
+    g_test_log_len = 0;
+}
+
+/* 断言文件存在/不存在于根目录 */
+static void assert_file_exists(const char *fn, int should_exist, u32 *total, u32 *passed, u32 *failed) {
+    char n83[11];
+    if (name_to_83(fn, n83) != 0) {
+        term_puts_color("  [FAIL] $assert: bad name '", ERROR_FG);
+        term_puts(fn); term_puts_color("'\n", ERROR_FG);
+        test_log_append("[FAIL] assert_file: bad name ");
+        test_log_append(fn); test_log_append("\n");
+        (*total)++; (*failed)++;
+        return;
+    }
+    u8 *data = 0; u32 sz = 0;
+    int rc = fat32_read_root_file(n83, &data, &sz);
+    int exists = (rc == 0);
+    if (exists == should_exist) {
+        term_puts_color("  [PASS] ", OK_FG);
+        test_log_append("[PASS] ");
+    } else {
+        term_puts_color("  [FAIL] ", ERROR_FG);
+        test_log_append("[FAIL] ");
+    }
+    if (should_exist) {
+        term_puts(fn); term_puts_color(" exists\n", exists ? OK_FG : ERROR_FG);
+        test_log_append(fn); test_log_append(" exists\n");
+    } else {
+        term_puts(fn); term_puts_color(" not found\n", !exists ? OK_FG : ERROR_FG);
+        test_log_append(fn); test_log_append(" not found\n");
+    }
+    (*total)++;
+    if (exists == should_exist) (*passed)++; else (*failed)++;
+}
+
+/* 检查 FUCK 配置键值 */
+static void check_config_value(const char *section, const char *key, u32 *total, u32 *passed, u32 *failed) {
+    /* 从 deshab64 读取 FUCK 配置 */
+    u32 d64_clus = 0;
+    if (get_deshab64_cluster(&d64_clus) != 0) {
+        term_puts_color("  [FAIL] $check_config: deshab64 dir not found\n", ERROR_FG);
+        test_log_append("[FAIL] check_config: deshab64 dir not found\n");
+        (*total)++; (*failed)++;
+        return;
+    }
+    char fuck83[11] = {'F','U','C','K',' ',' ',' ',' ',' ',' ',' '};
+    u8 *fuck_data = 0; u32 fuck_size = 0;
+    if (fat32_read_file_in_dir(d64_clus, fuck83, &fuck_data, &fuck_size) != 0) {
+        /* 回退: 根目录查找 */
+        if (fat32_read_root_file(fuck83, &fuck_data, &fuck_size) != 0) {
+            term_puts_color("  [FAIL] $check_config: FUCK not found\n", ERROR_FG);
+            test_log_append("[FAIL] check_config: FUCK not found\n");
+            (*total)++; (*failed)++;
+            return;
+        }
+    }
+    sh_ini_config cfg;
+    if (sh_ini_parse((const char *)fuck_data, fuck_size, &cfg) != 0) {
+        term_puts_color("  [FAIL] $check_config: parse error\n", ERROR_FG);
+        test_log_append("[FAIL] check_config: parse error\n");
+        (*total)++; (*failed)++;
+        return;
+    }
+    const char *val = sh_ini_get(&cfg, section, key);
+    if (val) {
+        term_puts_color("  [PASS] ", OK_FG);
+        term_puts(section); term_putc('.'); term_puts(key);
+        term_puts_color(" = ", DIM_FG); term_puts_color(val, OK_FG); term_putc('\n');
+        test_log_append("[PASS] ");
+        test_log_append(section); test_log_append(".");
+        test_log_append(key); test_log_append("=");
+        test_log_append(val); test_log_append("\n");
+        (*total)++; (*passed)++;
+    } else {
+        term_puts_color("  [FAIL] ", ERROR_FG);
+        term_puts(section); term_putc('.'); term_puts(key);
+        term_puts_color(" not found\n", ERROR_FG);
+        test_log_append("[FAIL] ");
+        test_log_append(section); test_log_append(".");
+        test_log_append(key); test_log_append(" not found\n");
+        (*total)++; (*failed)++;
+    }
+}
+
+/* $probe 内核插桩探测 */
+static void probe_kernel(const char *target, u32 *total, u32 *passed, u32 *failed) {
+    term_puts_color("  [PROBE] ", ACCENT_FG);
+    test_log_append("[PROBE] ");
+    if (sh_ini_streq(target, "kernel_version")) {
+        term_puts_color("kernel_version\n", ACCENT_FG);
+        cmd_version();
+        cmd_uname();
+        test_log_append("kernel_version\n");
+        (*total)++; (*passed)++;
+    } else if (sh_ini_streq(target, "block_device")) {
+        term_puts_color("block_device\n", ACCENT_FG);
+        test_log_append("block_device\n");
+        if (g_block_read) {
+            term_puts_color("  block_read=OK\n", OK_FG);
+            test_log_append("  block_read=OK\n");
+        } else {
+            term_puts_color("  block_read=NONE\n", ERROR_FG);
+            test_log_append("  block_read=NONE\n");
+        }
+        if (g_block_write) {
+            term_puts_color("  block_write=OK\n", OK_FG);
+            test_log_append("  block_write=OK\n");
+        } else {
+            term_puts_color("  block_write=NONE\n", ERROR_FG);
+            test_log_append("  block_write=NONE\n");
+        }
+        (*total)++; (*passed)++;
+    } else if (sh_ini_streq(target, "memory_map")) {
+        term_puts_color("memory_map\n", ACCENT_FG);
+        test_log_append("memory_map\n");
+        /* 读取 PIC IMR */
+        u8 imr1 = inb(0x21);
+        u8 imr2 = inb(0xA1);
+        term_puts("  PIC IMR1=0x"); term_putc((imr1>>4)>9?(imr1>>4)-10+'A':(imr1>>4)+'0');
+        term_putc((imr1&0xF)>9?(imr1&0xF)-10+'A':(imr1&0xF)+'0');
+        term_puts(" IMR2=0x"); term_putc((imr2>>4)>9?(imr2>>4)-10+'A':(imr2>>4)+'0');
+        term_putc((imr2&0xF)>9?(imr2&0xF)-10+'A':(imr2&0xF)+'0');
+        term_putc('\n');
+        test_log_append("  PIC IMR probed\n");
+        (*total)++; (*passed)++;
+    } else if (sh_ini_streq(target, "irq_status")) {
+        term_puts_color("irq_status\n", ACCENT_FG);
+        test_log_append("irq_status\n");
+        u8 imr1 = inb(0x21);
+        u8 imr2 = inb(0xA1);
+        term_puts("  IRQ masked: IMR1="); term_putc((imr1>>4)>9?(imr1>>4)-10+'A':(imr1>>4)+'0');
+        term_putc((imr1&0xF)>9?(imr1&0xF)-10+'A':(imr1&0xF)+'0');
+        term_puts(" IMR2="); term_putc((imr2>>4)>9?(imr2>>4)-10+'A':(imr2>>4)+'0');
+        term_putc((imr2&0xF)>9?(imr2&0xF)-10+'A':(imr2&0xF)+'0');
+        term_putc('\n');
+        test_log_append("  IRQ IMR probed\n");
+        (*total)++; (*passed)++;
+    } else {
+        term_puts_color(target, ERROR_FG);
+        term_puts_color(" — unknown probe target\n", ERROR_FG);
+        test_log_append(target); test_log_append(" unknown\n");
+        (*total)++; (*failed)++;
+    }
+}
+
+/* ============================================================
+ *  probe 命令：读取 UTSM 探测缓冲并格式化输出
+ *
+ *  用法:
+ *    probe          — 显示最近 16 条探测记录
+ *    probe 64       — 显示最近 64 条探测记录
+ *    probe stat     — 显示探测缓冲统计信息
+ *    probe tags     — 显示所有已知标签
+ * ============================================================ */
+
+/* 将 u32 标签转为 4 字符 ASCII 显示 */
+static void tag_to_str(u32 tag, char out[5]) {
+    out[0] = (char)((tag >> 24) & 0xFF);
+    out[1] = (char)((tag >> 16) & 0xFF);
+    out[2] = (char)((tag >>  8) & 0xFF);
+    out[3] = (char)((tag      ) & 0xFF);
+    out[4] = 0;
+    /* 不可打印字符替换为 '?' */
+    for (int i = 0; i < 4; i++) {
+        if (out[i] < ' ' || out[i] > '~') out[i] = '?';
+    }
+}
+
+/* shell 本地 u32 十六进制输出 */
+static void u32_to_hex_sh(char *buf, u32 v) {
+    const char hx[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) { buf[i] = hx[v & 0xF]; v >>= 4; }
+    buf[8] = 0;
+}
+
+/* shell 本地 u64 十六进制输出 */
+static void u64_to_hex_sh(char *buf, u64 v) {
+    const char hx[] = "0123456789ABCDEF";
+    for (int i = 15; i >= 0; i--) { buf[i] = hx[v & 0xF]; v >>= 4; }
+    buf[16] = 0;
+}
+
+/* probe_entry 结构体（与 UTSM instr.h 一致，shell 自有定义避免头文件依赖） */
+typedef struct {
+    u32 tag;
+    u32 tick;
+    u64 args[4];
+} sh_probe_entry;
+
+static void cmd_probe(const char *args) {
+    /* ---- probe stat — 统计信息 ---- */
+    if (sh_ini_streq(args, "stat")) {
+        if (!g_probe_info) {
+            term_puts_color("probe: 探测缓冲不可用（instr 未启用或无 probe_info）\n", ERROR_FG);
+            return;
+        }
+        term_puts_color("── Probe Buffer Status ──\n", ACCENT_FG);
+        term_puts("  enabled: "); term_puts_color(g_probe_info->instr_enabled ? "1" : "0", OK_FG); term_putc('\n');
+        term_puts("  probe_enable: "); term_puts_color(g_probe_info->instr_probe_enable ? "1" : "0", OK_FG); term_putc('\n');
+        { char h[9]; u32_to_hex_sh(h, g_probe_info->probe_cap);
+          term_puts("  capacity: "); term_puts_color(h, ACCENT_FG); term_putc('\n'); }
+        { char d[12]; u32_to_dec(d, g_probe_info->probe_count);
+          term_puts("  total written: "); term_puts_color(d, TEXT_FG); term_putc('\n'); }
+        { char d[12]; u32_to_dec(d, g_probe_info->probe_dropped);
+          term_puts("  dropped: "); term_puts_color(d, g_probe_info->probe_dropped ? ERROR_FG : DIM_FG); term_putc('\n'); }
+        return;
+    }
+
+    /* ---- probe tags — 已知标签列表 ---- */
+    if (sh_ini_streq(args, "tags")) {
+        term_puts_color("── Known Probe Tags ──\n", ACCENT_FG);
+        static const struct { u32 tag; const char *desc; } tag_list[] = {
+            {0x424F4F54u, "BOOT — startup event"},
+            {0x49445430u, "IDT0 — IDT/interrupt init"},
+            {0x41524530u, "ARE0 — Arena init"},
+            {0x444D4130u, "DMA0 — DMA init"},
+            {0x4E455430u, "NET0 — network registry"},
+            {0x44525230u, "DRR0 — DRR init"},
+            {0x55545330u, "UTS0 — UTSM core init"},
+            {0x444B4D30u, "DKM0 — DKM load"},
+            {0x44534D30u, "DSM0 — driver manifest load"},
+            {0x44534B30u, "DSK0 — DSK load/jump"},
+            {0x53454C46u, "SELF — selftest"},
+            {0x564D4D30u, "VMM0 — VMM init"},
+            {0x4C494E30u, "LIN0 — Linux loader"},
+            {0x564D4530u, "VME0 — VM-Exit event"},
+            {0x45505456u, "EPTV — EPT violation"},
+            {0x4550544Du, "EPTM — EPT misconfig"},
+            {0x41484349u, "AHCI — AHCI event"},
+            {0x45314B30u, "E1K0 — e1000 event"},
+            {0x46415430u, "FAT0 — FAT32 event"},
+            {0x4E564D30u, "NVM0 — NVMe event"},
+            {0x49525130u, "IRQ0 — IRQ register/fire"},
+            {0x50495430u, "PIT0 — PIT emulation"},
+            {0x53524C30u, "SRL0 — serial event"},
+            {0x4D4D494Fu, "MMIO — MMIO access"},
+            {0x4843414Cu, "HCAL — Hypercall"},
+            {0x45584350u, "EXCP — CPU exception"},
+        };
+        for (int i = 0; i < (int)(sizeof(tag_list)/sizeof(tag_list[0])); i++) {
+            char ts[5]; tag_to_str(tag_list[i].tag, ts);
+            term_puts_color("  ", DIM_FG);
+            term_puts_color(ts, ACCENT_FG);
+            term_puts_color(tag_list[i].desc + 5, TEXT_FG);  /* skip "XXXX —" prefix */
+            term_putc('\n');
+        }
+        return;
+    }
+
+    /* ---- probe [N] — 读取最近 N 条探测记录 ---- */
+    if (!g_probe_info || !g_probe_info->probe_buf_addr || !g_probe_info->probe_cap) {
+        term_puts_color("probe: 探测缓冲不可用（FUCK [debug] enabled=1 probe_enable=1）\n", ERROR_FG);
+        return;
+    }
+
+    /* 解析条目数 */
+    u32 n = 16;  /* 默认显示最近 16 条 */
+    if (args[0] >= '0' && args[0] <= '9') {
+        n = 0;
+        for (int i = 0; args[i] >= '0' && args[i] <= '9'; i++) {
+            n = n * 10 + (u32)(args[i] - '0');
+        }
+        if (n == 0) n = 16;
+        if (n > 256) n = 256;  /* 上限防止缓冲溢出 */
+    }
+
+    /* 从 probe_info 读取缓冲（快照方式：直接从共享内存读取） */
+    const sh_probe_entry *buf = (const sh_probe_entry *)(u64)g_probe_info->probe_buf_addr;
+    u32 cap = g_probe_info->probe_cap;
+    /* 注意：head/count 可能在读取期间被 UTSM 更新（如果 VMM 还在运行），
+     * 此处取快照值，可能存在微小的不一致，但对诊断足够 */
+    u32 head = g_probe_info->probe_head;
+    u32 count = g_probe_info->probe_count;
+
+    u32 avail = (count < cap) ? count : cap;
+    if (n > avail) n = avail;
+
+    if (n == 0) {
+        term_puts_color("probe: 缓冲为空（无探测记录）\n", DIM_FG);
+        return;
+    }
+
+    /* 表头 */
+    term_puts_color("── Probe Buffer (recent ", ACCENT_FG);
+    { char d[12]; u32_to_dec(d, n); term_puts_color(d, ACCENT_FG); }
+    term_puts_color(" entries) ──\n", ACCENT_FG);
+
+    /* 逐条输出 */
+    for (u32 i = 0; i < n; i++) {
+        u32 idx = (head - n + i) % cap;
+        const sh_probe_entry *e = &buf[idx];
+
+        char ts[5]; tag_to_str(e->tag, ts);
+
+        /* 序号 */
+        char sn[12]; u32_to_dec(sn, i + 1);
+        term_puts_color(sn, DIM_FG);
+        term_puts_color(": ", DIM_FG);
+
+        /* 标签 */
+        term_puts_color(ts, ACCENT_FG);
+
+        /* tick */
+        term_puts_color(" tick=", DIM_FG);
+        { char h[9]; u32_to_hex_sh(h, e->tick); term_puts_color(h, TEXT_FG); }
+
+        /* args */
+        for (int a = 0; a < 4; a++) {
+            if (e->args[a] != 0) {  /* 省略零参数以减少输出 */
+                term_putc(' '); term_putc('a' + a); term_putc('=');
+                char h[17]; u64_to_hex_sh(h, e->args[a]);
+                term_puts_color(h, TEXT_FG);
+            }
+        }
+        term_putc('\n');
+    }
+
+    term_puts_color("── ", ACCENT_FG);
+    { char d[12]; u32_to_dec(d, n); term_puts_color(d, ACCENT_FG); }
+    term_puts_color(" entries shown ──\n", ACCENT_FG);
+}
+
+/* 解析并执行脚本中的一行 */
+static void parse_script_line(const char *line, int len, u32 *total, u32 *passed, u32 *failed) {
+    /* 去除尾部空白 */
+    while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' || line[len-1] == '\r')) len--;
+    if (len == 0) return;  /* 空行 */
+
+    /* $ 指令处理 */
+    if (line[0] == '$') {
+        const char *cmd = line + 1;
+        int clen = len - 1;
+        /* 去除指令名前空白 */
+        while (clen > 0 && (*cmd == ' ' || *cmd == '\t')) { cmd++; clen--; }
+
+        if (clen >= 7 && sh_ini_streq_n(cmd, "section", 7)) {
+            /* $section NAME */
+            const char *name = cmd + 7;
+            while (*name == ' ' || *name == '\t') name++;
+            term_putc('\n');
+            term_puts_color("── ", DECORATIVE_FG);
+            term_puts_color(name, PROMPT_FG);
+            term_puts_color(" ──\n", DECORATIVE_FG);
+            test_log_append("=== ");
+            test_log_append(name); test_log_append(" ===\n");
+        } else if (clen >= 11 && sh_ini_streq_n(cmd, "assert_file", 11)) {
+            const char *fn = cmd + 11;
+            while (*fn == ' ' || *fn == '\t') fn++;
+            assert_file_exists(fn, 1, total, passed, failed);
+        } else if (clen >= 13 && sh_ini_streq_n(cmd, "assert_nofile", 13)) {
+            const char *fn = cmd + 13;
+            while (*fn == ' ' || *fn == '\t') fn++;
+            assert_file_exists(fn, 0, total, passed, failed);
+        } else if (clen >= 12 && sh_ini_streq_n(cmd, "check_config", 12)) {
+            const char *args = cmd + 12;
+            while (*args == ' ' || *args == '\t') args++;
+            /* 解析 section.key */
+            const char *dot = 0;
+            for (int i = 0; args[i] && args[i] != ' ' && args[i] != '\t'; i++) {
+                if (args[i] == '.') dot = &args[i];
+            }
+            if (dot) {
+                char sec[32]; int si = 0;
+                for (const char *p = args; p < dot && si < 31; p++) sec[si++] = *p;
+                sec[si] = 0;
+                char key[32]; int ki = 0;
+                for (const char *p = dot + 1; *p && *p != ' ' && *p != '\t' && ki < 31; p++) key[ki++] = *p;
+                key[ki] = 0;
+                check_config_value(sec, key, total, passed, failed);
+            } else {
+                term_puts_color("  [FAIL] $check_config: missing section.key\n", ERROR_FG);
+                test_log_append("[FAIL] check_config: missing section.key\n");
+                (*total)++; (*failed)++;
+            }
+        } else if (clen >= 5 && sh_ini_streq_n(cmd, "probe", 5)) {
+            const char *target = cmd + 5;
+            while (*target == ' ' || *target == '\t') target++;
+            probe_kernel(target, total, passed, failed);
+        } else if (clen >= 3 && sh_ini_streq_n(cmd, "end", 3)) {
+            term_putc('\n');
+            /* $end 信号：不继续解析（run_script 会检测） */
+            return;
+        } else {
+            term_puts_color("  [WARN] unknown directive: $", DIM_FG);
+            for (int i = 0; i < clen && cmd[i] != ' '; i++) term_putc(cmd[i]);
+            term_putc('\n');
+            test_log_append("[WARN] unknown directive: $");
+            for (int i = 0; i < clen && i < 30 && cmd[i] != ' '; i++) g_test_log[g_test_log_len++] = cmd[i];
+            g_test_log[g_test_log_len++] = '\n';
+        }
+        return;
+    }
+
+    /* 注释行: # 开头 */
+    if (line[0] == '#') return;
+
+    /* 作为 shell 命令执行 */
+    /* 构造命令字符串（去掉行尾换行） */
+    char cmd_buf[256];
+    if (len > 255) len = 255;
+    for (int i = 0; i < len; i++) cmd_buf[i] = line[i];
+    cmd_buf[len] = 0;
+
+    execute_command(cmd_buf);
+}
+
+/* 主脚本执行入口 */
+static int run_script(const char *data, u32 size) {
+    u32 total = 0, passed = 0, failed = 0;
+    term_puts_color("=== 执行测试脚本 ===\n", PROMPT_FG);
+    test_log_append("=== Deshab Test Script v1 ===\n");
+
+    u32 pos = 0;
+    while (pos < size) {
+        const char *line_start = data + pos;
+        /* 找行尾 */
+        u32 line_end = pos;
+        while (line_end < size && data[line_end] != '\n') line_end++;
+        int len = (int)(line_end - pos);
+
+        /* 检查 $end */
+        if (len >= 4 && line_start[0] == '$' &&
+            (line_start[1] == 'e' || line_start[1] == 'E') &&
+            (line_start[2] == 'n' || line_start[2] == 'N') &&
+            (line_start[3] == 'd' || line_start[3] == 'D')) {
+            break;
+        }
+
+        parse_script_line(line_start, len, &total, &passed, &failed);
+
+        pos = line_end + 1;  /* 跳过换行 */
+    }
+
+    /* 测试结果汇总 */
     term_putc('\n');
+    term_puts_color("=== 测试结果 ===\n", PROMPT_FG);
+    term_puts("  总计: "); term_putc((total/10)+'0'); term_putc((total%10)+'0'); term_putc('\n');
+    term_puts_color("  通过: ", OK_FG); term_putc((passed/10)+'0'); term_putc((passed%10)+'0'); term_putc('\n');
+    if (failed > 0) {
+        term_puts_color("  失败: ", ERROR_FG); term_putc((failed/10)+'0'); term_putc((failed%10)+'0'); term_putc('\n');
+    } else {
+        term_puts_color("  失败: 0 (全部通过)\n", OK_FG);
+    }
+    test_log_append("=== Result: total=");
+    test_log_append_u32(total);
+    test_log_append(" passed=");
+    test_log_append_u32(passed);
+    test_log_append(" failed=");
+    test_log_append_u32(failed);
+    test_log_append(" ===\n");
 
-    term_puts_color("[2] echo \"Deshab dev test\" > TEST.TXT\n", ACCENT_FG);
-    cmd_echo("Deshab dev test > TEST.TXT");
+    /* 刷日志到磁盘 */
+    test_log_flush();
 
-    term_puts_color("[3] cat TEST.TXT — 读回验证\n", ACCENT_FG);
-    cmd_cat("TEST.TXT");
-    term_putc('\n');
-
-    term_puts_color("[4] cp TEST.TXT COPY.TXT\n", ACCENT_FG);
-    cmd_cp("TEST.TXT COPY.TXT");
-
-    term_puts_color("[5] ls — 确认复制\n", ACCENT_FG);
-    cmd_ls();
-    term_putc('\n');
-
-    term_puts_color("[6] mv COPY.TXT MOVED.TXT\n", ACCENT_FG);
-    cmd_mv("COPY.TXT MOVED.TXT");
-
-    term_puts_color("[7] ls — 确认移动\n", ACCENT_FG);
-    cmd_ls();
-    term_putc('\n');
-
-    term_puts_color("[8] rm TEST.TXT\n", ACCENT_FG);
-    cmd_rm("TEST.TXT");
-    term_puts_color("[9] rm MOVED.TXT — 清理\n", ACCENT_FG);
-    cmd_rm("MOVED.TXT");
-
-    term_puts_color("[10] ls — 确认清理\n", ACCENT_FG);
-    cmd_ls();
-
-    term_puts_color("[11] ping — 外部命令（/bin/ping.elf），跳过内联测试\n", ACCENT_FG);
-
-    term_putc('\n');
-    term_puts_color("=== 自动测试完成 ===\n", OK_FG);
+    term_puts_color("=== 测试脚本完成 ===\n", OK_FG);
     term_puts_color("按 Esc 返回 DSK，或继续输入命令\n", DIM_FG);
     term_putc('\n');
+
+    return (int)failed;
+}
+
+/* 开发者模式:自动测试 — 优先加载 dev/test.bas 脚本，回退硬编码序列
+ * 由 DSK 在 firstInit.txt 第二行=1 时触发，reserved[3]=1 */
+static void run_dev_tests(void) {
+    term_puts_color("=== 开发者模式:自动测试 ===\n", PROMPT_FG);
+    term_putc('\n');
+
+    /* 尝试加载 dev/test.bas 脚本 */
+    u32 dev_clus = 0;
+    if (get_dev_cluster(&dev_clus) == 0) {
+        u8 *script = 0; u32 ssize = 0;
+        char tbas83[11] = {'T','E','S','T',' ',' ',' ',' ','B','A','S'};
+        if (fat32_read_file_in_dir(dev_clus, tbas83, &script, &ssize) == 0 && ssize > 0) {
+            if (ssize <= SCRIPT_BUF_MAX) {
+                logl("[shell] test.bas loaded, running script");
+                for (u32 i = 0; i < ssize; i++) g_script_buf[i] = ((char*)script)[i];
+                run_script(g_script_buf, ssize);
+                return;
+            }
+            logl("[shell] test.bas too large, fallback");
+        }
+    }
+    logl("[shell] test.bas not found, fallback to hardcoded");
+
+	    /* 回退: 原硬编码 11 步序列 — BUG-20260730: 添加 test_log_append/flush */
+	    test_log_append("=== Deshab Hardcoded Test Sequence ===\n");
+
+	    term_puts_color("[1] ls — 列出根目录\n", ACCENT_FG);
+	    test_log_append("[1] ls\n");
+	    cmd_ls();
+	    term_putc('\n');
+
+	    term_puts_color("[2] echo \"Deshab dev test\" > TEST.TXT\n", ACCENT_FG);
+	    test_log_append("[2] echo > TEST.TXT\n");
+	    cmd_echo("Deshab dev test > TEST.TXT");
+
+	    term_puts_color("[3] cat TEST.TXT — 读回验证\n", ACCENT_FG);
+	    test_log_append("[3] cat TEST.TXT\n");
+	    cmd_cat("TEST.TXT");
+	    term_putc('\n');
+
+	    term_puts_color("[4] cp TEST.TXT COPY.TXT\n", ACCENT_FG);
+	    test_log_append("[4] cp TEST.TXT COPY.TXT\n");
+	    cmd_cp("TEST.TXT COPY.TXT");
+
+	    term_puts_color("[5] ls — 确认复制\n", ACCENT_FG);
+	    test_log_append("[5] ls\n");
+	    cmd_ls();
+	    term_putc('\n');
+
+	    term_puts_color("[6] mv COPY.TXT MOVED.TXT\n", ACCENT_FG);
+	    test_log_append("[6] mv COPY.TXT MOVED.TXT\n");
+	    cmd_mv("COPY.TXT MOVED.TXT");
+
+	    term_puts_color("[7] ls — 确认移动\n", ACCENT_FG);
+	    test_log_append("[7] ls\n");
+	    cmd_ls();
+	    term_putc('\n');
+
+	    term_puts_color("[8] rm TEST.TXT\n", ACCENT_FG);
+	    test_log_append("[8] rm TEST.TXT\n");
+	    cmd_rm("TEST.TXT");
+	    term_puts_color("[9] rm MOVED.TXT — 清理\n", ACCENT_FG);
+	    test_log_append("[9] rm MOVED.TXT\n");
+	    cmd_rm("MOVED.TXT");
+
+	    term_puts_color("[10] ls — 确认清理\n", ACCENT_FG);
+	    test_log_append("[10] ls\n");
+	    cmd_ls();
+
+	    term_puts_color("[11] ping — 外部命令（/bin/ping.elf），跳过内联测试\n", ACCENT_FG);
+	    test_log_append("[11] ping (skipped)\n");
+
+	    term_putc('\n');
+	    term_puts_color("=== 自动测试完成 ===\n", OK_FG);
+	    test_log_append("=== Hardcoded test complete ===\n");
+	    test_log_flush();  /* 关键: 刷日志到磁盘 */
+	    term_puts_color("按 Esc 返回 DSK，或继续输入命令\n", DIM_FG);
+	    term_putc('\n');
+	}
+
+/* 手动触发测试脚本执行 */
+static void cmd_test(void) {
+    u32 dev_clus = 0;
+    if (get_dev_cluster(&dev_clus) != 0) {
+        term_puts_color("dev/ 目录未找到\n", ERROR_FG);
+        return;
+    }
+    u8 *script = 0; u32 ssize = 0;
+    char tbas83[11] = {'T','E','S','T',' ',' ',' ',' ','B','A','S'};
+    if (fat32_read_file_in_dir(dev_clus, tbas83, &script, &ssize) != 0 || ssize == 0) {
+        term_puts_color("test.bas 未找到\n", ERROR_FG);
+        return;
+    }
+    if (ssize > SCRIPT_BUF_MAX) {
+        term_puts_color("test.bas 过大\n", ERROR_FG);
+        return;
+    }
+    for (u32 i = 0; i < ssize; i++) g_script_buf[i] = ((char*)script)[i];
+    g_serial_mirror = 1;
+    run_script(g_script_buf, ssize);
 }
 
 /* ---- 主入口 ---- */
@@ -1821,12 +3243,13 @@ void dsk_entry(const dsk_boot_context *ctx) {
     g_kernel_api = ctx->dkm_kernel_api;
     g_boot_ctx = ctx;
 
-    /* 获取 block 设备 read/write（从 kernel_api + 0xA8 → block_api → +16/+24） */
+    /* 获取 block 设备 read/write（BUG-021: 使用镜像结构体字段名访问，不再硬偏移） */
     {
-        u64 api = ctx->dkm_kernel_api;
-        u64 blk = *(u64 *)(api + 0xA8);
-        g_block_read  = blk ? (shell_block_read_fn)*(u64 *)(blk + 16) : 0;
-        g_block_write = blk ? (shell_block_write_fn)*(u64 *)(blk + 24) : 0;
+        u64 api_addr = ctx->dkm_kernel_api;
+        const shell_kernel_api_mirror *api = (const shell_kernel_api_mirror *)api_addr;
+        const shell_block_api_mirror *blk = api ? api->block : 0;
+        g_block_read  = blk ? blk->read  : 0;
+        g_block_write = blk ? blk->write : 0;
     }
     if (g_block_read)  logl("[shell] block_read ok");
     if (g_block_write) logl("[shell] block_write ok");
@@ -1844,6 +3267,22 @@ void dsk_entry(const dsk_boot_context *ctx) {
             }
         } else {
             logl("[shell] linux_compat service not available");
+        }
+    }
+
+    /* 获取 Probe 探测缓冲信息（reserved[6]）—— $probe 命令 */
+    {
+        u64 pi_addr = ctx->reserved[6];
+        if (pi_addr) {
+            const probe_info *pi = (const probe_info *)pi_addr;
+            if (pi->magic == PROBE_INFO_MAGIC) {
+                g_probe_info = pi;
+                logl("[shell] probe_info ok");
+            } else {
+                logl("[shell] probe_info magic mismatch");
+            }
+        } else {
+            logl("[shell] probe_info not available");
         }
     }
 
@@ -1955,6 +3394,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 continue;
             }
             if (sc == 0x0E) { delete_char_back(); continue; }
+            if (sc == 0x0F) { handle_tab_complete(); continue; }
             if (sc == 0x01) { logl("[shell] esc -> return to DSK"); return; }
             if (sc == 0x15 && !shift) { kill_line(); continue; }
             if (sc == 0x17 && !shift) { while (input_cursor > 0) delete_char_back(); continue; }

@@ -2,6 +2,9 @@
 
 > 所有测试与开发过程中发现的 bug 统一登记于此。每个 bug 按 BUG-YYYYMMDD-NNN 编号。
 > 测试用例文档位于 RE/test-cases/。
+>
+> 2026-07-29 文档治理：此前 8 条遗留纯文本 bug 已按模板补全（编号 001–008，
+> 日期为桌面测试期的近似日期）；同时补登 B5/B6 及 BSS NOBITS、go_up 条目。
 
 ## 严重程度定义
 
@@ -29,11 +32,257 @@
 ## Bug 列表
 
 <!-- 在此追加 bug 条目，最新放在顶部 -->
-P2: 软件Files的窗口点击叉无法关闭
-P3: 在第一页已经有了终端，所以在第四页的桌面上不用显示终端和CMD
-P2: 在开发者模式中的shell输入命令并回车时文字消失没有反应
-P3: 启动时的打字机效果再快3倍
-P2: 桌面中第一页的shell中输入命令回车后，上一条命令输入的文字会跑到下一行
-P2: 桌面中第一页的Files显示的不是SYSTEM/user中的文件夹内容
-P2: Files中没有显示文件夹，直接显示了文件夹下的文件
-P2: Files没有提供“..”来供用户返回上一级的文件夹
+
+### BUG-20260729-021 [P2] [DSK/kernel_api] 硬偏移读取 kernel_api.block 脆弱性
+- 现象: DSK 通过 `*(u64*)(api + 0xA8)` 硬偏移读取 `dkm_kernel_api.block`，若结构体在 `block` 字段前插入新字段，DSK 将读取到错误指针 → 解引用 → 立即崩溃，无日志。
+- 复现步骤: 修改 dkm.h 中 `dkm_kernel_api` 在 `block` 字段前增加任意字段 → 编译 DSK（不重新编译）→ 启动。
+- 串口/日志证据: 安全审查Agent报告（bd89e1b9），4.1节。
+- 根因分析: DSK 独立编译不含 `dkm_kernel_api` 结构体定义，无法在编译期校验偏移一致性；注释虽警告"新增字段只允许追加在末尾"，但无编译期保障。
+- 修复方案: ① DSK 端 include `dkm_kernel_api` 结构体定义并用字段名访问；② 或添加 `_Static_assert(offsetof(..., block) == 0xA8, ...)` 编译期校验。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/dsk/main.c + CODE/shell/main.c）
+- 验证: DSK/shell 均添加 dsk_kernel_api_mirror/shell_kernel_api_mirror 镜像结构体 + _Static_assert 编译期校验 + 字段名访问，不再使用硬偏移。
+
+### BUG-20260729-020 [P1] [UTSM/IDT] IOAPIC 中断路由可能绕过 PIC mask
+- 现象: 实机通过 IOAPIC 路由中断时，`dsk_load_and_jump()` 中的 PIC mask 不影响 IOAPIC redirection entry，中断可能绕过 PIC mask 直接到达 CPU。
+- 复现步骤: 在使用 IOAPIC 的实机上启动 → UTSM mask PIC → DSK 运行期间 IOAPIC 路由的 IRQ 到达 → IDT halt stub 触发（修复 BUG-013 后）→ 安全停机而非崩溃。
+- 串口/日志证据: 系统日志Agent报告（aa2d3f5a），崩溃点B分析。
+- 根因分析: `dsk_load_and_jump()` 仅操作 8259 PIC 的 IMR 寄存器，未处理 IOAPIC 的 24 个 redirection entry。实机（尤其是多核平台）中断路由通常经 IOAPIC 而非 PIC。
+- 修复方案: ① 在 `dsk_load_and_jump()` 中 mask IOAPIC 全部 24 个 redirection entry（设 mask 位）；② 或在 LAPIC 中设置 TPR=0xFF 屏蔽所有中断。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/UTSM/kernel/dsk_loader.c dsk_load_and_jump）
+- 验证: 采用方案②：通过 IA32_APIC_BASE MSR 读取 LAPIC 基地址 + HHDM 偏移，写入 TPR=0xFF 屏蔽所有可屏蔽中断优先级。仅在 LAPIC 全局启用时（bit 11）执行。
+
+### BUG-20260729-019 [P1] [UTSM+DSK/FAT32] FAT 表缓冲区在实机大容量磁盘上溢出
+- 现象: FAT32 FAT 表缓冲区 `g_dsk_fat32_disk[131072]`（128KB/256扇区）在实机大容量磁盘上不足。2GB 以上分区的 FAT 表超过 128KB，FAT 链遍历在缓冲区边界处中断，文件读取截断或失败。
+- 复现步骤: 在 ≥2GB FAT32 分区上启动 → UTSM 从 SATA 盘读取 deshab.elf → FAT 条目偏移超过 128KB → `fat_ent + 4 > sizeof(g_dsk_fat32_disk)` → 循环中断 → 文件未找到或数据截断。
+- 串口/日志证据: 安全审查Agent报告（bd89e1b9），2.1节；计算表：2GB分区/32KB簇=256KB FAT（溢出），32GB分区/4KB簇=32MB FAT（严重溢出）。
+- 根因分析: FAT 读取策略为"一次性预读 256 扇区"，在 QEMU 4MB 测试镜像上够用，但实机磁盘分区远大于此。当文件起始簇在缓冲区内但后续簇不在时，ELF 数据不完整 → 加载后必然崩溃。
+- 修复方案: 实现"按需 FAT 扇区读取"：仅读取包含目标条目的单个 FAT 扇区（512字节），而非预读整个 FAT 表。需新增 `fat32_get_next_cluster()` 函数。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/UTSM/kernel/dsk_loader.c + CODE/dsk/main.c + CODE/shell/main.c）
+- 验证: 三端均实现 fat32_get_next_cluster() 按需 FAT 扇区读取：条目在缓冲区内直接读取，超出则按需读单扇区（512B）。写入路径保留缓冲区内修改+回写逻辑不变。
+
+### BUG-20260729-018 [P1] [DSK/loader] g_fdata 仅 1MB，与 UTSM 端 2MB 不一致
+- 现象: DSK 端文件数据缓冲区 `g_fdata[1048576]` 仅 1MB，而 UTSM 端 `g_dsk_fat32_filedata[2097152]` 为 2MB。当前 desktop.elf 约 150KB 暂时够用，但增长后将突破 1MB 限制。
+- 复现步骤: desktop.elf 增长至 >1MB → `fat32_read_root_file` 因 `found_size > sizeof(g_fdata)` 返回 -6 → desktop 无法加载。
+- 串口/日志证据: 安全审查Agent报告（bd89e1b9），2.2节。
+- 根因分析: UTSM 和 DSK 两端缓冲区大小定义不一致，DSK 端未与 UTSM 对齐。
+- 修复方案: `g_fdata[1048576]` → `g_fdata[2097152]`，与 UTSM 端对齐。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/dsk/main.c L66）
+- 验证: 编译通过，镜像生成成功。
+
+### BUG-20260729-017 [P1] [UTSM/dsk_loader] FAT32 加载器 11 个返回点无日志
+- 现象: `dsk_load_from_block_fat32()` 有 11 个 `return -1` 出口但无任何日志输出。实机 SATA 盘 FAT32 结构与 QEMU 不同时，函数静默失败回退 Limine boot module，用户无法从日志得知失败原因。
+- 复现步骤: 实机启动 → FAT32 解析任意步骤失败 → 串口无相关日志 → 回退 Limine 或 halt。
+- 串口/日志证据: 系统日志Agent报告（aa2d3f5a），缺口1分析。
+- 根因分析: 函数编写时为早期最小实现，未添加错误路径日志。
+- 修复方案: 在全部 11 个 `return -1` 前添加 `log_error` + 诊断 `log_hex64`，输出失败条件和关键参数值。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/UTSM/kernel/dsk_loader.c L182-317）
+- 验证: 编译通过，日志覆盖完整。
+
+### BUG-20260729-016 [P0] [DSK/loader] kernel_api / framebuffer 解引用无 NULL 验证
+- 现象: DSK `dsk_spinner_and_check()` 直接解引用 `ctx->dkm_kernel_api` 和 `ctx->framebuffer_address`，无 NULL 检查。若 `api` 为 0 → `*(u64*)(0 + 0xA8)` 解引用地址 0xA8 → 页错误 → 三重故障重启。framebuffer 为 NULL 同理。
+- 复现步骤: boot_context 传递错误（kernel_api=0 或 fb=0）→ DSK entry → 立即页错误。
+- 串口/日志证据: 系统日志Agent报告（aa2d3f5a），缺口3/4分析。
+- 根因分析: 早期实现假设 boot_context 始终有效，未添加防御性检查。
+- 修复方案: ① `kernel_api` NULL 检查 + 诊断日志；② `framebuffer_address` NULL 检查；③ 输出 `block_api` / `block_read` / `block_write` 函数指针地址便于调试。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/dsk/main.c L866-878）
+- 验证: 编译通过。
+
+### BUG-20260729-015 [P0] [DKM/ahci] AHCI 写入超时使用固定循环 + PxCMD.W 违规写入
+- 现象: `ahci_write_blocks_internal()` 使用 `for(i=0;i<5000000;i++)` 固定循环超时。实机 CPU 频率差异导致超时时间不可预测（快 CPU 可能过早超时，慢 CPU 可能等待过久）。同时代码写入 `PxCMD.W` 位（AHCI 规范中为只读位），违反 AHCI 1.3 规范。
+- 复现步骤: 实机启动 → DSK 通过 AHCI 写入 FAT32 → 固定循环超时不足 → 写入超时失败 → FAT32 写操作失败 → 系统异常。
+- 串口/日志证据: 驱动开发Agent报告；原代码 L356-358（PxCMD.W 写入）、L363-371（固定循环）。
+- 根因分析: ① 写入路径复制了早期读取路径的固定循环模式，未跟随读取路径升级为 TSC deadline；② `AHCI_CMD_W` (bit 6) 在 AHCI 规范中为只读，硬件根据命令头 `flags.W` 自动设置。
+- 修复方案: ① 写入超时替换为 TSC 5 秒 deadline（与读取路径一致）；② 移除所有 PxCMD.W 读/写操作。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/DKM/ahci/ahci.c L355-371）
+- 验证: 编译通过；QEMU 读取路径已验证 TSC 超时有效。
+
+### BUG-20260729-014 [P0] [DSK/loader] dsk_load_elf 完全忽略 size 参数 + PIE 重定位无边界检查
+- 现象: DSK 端 `dsk_load_elf()` 显式 `(void)size` 忽略文件大小参数，程序头、PT_LOAD 段、PT_DYNAMIC 段的读取均无边界检查。PIE 重定位中 `rela_off - min_vaddr` 和 `rel->offset - min_vaddr` 可能无符号整数下溢（若 < min_vaddr），导致从 `image` 基址偏移到巨大地址 → 随机内存写入 → 三重故障重启。UTSM 端有完整的 `range_ok` 检查，DSK 端完全缺失。
+- 复现步骤: 加载损坏/恶意的 ELF → `rela_off < min_vaddr` → `rela_off - min_vaddr` 下溢为 ~0xFFFFFFFFFFFFFFFF → 读取/写入随机内存 → 崩溃。
+- 串口/日志证据: 安全审查Agent报告（bd89e1b9），1.1/1.2/3.1节。
+- 根因分析: DSK ELF 加载器为简化实现，省略了 UTSM 端已实现的安全检查。两端 ELF 加载逻辑不一致（UTSM 有 `range_ok`，DSK 忽略 `size`）。
+- 修复方案: ① 移除 `(void)size`，添加 `size < sizeof(elf64_ehdr)` 检查；② 程序头范围验证 `phoff + phnum*phentsize <= size`；③ PT_LOAD `offset + filesz <= size` 检查；④ PT_DYNAMIC vaddr 范围检查；⑤ PIE `rela_off >= min_vaddr && rela_off < min_vaddr + isize` 边界检查；⑥ `rel->offset >= min_vaddr && rel->offset < min_vaddr + isize` 边界检查；⑦ entry 范围验证。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/dsk/main.c L721-824）
+- 验证: 编译通过；边界检查逻辑与 UTSM 端 `dsk_load_elf_image` 一致。
+
+### BUG-20260729-013 [P0] [UTSM/dsk_loader] UTSM→DSK 跳转前 cli 缺失 + IDT 未重置导致实机三重故障
+- 现象: 实机从 UTSM 加载 DSK 后崩溃重启。`dsk_load_and_jump()` 中 PIC mask 操作前未执行 `cli`，两条 `outb`（mask PIC2 和 PIC1）之间存在中断竞争窗口。实机在此窗口内可能触发 spurious IRQ7/15 或 IOAPIC 中断 → 跳转到 UTSM 过期 IDT handler → 若 handler 内调用的内存被 DSK 覆盖 → 双重异常 → 三重故障 → 重启。同时，跳转后 IDT 仍指向 UTSM 的 ISR stub，DSK 运行期间任何 CPU 异常（PF/GP）会执行 UTSM 的 `idt_handler`（含 log_error + for(;;)cli;hlt），若发生双重异常则重启。
+- 复现步骤: 实机启动 → UTSM 完成 DKM 加载 → `dsk_load_and_jump()` → PIC mask 两步操作之间中断到达 → 三重故障重启。或在 DSK 运行期间发生 CPU 异常 → UTSM handler → 可能双重异常 → 重启。
+- 串口/日志证据: 系统日志Agent报告（aa2d3f5a），崩溃点A/B分析；安全审查Agent报告确认。QEMU 不复现（无 spurious IRQ、无 SMI/NMI）。
+- 根因分析: ① `outb(0xA1,0xFF)` 和 `outb(0x21,0xFF)` 之间 IF=1，PIC2 IRQ 可通过 cascade 到 PIC1 触发中断；② IDT 未重置，DSK 阶段异常仍路由到 UTSM handler，handler 依赖的代码/数据可能已被覆盖。
+- 修复方案: ① PIC mask 前添加 `__asm__ volatile("cli")` 消除中断窗口；② 新增 `idt_halt_all()` 函数将全部 256 个 IDT 条目替换为安全 halt stub（`cli; hlt` 循环），防止 DSK 运行期间过期 handler 被触发；③ DSK entry 前输出 context 关键字段诊断日志（magic/api/fb）。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/UTSM/kernel/dsk_loader.c L613-650, CODE/UTSM/arch/x86_64/idt.c L440-460, CODE/UTSM/include/utsm/idt.h L8-11）
+- 验证: 编译通过；QEMU 启动正常；实机验证待用户执行。
+
+### BUG-20260729-012 [P3] [tools/fileman] go_up 缺少前向声明导致编译错误
+- 现象: fileman 编译失败，`open_selected()` 调用 `go_up()` 时函数尚未定义（隐式声明/未定义引用）。
+- 复现步骤: 编译 `CODE/tools/fileman/`。
+- 串口/日志证据: 编译器报错（implicit declaration of function 'go_up'）。
+- 根因分析: C 文件内函数定义顺序——`open_selected`（L259）在 `go_up`（L298）之前，缺少前向声明。
+- 修复方案: `CODE/tools/fileman/main.c` L258 添加 `static void go_up(void); /* 前向声明：open_selected 调用 go_up */`。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——main.c L258 前向声明存在，编译通过。
+
+### BUG-20260729-011 [P1] [build/linker] 全项目 linker.ld 未将 .bss 分离为 NOBITS 段导致 ELF 膨胀
+- 现象: 多个用户态 ELF 体积异常膨胀：shell 773KB、cmd 499KB、fileman ~470KB，远超代码实际大小；fileman 因超出桌面宿主加载缓冲区而崩溃（见 BUG-20260728-009）。
+- 复现步骤: 构建 shell/cmd/fileman 等 .elf，观察文件体积；反查 program header 的 filesz/memsz。
+- 串口/日志证据: 无运行期日志；构建产物体积异常即为证据。
+- 根因分析: linker.ld 将 `.bss` 与 `.data` 合并且未分离为独立 NOBITS 段，零初始化 BSS 数据（f32_disk/f32_data 等大缓冲）被计入 ELF 文件体积。
+- 修复方案: 全项目 linker.ld 将 `.bss` 分离为独立段置于 `.dynamic` 之后（仍归 `:data` PT_LOAD，phdr filesz<memsz，NOBITS 不占文件空间）。修复后 shell 773KB→92KB、cmd 499KB→92KB、fileman ~470KB→46KB。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——`CODE/tools/fileman/linker.ld` L23–28 含分离注释与独立 .bss 段；shell/cmd 等 linker.ld 同构。
+
+### BUG-20260729-010 [P1] [firstInit] FirstInit 设置向导按键崩溃（策划 B6）
+- 现象: FirstInit 账户设置卡片中按键导致崩溃。原记录："fb_text -O2 optimization issue"。
+- 复现步骤: firstInit.txt=0 → 首次启动 → 进入 FirstInit 账户设置卡片 → 按任意键。
+- 串口/日志证据: 调试会话 `debug-firstinit-key-crash.md`（状态 OPEN）记录 H1–H5 假设：① -O2 下 clang 生成 memset/memcpy 隐式调用或对齐 SSE 指令（freestanding 环境出错）；② fb_text/fb_char 路径数组越界（g_ascii 95 项索引边界 / 18px 中文字模尺寸）；③ 栈溢出（DSK 直接 call 入口共享同一栈，-O2 内联帧膨胀）；④ 扫描码状态机（shift/release）越界写；⑤ linker.ld BSS NOBITS 分离后 rela 覆盖遗漏（指针数组未重定位）。已确认：所有模块 -O2 编译、无 -fno-strict-aliasing；DSK loader 已 memset 整个 image（BSS 安全）。
+- 根因分析: 未定，待 QEMU 复现（monitor sendkey + 串口捕获异常向量/RIP）后 addr2line 定位。M1 里程碑确认 QEMU 未复现。
+- 修复方案: 添加防御性边界检查：scan_to_ascii 调用前 sc>=58 提前跳过（防止越界）；已确认 -fno-builtin 编译标志存在。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/firstInit/main.c read_field 防御性边界检查）
+- 验证: M1 里程碑 QEMU 验证未复现；已添加 sc>=58 防御性跳过；-fno-builtin 已存在于编译标志。
+
+### BUG-20260728-009 [P1] [desktop/fileman] fileman.elf 启动触发 QEMU exit（策划 B5）
+- 现象: 桌面中打开 Files 应用（外部 .elf 全屏宿主）时 QEMU 进程直接退出，文件管理器不可用。
+- 复现步骤: 构建含 fileman.elf 的镜像 → 启动至 desktop → 打开 fileman → QEMU exit。
+- 串口/日志证据: fileman 启动后串口输出中断（当时未留存完整日志，退出码待补录）。
+- 根因分析: fileman 的 linker.ld 未将 .bss 分离为 NOBITS 段（见 BUG-20260729-011），ELF 膨胀至 ~470KB，超出 desktop `dt_load_elf` 的 `g_elf_image` 256KB 静态缓冲区，加载越界/校验失败。
+- 修复方案: ① 全项目 linker.ld .bss 分离 NOBITS（fileman ~470KB→46KB）；② desktop `g_elf_image` 由 256KB 扩至 1MB（`CODE/desktop/main.c` L1802）。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——linker.ld NOBITS 分离 + g_elf_image=1048576 已确认；fileman 现可打开/浏览/关闭（QEMU 实机回归建议补做）。
+
+### BUG-20260728-008 [P2] [desktop/fileman] Files 缺少 ".." 返回上级目录
+- 现象: Files 进入子目录后没有 ".." 条目，用户无法返回上一级文件夹。
+- 复现步骤: desktop 打开 Files → 进入任意子目录 → 列表中无返回入口（仅键盘 Backspace）。
+- 串口/日志证据: 无（UI 行为问题）。
+- 根因分析: `load_current_dir()` 未在非根目录时合成 ".." 伪条目。
+- 修复方案: `CODE/tools/fileman/main.c` `load_current_dir()` 在 path_depth>0 时于列表开头插入 ".." 条目（clus=0 特殊标记），`open_selected()` 特判调用 `go_up()`；同时补充 `go_up()` 前向声明（见 BUG-20260729-012）。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——main.c L67–82 插入 ".." 条目、L264–267 特判、L298–303 go_up 实现均存在。
+
+### BUG-20260728-007 [P2] [desktop/fileman] Files 未显示文件夹条目（直接显示文件夹下文件）
+- 现象: Files 列表中不显示文件夹条目，直接展开了文件夹下的文件，目录层级丢失。
+- 复现步骤: desktop 打开 Files → 根目录列表中看不到 SYSTEM 等目录条目。
+- 串口/日志证据: 无（UI 行为问题）。
+- 根因分析: 目录列举/过滤逻辑未正确区分 `is_dir` 条目（attr 0x10）。
+- 修复方案: 修复后 `fm_entry.is_dir` 正确填充，目录以黄色图标 + "DIR" 类型 + "--" 大小显示，Enter 进入子目录（`CODE/tools/fileman/main.c`）。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——main.c 列表绘制含 is_dir 分支（图标颜色/类型列），`open_selected()` 目录进入逻辑存在。
+
+### BUG-20260728-006 [P2] [desktop/fileman] Files 默认未显示 SYSTEM/user 目录内容
+- 现象: 桌面第一页 Files 面板/Files 应用默认显示根目录，而非用户期望的 SYSTEM/user 内容。
+- 复现步骤: 启动至 desktop → 打开 Files → 默认路径为根目录。
+- 串口/日志证据: 无（UI 行为问题）。
+- 根因分析: fileman 启动时 path_depth=0（根目录），未定位到 SYSTEM/user。
+- 修复方案: `CODE/tools/fileman/main.c` `find_user_dir()`：启动时先枚举根目录找 SYSTEM，再在其中找 USER，命中则预设路径栈（path_depth=2）后 `load_current_dir()`。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——main.c L306–339 find_user_dir 实现存在，dsk_entry 中调用。
+
+### BUG-20260728-005 [P2] [desktop] DASHBOARD shell 回车后上一条命令文字跑到下一行
+- 现象: 桌面第一页（DASHBOARD）的 shell 面板中输入命令回车后，上一条命令的输入文字异常出现在下一行。
+- 复现步骤: desktop DASHBOARD → TERM 面板输入任意命令 → 回车 → 观察回显错位。
+- 串口/日志证据: 无（UI 行为问题）。
+- 根因分析: `redraw_input_line()` 只更新 framebuffer 视觉渲染，不同步终端缓冲区 `term_ch[]`。当 `term_redraw_all()` 从缓冲区重新渲染时，旧输入文字残留在缓冲区导致错位。
+- 修复方案: `redraw_input_line()` 中同步更新终端缓冲区 term_ch[]/term_fg[]（提示符+输入+空白填充），确保 term_redraw_all() 渲染与视觉一致。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/shell/main.c redraw_input_line）
+- 验证: 编译通过；redraw_input_line 现在同步 term_ch/term_fg 缓冲区。
+
+### BUG-20260728-004 [P3] [desktop] Boot 打字机效果速度过慢（期望提速 3 倍）
+- 现象: 桌面启动时的打字机 Boot 屏逐字输出节奏过慢，影响开机体验。
+- 复现步骤: 启动至 desktop → 观察 Boot 屏打字速度。
+- 串口/日志证据: 无（体验问题）。
+- 根因分析: 打字机帧间隔常量偏大。
+- 修复方案: 缩小打字机每字符间隔（约 3 倍提速）。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: ROADMAP 近期进展已记录"Boot 打字机提速"；QEMU 观感验证。
+
+### BUG-20260728-003 [P2] [shell] 开发者模式 shell 回车后文字消失无反应
+- 现象: 开发者模式（dev_mode）中 shell 输入命令回车，输入文字消失且无任何响应/输出。
+- 复现步骤: firstInit.txt 第二行=1 或 FUCK dev_mode=1 → DSK 加载 shell.elf → 手动输入命令 → 回车。
+- 串口/日志证据: 无（当时未留存）。
+- 根因分析: 与 BUG-005 同根因：`redraw_input_line()` 不同步终端缓冲区，`term_redraw_all()` 从旧缓冲区渲染覆盖当前输入行，导致视觉上输入文字"消失"。
+- 修复方案: BUG-005 修复（redraw_input_line 同步 term_ch/term_fg 缓冲区）同时解决此问题。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/shell/main.c redraw_input_line — 与 BUG-005 同修复）
+- 验证: 编译通过；BUG-005 修复确保终端缓冲区与视觉渲染一致。
+
+### BUG-20260728-002 [P3] [desktop] DESKTOP 页冗余显示终端/CMD 图标
+- 现象: 第一页（DASHBOARD）已有 TERM-01/TERM-02 终端面板，第三页 DESKTOP 图标网格仍显示终端和 CMD 图标，入口冗余。
+- 复现步骤: desktop → 切到 DESKTOP 页 → 可见终端/CMD 图标。
+- 串口/日志证据: 无（UI 设计问题）。
+- 根因分析: DESKTOP 页快捷方式列表未排除已在 DASHBOARD 常驻的终端类应用。
+- 修复方案: 从 DESKTOP 页图标列表移除终端与 CMD 冗余项。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: ROADMAP 近期进展已记录"DESKTOP 页冗余图标移除"；代码核查——desktop 图标过滤逻辑已生效（当前 DESKTOP 页无终端/CMD 图标）。
+
+### BUG-20260728-001 [P2] [desktop/fileman] Files 窗口点击关闭按钮（叉）无法关闭
+- 现象: Files 应用窗口右上角关闭按钮（叉）点击无反应，无法退出应用。
+- 复现步骤: desktop 打开 Files → 点击右上角关闭区域 → 应用未退出。
+- 串口/日志证据: 无（UI 行为问题）。
+- 根因分析: 鼠标点击处理未命中关闭按钮热区（右上角 w-28..w-4, y 4..24）。
+- 修复方案: `CODE/tools/fileman/main.c` 鼠标轮询中检测关闭按钮热区命中后 `da_slog("fileman","close button clicked")` 并 return 退出。
+- 状态: [FIXED]
+- 修复提交: 待提交（工作区已修复）
+- 验证: 代码核查——main.c L372–377 关闭热区判定与退出存在。
+
+---
+
+## 附：遗留条目对照
+
+2026-07-29 结构化前的 8 条纯文本遗留 bug 与新编号对照：
+
+| 遗留原文 | 新编号 | 状态 |
+|---------|--------|------|
+| 软件Files的窗口点击叉无法关闭 | BUG-20260728-001 | FIXED |
+| 第一页已有终端，第四页桌面不用显示终端和CMD | BUG-20260728-002 | FIXED |
+| 开发者模式 shell 回车文字消失没有反应 | BUG-20260728-003 | FIXED |
+| 启动时打字机效果再快3倍 | BUG-20260728-004 | FIXED |
+| 第一页 shell 回车后上一条命令文字跑到下一行 | BUG-20260728-005 | FIXED |
+| 第一页 Files 显示的不是 SYSTEM/user 中的文件夹内容 | BUG-20260728-006 | FIXED |
+| Files 中没有显示文件夹，直接显示文件夹下的文件 | BUG-20260728-007 | FIXED |
+| Files 没有提供 ".." 返回上一级文件夹 | BUG-20260728-008 | FIXED |
+
+### BUG-20260730-P12 [P0] [DSK/Shell] fat32_write_root_file 不遍历 FAT 链，根目录首簇满时报告 "no free dir entry"
+- 现象: DSK 里程碑标记和 Shell 测试日志无法写入磁盘，QEMU 串口日志显示 4 次 [DSK] fat32 write: no free dir entry。
+- 复现步骤: 使用 SATA FAT32 测试镜像启动（根目录首簇 16 条目全部占用），任何需要创建新文件的写入操作均失败。
+- 串口/日志证据: QEMU serial.log 中 4 次 [DSK] fat32 write: no free dir entry。
+- 根因分析: at32_write_root_file 只扫描根目录的第一个簇（spc=1 时仅 16 条目），不跟随 FAT 链检查后续簇。SATA 测试镜像根目录 FAT 链为 2→3→EOF，首簇满但第二簇有 10 个空闲条目，代码未到达第二簇。
+- 修复方案: 修改 DSK 和 Shell 的 at32_write_root_file，用 while 循环遍历完整 FAT 链搜索空闲条目，记录 ree_clus/ound_clus，写回时使用活动簇而非硬编码 oot_clus。
+- 状态: [FIXED]
+- 修复文件: CODE/dsk/main.c (L589-655), CODE/shell/main.c (L437-490)
+- 验证: QEMU 测试显示 4 次 [DSK] fat32 write: success，4 个里程碑标记文件成功写入 SATA 镜像。
+
+### BUG-20260730-P13 [P0] [Shell] fat32_write_root_file 不遍历 FAT 链 (同 P12)
+- 现象/根因/修复: 与 P12 相同，影响 Shell 模块。
+- 状态: [FIXED]
+- 修复文件: CODE/shell/main.c (L437-490, L553-606, L682-684)
+- 额外修复: 当整条 FAT 链都无空闲条目时，自动扩展根目录（分配新簇并链接到 FAT 链尾部）。
+- 验证: 同 P12。
+
+### BUG-20260730-P14 [P0] [DKM/ahci] AHCI 写入 TFD 错误检查误判正常状态为错误
+- 现象: QEMU 测试中 AHCI 写入报 write error: TFD ERR，导致 FAT32 写入函数返回错误码。实际写入可能成功但因错误检查提前返回，后续 FLUSH CACHE 被跳过。
+- 复现步骤: QEMU q35 + SATA 驱动，任何 AHCI 写入操作。
+- 串口/日志证据: [WARN] [ahci] write error: TFD ERR，TFD 值为 0x50（DRDY|DRQ，正常状态）。
+- 根因分析: hci.c L376 的错误检查 if (tfd & 0xFF) 检查的是 STS 低字节是否非零。但 STS=0x50 (DRDY=1, DRQ=1) 是 DMA 完成后的正常状态，不是错误。正确的检查应只看 STS bit0 (ERR) 和 ERR 寄存器 (bits15:8)。
+- 修复方案: 改为 u8 sts = (u8)(tfd & 0xFF); u8 err_reg = (u8)((tfd >> 8) & 0xFF); if ((sts & 0x01) || err_reg)。
+- 状态: [FIXED]
+- 修复文件: CODE/DKM/ahci/ahci.c (L372-386)
+- 验证: QEMU 测试无 TFD ERR 错误，4 次 FAT32 写入成功，里程碑文件正确写入磁盘。

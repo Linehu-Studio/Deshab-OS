@@ -96,6 +96,10 @@ void dma_init(void) {
 int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer *out) {
     if (!out || page_count == 0 || !g_dma_ready) return -1;
     if (page_count > DMA_BITMAP_PAGES) return -3;
+    /* 真机安全: max_phys 参数上限为低 4G (DMA bitmap 只覆盖低 4G)。
+     * 调用方若传 0 表示"无限制"，按低 4G 上限处理。
+     * 对 NVMe/AHCI 等需要 32-bit DMA 的设备, max_phys 传 0x100000000。
+     * 若未来需要 >4G DMA, 需要扩展 bitmap 或使用 IOMMU/SWIOTLB。 */
     if (max_phys == 0 || max_phys > DMA_LOW_MAX_PHYS) max_phys = DMA_LOW_MAX_PHYS;
 
     if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;

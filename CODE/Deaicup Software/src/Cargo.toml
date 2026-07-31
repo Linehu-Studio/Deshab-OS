@@ -1,0 +1,13 @@
+[package]
+name = "Deaicup-Software"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "Deaicup-Software"
+path = "src/main.rs"
+
+[dependencies]
+egui = "0.27"
+eframe = "0.27"
+egui_extras = { version = "0.27" , features = ["all_loaders"] }

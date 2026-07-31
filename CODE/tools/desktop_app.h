@@ -16,9 +16,11 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 typedef long long          i64;
 
-/* 端口 I/O */
+/* 端口 I/O（宿主已自带 outb/inb 时，包含前 #define DA_NO_PORTIO 跳过本段） */
+#ifndef DA_NO_PORTIO
 static inline void outb(u16 port, u8 val) { __asm__ volatile("outb %0,%1"::"a"(val),"Nd"(port)); }
 static inline u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+#endif
 
 /* COM1 串口日志 */
 #define DA_COM1 0x3F8
@@ -378,5 +380,91 @@ static inline void da_rtc_time(u8 *h, u8 *m) {
 /* ========== memset/memcpy ========== */
 static inline void *da_memset(void *d, int c, u64 n) { u8 *p=(u8*)d; while(n--)*p++=(u8)c; return d; }
 static inline void *da_memcpy(void *d, const void *s, u64 n) { u8 *dd=(u8*)d; const u8 *ss=(const u8*)s; while(n--)*dd++=*ss++; return d; }
+
+/* ========== Linux 桌面应用配置契约（Phase 5） ==========
+ *
+ * desktop.elf 启动时（Linux 兼容层服务可用时）从 FAT32 根目录读取
+ * LINUXAPP.CNF（8.3 名 LINUXAPPCNF），每行注册一个 Linux 应用图标：
+ *
+ *   显示名|linux命令
+ *
+ * 示例：
+ *   NEOFETCH|/usr/bin/neofetch
+ *   HTOP|/usr/bin/htop
+ *   LS|/bin/ls -la /
+ *
+ * 规则：
+ *   - 空行与 # 开头的行被忽略；显示名与命令两侧空白被修剪
+ *   - 显示名 <= 11 字符（桌面图标 label），命令 <= 63 字符
+ *   - 命令按空格分词：第一个 token 为程序路径（建议绝对路径；
+ *     裸命令由调用方补 /bin/ 前缀），其余 token 作为 argv 参数，
+ *     不支持引号转义
+ *   - 文件不存在或无有效行时，调用方回退到内置默认列表
+ */
+
+#define DA_LINUXAPP_CNF_83   "LINUXAPPCNF"  /* FAT32 8.3 名（即 LINUXAPP.CNF） */
+#define DA_LINUXAPP_MAX      8              /* Linux 应用注册上限 */
+#define DA_LINUXAPP_NAME_CAP 12             /* 显示名缓冲（含 NUL） */
+#define DA_LINUXAPP_CMD_CAP  64             /* 命令行缓冲（含 NUL） */
+
+typedef struct {
+    char name[DA_LINUXAPP_NAME_CAP];
+    char cmd[DA_LINUXAPP_CMD_CAP];
+} da_linux_app;
+
+/* 解析 LINUXAPP.CNF 文本（允许非 NUL 结尾，按 size 截断）。
+ * 返回有效条目数（<= max）。 */
+static inline int da_linuxapp_parse(const char *text, u32 size, da_linux_app *out, int max) {
+    int count = 0;
+    u32 pos = 0;
+    while (pos < size && count < max) {
+        /* 取出一行（吞掉 \r，超长部分截断） */
+        char line[96];
+        int ll = 0;
+        while (pos < size && text[pos] != '\n') {
+            char c = text[pos++];
+            if (c == '\r') continue;
+            if (ll < 95) line[ll++] = c;
+        }
+        if (pos < size && text[pos] == '\n') pos++;
+        line[ll] = 0;
+
+        /* 行尾空白修剪 */
+        while (ll > 0 && (line[ll-1] == ' ' || line[ll-1] == '\t')) line[--ll] = 0;
+
+        /* 跳过空行与注释行 */
+        int s = 0;
+        while (line[s] == ' ' || line[s] == '\t') s++;
+        if (line[s] == 0 || line[s] == '#') continue;
+
+        /* 分隔符 '|' */
+        int bar = s;
+        while (line[bar] && line[bar] != '|') bar++;
+        if (line[bar] != '|') continue;
+
+        /* 显示名 [s, bar) 去尾空白 */
+        int ne = bar;
+        while (ne > s && (line[ne-1] == ' ' || line[ne-1] == '\t')) ne--;
+        if (ne <= s) continue;
+
+        /* 命令 (bar, end) 去头空白 */
+        int cs = bar + 1;
+        while (line[cs] == ' ' || line[cs] == '\t') cs++;
+        if (line[cs] == 0) continue;
+
+        int ni = 0;
+        for (int k = s; k < ne && ni < DA_LINUXAPP_NAME_CAP - 1; k++)
+            out[count].name[ni++] = line[k];
+        out[count].name[ni] = 0;
+
+        int ci = 0;
+        for (int k = cs; line[k] && ci < DA_LINUXAPP_CMD_CAP - 1; k++)
+            out[count].cmd[ci++] = line[k];
+        out[count].cmd[ci] = 0;
+
+        count++;
+    }
+    return count;
+}
 
 #endif /* DESHAB_DESKTOP_APP_H */

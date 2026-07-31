@@ -2,6 +2,7 @@
 #include <utsm/log.h>
 #include <utsm/idt.h>
 #include <utsm/net.h>
+#include <utsm/mm.h>
 
 static void dkm_api_info(const char *msg) {
     log_info(msg);
@@ -52,7 +53,10 @@ static dkm_kernel_api g_kernel_api = {
     .boot_modules_response = 0,
     .irq_register = 0,
     .hhdm_offset = 0,
-    .block = 0
+    .block = 0,
+    .mmio = 0,
+    .mm_map_mmio = 0,
+    .mm_unmap_mmio = 0
 };
 
 const dkm_kernel_api *dkm_get_kernel_api(void) {
@@ -69,6 +73,7 @@ void dkm_fill_platform_info(void) {
     g_kernel_api.dma = dma_get_api();
     g_kernel_api.net = net_get_api();
     g_kernel_api.block = block_get_api();
+    g_kernel_api.mmio = paging_get_api();
     if (g_rsdp_request.response && g_rsdp_request.response->address) {
         g_kernel_api.rsdp_address = g_rsdp_request.response->address;
     }
@@ -87,4 +92,6 @@ void dkm_fill_platform_info(void) {
     if (g_hhdm_request.response) {
         g_kernel_api.hhdm_offset = g_hhdm_request.response->offset;
     }
+    g_kernel_api.mm_map_mmio = mm_map_mmio;
+    g_kernel_api.mm_unmap_mmio = mm_unmap_mmio;
 }

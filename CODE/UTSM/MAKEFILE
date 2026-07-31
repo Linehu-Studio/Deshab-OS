@@ -12,20 +12,28 @@ LDFLAGS := -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c dkm/*.c test/*.c vmm/*.c pe/*.c)
 S_SOURCES := $(wildcard arch/x86_64/*.S vmm/*.S)
 OBJECTS := $(C_SOURCES:.c=.o) $(S_SOURCES:.S=.o)
+DEPS := $(C_SOURCES:.c=.d)
 
 .PHONY: all clean
 
+# 显式指定默认目标：防止 -include 的 .d 文件(halt.d 等)抢占默认目标
+.DEFAULT_GOAL := all
+
 all: $(OUT)
+
+# 头文件依赖追踪：clang -MMD 生成 .d，避免 config.h 等头修改后对象文件不重建
+# 注意：-include 必须放在 all: 之后，否则第一个 .d 中的目标会成为 make 默认目标
+-include $(DEPS)
 
 $(OUT): $(OBJECTS) linker.ld
 	@if not exist "$(ROOT)\SYSTEM\boot" mkdir "$(ROOT)\SYSTEM\boot"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 %.o: %.S
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 clean:
-	powershell -NoProfile -Command "Get-ChildItem -Path . -Recurse -Filter *.o | Remove-Item -Force; if (Test-Path '$(OUT)') { Remove-Item '$(OUT)' -Force }"
+	powershell -NoProfile -Command "Get-ChildItem -Path . -Recurse -Include *.o,*.d | Remove-Item -Force; if (Test-Path '$(OUT)') { Remove-Item '$(OUT)' -Force }"

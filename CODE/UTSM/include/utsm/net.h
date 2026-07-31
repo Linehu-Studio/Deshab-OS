@@ -58,6 +58,16 @@ typedef struct dkm_net_device_info {
     u32 flags;
 } dkm_net_device_info;
 
+/* 网络设备统计（真机诊断用，驱动层累计）。 */
+typedef struct dkm_net_stats {
+    u64 tx_ok;          /* TX 成功帧数 */
+    u64 tx_err;         /* TX 失败帧数 */
+    u64 rx_ok;          /* RX 成功帧数 */
+    u64 rx_err;         /* RX 错误帧数 */
+    u64 rx_overflow;    /* RX buffer 溢出丢包 */
+    u64 link_changes;   /* 链路状态变化次数 */
+} dkm_net_stats;
+
 typedef struct dkm_net_api {
     int (*register_device)(const dkm_net_device_desc *desc);
     u32 (*device_count)(void);
@@ -69,6 +79,8 @@ typedef struct dkm_net_api {
     int (*scan_count)(u32 index);
     int (*scan_result)(u32 index, u32 n, dkm_net_scan_result *out);
     int (*is_wireless)(u32 index);
+    /* 网络统计查询（返回 0 成功，-1 索引越界）。 */
+    int (*device_stats)(u32 index, dkm_net_stats *out);
 } dkm_net_api;
 
 void net_init(void);

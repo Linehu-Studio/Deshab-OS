@@ -5,6 +5,7 @@
 #include <utsm/types.h>
 #include <utsm/pe.h>
 #include <utsm/linux_compat.h>
+#include <utsm/instr.h>
 #include "../arch/x86_64/limine.h"
 
 #define DSK_PATH "/system/deshab64/deshab.elf"
@@ -20,6 +21,27 @@
 #define ET_EXEC 2
 #define EM_X86_64 62
 #define PT_LOAD 1
+#define PT_DYNAMIC 2
+
+/* ELF Dynamic section tags */
+#define DT_NULL     0
+#define DT_RELA     7
+#define DT_RELASZ   8
+#define DT_RELAENT  9
+
+/* ELF Relocation types */
+#define R_X86_64_RELATIVE 8
+
+typedef struct elf64_dyn {
+    i64 tag;
+    u64 val;
+} elf64_dyn;
+
+typedef struct elf64_rela {
+    u64 offset;
+    u64 info;
+    i64 addend;
+} elf64_rela;
 
 void *memset(void *dst, int value, usize len);
 void *memcpy(void *dst, const void *src, usize len);
@@ -152,27 +174,86 @@ static struct limine_file *dsk_find_module(void) {
 }
 
 /* ---- FAT32 block-provider file reader ---- */
-static u8 g_dsk_fat32_disk[65536];  /* 128-sector BPB+FAT+root dir buffer */
+static u8 g_dsk_fat32_disk[131072]; /* 256-sector BPB+FAT+root dir buffer (与 DSK 端一致) */
 static u8 g_dsk_fat32_cluster[4096]; /* 8-sector cluster buffer */
 /* 实机要求: 文件缓冲区足够大容纳 deshab.elf (~1.5MB) */
 static u8 g_dsk_fat32_filedata[2097152]; /* 2MB file data buffer */
+/* BUG-019 修复: FAT 按需扇区读取缓冲区（仅 512 字节），
+ * 当 FAT 条目偏移超出 g_dsk_fat32_disk (128KB) 时使用。 */
+static u8 g_dsk_fat32_fat_sec[512];
+
+/* BUG-019 修复: 按需读取 FAT 扇区获取下一个簇号。
+ * 如果目标 FAT 条目在预读缓冲区内，直接读取；
+ * 否则只读取包含该条目的单个 FAT 扇区（512 字节）。
+ * fat_start: FAT 在预读缓冲区中的字节偏移（reserved_sectors * 512）。
+ * clus: 当前簇号。
+ * bpb: BPB 指针（用于计算 FAT 扇区 LBA）。
+ * disk: 预读缓冲区基址。
+ * 返回: 下一个簇号，失败返回 0x0FFFFFFF（链终止）。 */
+static u32 fat32_get_next_cluster(u32 fat_start_byte, u32 clus,
+                                   const fat32_bpb *bpb, const u8 *disk) {
+    u32 fat_ent_off = fat_start_byte + clus * 4;
+    /* 情况 1: FAT 条目在预读缓冲区内（小分区） */
+    if (fat_ent_off + 4 <= sizeof(g_dsk_fat32_disk)) {
+        return fat32_read_u32(disk + fat_ent_off) & 0x0FFFFFFF;
+    }
+    /* 情况 2: FAT 条目超出预读缓冲区（实机大分区）——按需读取单个 FAT 扇区 */
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block) return 0x0FFFFFFF;
+    /* FAT 条目在 FAT 表中的字节偏移（相对于 FAT 起始） */
+    u32 fat_byte_off_in_fat = clus * 4;
+    /* 该条目所在的 FAT 扇区号（相对于 FAT 起始） */
+    u32 fat_sec_index = fat_byte_off_in_fat / 512;
+    /* 条目在扇区内的字节偏移 */
+    u32 ent_off_in_sec = fat_byte_off_in_fat % 512;
+    /* FAT 扇区的绝对 LBA */
+    u32 fat_sec_lba = bpb->reserved_sector_count + fat_sec_index;
+    int st = api->block->read(0, fat_sec_lba, 1, g_dsk_fat32_fat_sec);
+    if (st != 0) {
+        log_error("[UTSM] FAT32: on-demand FAT sector read failed");
+        log_hex64("[UTSM] FAT32: fat_sec_lba=", fat_sec_lba);
+        log_hex64("[UTSM] FAT32: clus=", clus);
+        return 0x0FFFFFFF;
+    }
+    return fat32_read_u32(g_dsk_fat32_fat_sec + ent_off_in_sec) & 0x0FFFFFFF;
+}
 
 static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
     const dkm_kernel_api *api = dkm_get_kernel_api();
-    if (!api || !api->block || !api->block->device_count) return -1;
+    if (!api || !api->block || !api->block->device_count) {
+        log_error("[UTSM] FAT32: no block api available");
+        return -1;
+    }
     u32 count = api->block->device_count();
-    if (count == 0 || api->block->sector_size(0) != 512) return -1;
+    if (count == 0 || api->block->sector_size(0) != 512) {
+        log_error("[UTSM] FAT32: no block device or wrong sector size");
+        log_hex64("[UTSM] FAT32: device_count=", count);
+        return -1;
+    }
 
-    /* Read first 128 sectors: BPB + FAT + root dir */
+    /* Read first 256 sectors: BPB + FAT + root dir */
     u8 *disk = g_dsk_fat32_disk;
-    int st = api->block->read(0, 0, 128, disk);
-    if (st != 0) return -1;
+    int st = api->block->read(0, 0, 256, disk);
+    if (st != 0) {
+        log_error("[UTSM] FAT32: BPB read failed");
+        log_hex64("[UTSM] FAT32: read status=", (u64)(i64)st);
+        return -1;
+    }
 
     const fat32_bpb *bpb = (const fat32_bpb *)disk;
-    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) return -1;
+    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) {
+        log_error("[UTSM] FAT32: invalid BPB signature or sector size");
+        log_hex64("[UTSM] FAT32: boot_sig=", bpb->boot_sig);
+        log_hex64("[UTSM] FAT32: bps=", bpb->bytes_per_sector);
+        return -1;
+    }
 
     u32 fat_start = bpb->reserved_sector_count * 512;
     u32 data_start_sec = bpb->reserved_sector_count + (u32)bpb->fat_count * bpb->sectors_per_fat;
+    log_hex64("[UTSM] FAT32: fat_start_off=", fat_start);
+    log_hex64("[UTSM] FAT32: data_start_sec=", data_start_sec);
+    log_hex64("[UTSM] FAT32: spc=", bpb->sectors_per_cluster);
+    log_hex64("[UTSM] FAT32: root_clus=", bpb->root_cluster);
 
     u32 clus = bpb->root_cluster;
     u32 found_clus = 0;
@@ -184,7 +265,12 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
         u32 cls_sec = bpb->sectors_per_cluster;
         u8 *cb = g_dsk_fat32_cluster;
         st = api->block->read(0, clus_lba, cls_sec, cb);
-        if (st != 0) return -1;
+        if (st != 0) {
+            log_error("[UTSM] FAT32: dir cluster read failed");
+            log_hex64("[UTSM] FAT32: clus=", clus);
+            log_hex64("[UTSM] FAT32: lba=", clus_lba);
+            return -1;
+        }
 
         const fat32_dir_entry *dir = (const fat32_dir_entry *)cb;
         for (u32 e = 0; e * 32 < cls_sec * 512; e++) {
@@ -194,19 +280,27 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
             if (dir[e].attr & 0x08) continue;
             if (fat32_name11_eq(dir[e].name, target)) {
                 found_size = dir[e].file_size;
-                found_clus = fat32_read_u16((const u8 *)&dir[e].cluster_low);
+                found_clus = fat32_read_u16((const u8 *)&dir[e].cluster_low) |
+                             ((u32)fat32_read_u16((const u8 *)&dir[e].cluster_high) << 16);
                 break;
             }
         }
         if (found_clus) break;
-        u32 fat_ent = fat_start + clus * 4;
-        if (fat_ent + 4 > 65536) break;
-        clus = fat32_read_u32(disk + fat_ent) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取，不再受 128KB 缓冲区限制 */
+        clus = fat32_get_next_cluster(fat_start, clus, bpb, disk);
     }
 
-    if (!found_clus || found_size == 0) return -1;
+    if (!found_clus || found_size == 0) {
+        log_error("[UTSM] FAT32: DESHAB.ELF not found in root dir");
+        return -1;
+    }
+    log_hex64("[UTSM] FAT32: found_clus=", found_clus);
+    log_hex64("[UTSM] FAT32: found_size=", found_size);
 
-    if (found_size > sizeof(g_dsk_fat32_filedata)) return -1;
+    if (found_size > sizeof(g_dsk_fat32_filedata)) {
+        log_error("[UTSM] FAT32: file exceeds 2MB buffer");
+        return -1;
+    }
     u8 *dst = g_dsk_fat32_filedata;
     u32 remaining = found_size;
     u32 fc = found_clus;
@@ -219,25 +313,166 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
 
         u8 *chunk = g_dsk_fat32_cluster;
         st = api->block->read(0, fc_lba, fc_sec, chunk);
-        if (st != 0) return -1;
+        if (st != 0) {
+            log_error("[UTSM] FAT32: data cluster read failed");
+            log_hex64("[UTSM] FAT32: fc=", fc);
+            log_hex64("[UTSM] FAT32: lba=", fc_lba);
+            return -1;
+        }
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = chunk[b];
         dst += fc_bytes;
         remaining -= fc_bytes;
 
-        u32 fat_ent = fat_start + fc * 4;
-        if (fat_ent + 4 > 65536) { fc = 0x0FFFFFFF; break; }
-        fc = fat32_read_u32(disk + fat_ent) & 0x0FFFFFFF;
+        /* BUG-019: 使用按需 FAT 读取 */
+        fc = fat32_get_next_cluster(fat_start, fc, bpb, disk);
     }
 
     /* Copy to arena for ELF loader */
     u8 *file_buf = (u8 *)kmem_alloc_aligned(found_size, 16);
-    if (!file_buf) return -1;
+    if (!file_buf) {
+        log_error("[UTSM] FAT32: arena alloc failed");
+        log_hex64("[UTSM] FAT32: size=", found_size);
+        return -1;
+    }
     for (u32 i = 0; i < found_size; i++) file_buf[i] = g_dsk_fat32_filedata[i];
 
     *out_addr = file_buf;
     *out_size = found_size;
     log_hex64("[UTSM] FAT32 file size=", found_size);
     return 0;
+}
+
+/* ---- FAT32 subdirectory traversal ---- */
+
+/* 在指定起始 cluster 的目录项中查找 name11。
+ * is_dir=1 时只匹配子目录（attr & 0x10），is_dir=0 时只匹配文件。
+ * 返回 0 成功，out_clus/out_size 返回匹配项的起始 cluster 和大小。 */
+static int fat32_find_in_dir(u32 start_clus, const char *name11, int is_dir,
+                              u32 *out_clus, u32 *out_size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->device_count) return -1;
+
+    u8 *disk = g_dsk_fat32_disk;
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) return -2;
+
+    u32 fat_start = bpb->reserved_sector_count * 512;
+    u32 data_start_sec = bpb->reserved_sector_count + (u32)bpb->fat_count * bpb->sectors_per_fat;
+    u32 spc = bpb->sectors_per_cluster;
+
+    u32 clus = start_clus;
+    while (clus >= 2 && clus < 0x0FFFFFF8) {
+        u32 clus_lba = data_start_sec + (clus - 2) * spc;
+        u8 *cb = g_dsk_fat32_cluster;
+        int st = api->block->read(0, clus_lba, spc, cb);
+        if (st != 0) return -3;
+
+        const fat32_dir_entry *dir = (const fat32_dir_entry *)cb;
+        for (u32 e = 0; e * 32 < spc * 512; e++) {
+            if (dir[e].name[0] == 0) break;
+            if ((u8)dir[e].name[0] == 0xE5) continue;
+            if (dir[e].attr == 0x0F) continue;
+            if (dir[e].attr & 0x08) continue;
+            if (!fat32_name11_eq(dir[e].name, name11)) continue;
+
+            /* 名称匹配，检查类型 */
+            int entry_is_dir = (dir[e].attr & 0x10) ? 1 : 0;
+            if (entry_is_dir != is_dir) continue;
+
+            *out_clus = fat32_read_u16((const u8 *)&dir[e].cluster_low) |
+                        ((u32)fat32_read_u16((const u8 *)&dir[e].cluster_high) << 16);
+            *out_size = dir[e].file_size;
+            return 0;
+        }
+
+        /* 跟随 FAT 链 — BUG-019: 使用按需 FAT 读取 */
+        clus = fat32_get_next_cluster(fat_start, clus, bpb, disk);
+    }
+    return -4;  /* 未找到 */
+}
+
+/* 按路径查找文件并读取内容。
+ * path: '/' 分隔的 8.3 格式路径（如 "SYSTEM  /DESHAB64 /FUCK    "）。
+ * out_data: 返回在 g_dsk_fat32_filedata 中的文件数据指针。
+ * out_size: 返回文件大小。
+ * 返回 0 成功。 */
+int fat32_read_path(const char *path, u8 **out_data, u32 *out_size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->device_count) return -1;
+
+    u8 *disk = g_dsk_fat32_disk;
+    /* 确保 BPB 缓冲区是新鲜的 */
+    if (api->block->read(0, 0, 256, disk) != 0) return -2;
+
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) return -3;
+
+    u32 fat_start = bpb->reserved_sector_count * 512;
+    u32 data_start_sec = bpb->reserved_sector_count + (u32)bpb->fat_count * bpb->sectors_per_fat;
+    u32 spc = bpb->sectors_per_cluster;
+
+    /* 解析路径组件 */
+    u32 pos = 0;
+    u32 path_len = 0;
+    while (path[path_len]) path_len++;
+
+    u32 cur_clus = bpb->root_cluster;  /* 从根目录开始 */
+
+    while (pos < path_len) {
+        /* 提取一个路径组件（到下一个 '/' 或结尾） */
+        char comp[12];  /* 11 字符 8.3 名 + \0 */
+        u32 ci = 0;
+        while (pos < path_len && path[pos] != '/' && ci < 11) {
+            comp[ci++] = path[pos++];
+        }
+        /* 不足 11 字符则补空格 */
+        while (ci < 11) comp[ci++] = ' ';
+        comp[11] = 0;
+
+        /* 跳过 '/' */
+        if (pos < path_len && path[pos] == '/') pos++;
+
+        /* 判断是否为最后一个组件 */
+        int is_last = (pos >= path_len);
+
+        if (is_last) {
+            /* 最后一级：查找文件 */
+            u32 found_clus = 0, found_size = 0;
+            int rc = fat32_find_in_dir(cur_clus, comp, 0, &found_clus, &found_size);
+            if (rc != 0) return -4;
+
+            if (found_size > sizeof(g_dsk_fat32_filedata)) return -5;
+
+            /* 读取文件数据 */
+            u8 *dst = g_dsk_fat32_filedata;
+            u32 remaining = found_size;
+            u32 fc = found_clus;
+            while (fc >= 2 && fc < 0x0FFFFFF8 && remaining > 0) {
+                u32 fc_lba = data_start_sec + (fc - 2) * spc;
+                u32 fc_bytes = spc * 512;
+                if (fc_bytes > remaining) fc_bytes = remaining;
+                u8 *chunk = g_dsk_fat32_cluster;
+                if (api->block->read(0, fc_lba, spc, chunk) != 0) return -6;
+                for (u32 b = 0; b < fc_bytes; b++) dst[b] = chunk[b];
+                dst += fc_bytes;
+                remaining -= fc_bytes;
+                /* BUG-019: 使用按需 FAT 读取 */
+                fc = fat32_get_next_cluster(fat_start, fc, bpb, disk);
+            }
+
+            *out_data = g_dsk_fat32_filedata;
+            *out_size = found_size;
+            return 0;
+        } else {
+            /* 中间级：查找子目录 */
+            u32 sub_clus = 0, sub_size = 0;
+            int rc = fat32_find_in_dir(cur_clus, comp, 1, &sub_clus, &sub_size);
+            if (rc != 0) return -7;
+            cur_clus = sub_clus;
+        }
+    }
+
+    return -8;  /* 路径为空或无效 */
 }
 
 /* ---- ELF checks ---- */
@@ -263,15 +498,26 @@ static int dsk_load_elf_image(const void *address, u64 size, dsk_entry_fn *entry
     u64 max_align = 0x1000;
     u32 load_count = 0;
 
+    /* PT_DYNAMIC 的位置（PIE 重定位用） */
+    u64 dyn_off = 0;
+    u64 dyn_filesz = 0;
+    int has_dyn = 0;
+
     for (u16 i = 0; i < eh->phnum; i++) {
         const elf64_phdr *ph = (const elf64_phdr *)(base + eh->phoff + (u64)i * eh->phentsize);
-        if (ph->type != PT_LOAD) continue;
-        if (ph->filesz > ph->memsz) return -1;
-        if (!range_ok(ph->offset, ph->filesz, size)) return -2;
-        if (ph->vaddr < min_vaddr) min_vaddr = ph->vaddr;
-        if (ph->vaddr + ph->memsz > max_vaddr) max_vaddr = ph->vaddr + ph->memsz;
-        if (ph->align > max_align) max_align = ph->align;
-        load_count++;
+        if (ph->type == PT_LOAD) {
+            if (ph->filesz > ph->memsz) return -1;
+            if (!range_ok(ph->offset, ph->filesz, size)) return -2;
+            if (ph->vaddr < min_vaddr) min_vaddr = ph->vaddr;
+            if (ph->vaddr + ph->memsz > max_vaddr) max_vaddr = ph->vaddr + ph->memsz;
+            if (ph->align > max_align) max_align = ph->align;
+            load_count++;
+        } else if (ph->type == PT_DYNAMIC) {
+            if (!range_ok(ph->offset, ph->filesz, size)) return -2;
+            dyn_off = ph->offset;
+            dyn_filesz = ph->filesz;
+            has_dyn = 1;
+        }
     }
 
     if (load_count == 0 || min_vaddr == ~0ULL || max_vaddr <= min_vaddr) return -3;
@@ -288,6 +534,44 @@ static int dsk_load_elf_image(const void *address, u64 size, dsk_entry_fn *entry
         u64 dst_off = ph->vaddr - min_vaddr;
         if (dst_off + ph->memsz > image_size) return -6;
         memcpy(image + dst_off, base + ph->offset, ph->filesz);
+    }
+
+    /* PIE 重定位: 处理 PT_DYNAMIC → DT_RELA → R_X86_64_RELATIVE
+     * load_bias = image 实际加载地址 - ELF 预期最小 vaddr
+     * 对每个 R_X86_64_RELATIVE: slot = load_bias + addend */
+    if (has_dyn && eh->type == ET_DYN) {
+        u64 load_bias = (u64)image - min_vaddr;
+        const elf64_dyn *dyn = (const elf64_dyn *)(base + dyn_off);
+        u64 dyn_count = dyn_filesz / sizeof(elf64_dyn);
+
+        u64 rela_off = 0, rela_sz = 0, rela_ent = sizeof(elf64_rela);
+
+        for (u64 d = 0; d < dyn_count; d++) {
+            if (dyn[d].tag == DT_NULL) break;
+            if (dyn[d].tag == DT_RELA)    rela_off = dyn[d].val;
+            if (dyn[d].tag == DT_RELASZ)  rela_sz  = dyn[d].val;
+            if (dyn[d].tag == DT_RELAENT) rela_ent = dyn[d].val;
+        }
+
+        if (rela_off != 0 && rela_sz != 0 && rela_ent != 0) {
+            /* rela_off 是相对于文件开头的 vaddr，需转换为 image 内偏移 */
+            if (rela_off >= min_vaddr && rela_off < min_vaddr + image_size) {
+                u64 rela_count = rela_sz / rela_ent;
+                for (u64 r = 0; r < rela_count; r++) {
+                    const elf64_rela *rel = (const elf64_rela *)(
+                        image + (rela_off - min_vaddr) + r * rela_ent);
+                    u32 rtype = (u32)rel->info;
+                    if (rtype == R_X86_64_RELATIVE) {
+                        if (rel->offset < min_vaddr || rel->offset >= min_vaddr + image_size) continue;
+                        u64 *slot = (u64 *)(image + (rel->offset - min_vaddr));
+                        *slot = load_bias + (u64)rel->addend;
+                    }
+                }
+            }
+            log_info("[UTSM] PIE reloc applied");
+            log_hex64("[UTSM] load_bias=", load_bias);
+            log_hex64("[UTSM] rela_count=", rela_sz / rela_ent);
+        }
     }
 
     *entry_out = (dsk_entry_fn)(image + (eh->entry - min_vaddr));
@@ -331,6 +615,24 @@ static void dsk_fill_boot_context(dsk_boot_context *ctx) {
     const linux_compat_service *lxc = linux_compat_get_service();
     if (lxc && lxc->magic == LINUX_COMPAT_MAGIC) {
         ctx->reserved[5] = (u64)lxc;
+    }
+
+    /* Probe 探测缓冲信息（供 shell $probe 命令读取） */
+    if (g_instr_enabled) {
+        probe_info *pi = (probe_info *)kmem_alloc_aligned(sizeof(probe_info), 8);
+        if (pi) {
+            pi->magic = PROBE_INFO_MAGIC;
+            pi->version = 1;
+            pi->probe_buf_addr = (u64)probe_buf_address();
+            pi->probe_cap = probe_capacity();
+            pi->probe_head = probe_head_value();
+            pi->probe_count = probe_count();
+            pi->probe_dropped = probe_dropped_count();
+            pi->instr_enabled = g_instr_enabled;
+            pi->instr_probe_enable = g_instr_probe_enable;
+            ctx->reserved[6] = (u64)pi;
+            ctx->flags |= DSK_BOOT_FLAG_PROBE_INFO;
+        }
     }
 
     u64 rsp;
@@ -384,6 +686,65 @@ int dsk_load_and_jump(void) {
     }
     dsk_fill_boot_context(ctx);
 
+    /* 实机安全: 跳转前 cli → mask PIC → 重置 IDT → NMI off。
+     * DSK 加载的 ELF 映像可能覆盖 UTSM 的驱动代码段,
+     * 如果 UTSM 注册的 IRQ handler 所在内存被覆盖,
+     * 中断触发时跳转到无效地址 → 三重故障重启。
+     *
+     * P0 修复: 1) 先 cli 禁用中断，消除 PIC mask 两步操作之间的中断竞争窗口
+     *          2) mask PIC 确保不会有硬件中断到达
+     *          3) 设置 LAPIC TPR=0xFF 屏蔽所有通过 IOAPIC 路由的中断
+     *          4) 将 IDT 所有条目替换为安全 halt stub，防止 DSK 运行时
+     *             过期的 UTSM handler 被异常/spurious IRQ 触发
+     *          5) 禁用 NMI */
+    {
+        extern void outb(u16 port, u8 value);
+        extern u8 inb(u16 port);
+
+        /* 1) 先禁用中断——关键修复！原来缺少此步，
+         *    outb(0xA1,0xFF) 和 outb(0x21,0xFF) 之间有中断窗口 */
+        __asm__ volatile("cli");
+
+        /* 2) mask PIC — 此时 IF=0，安全操作 */
+        outb(0xA1, 0xFF);  /* PIC2: mask IRQ8-15 */
+        outb(0x21, 0xFF);  /* PIC1: mask IRQ0-7  */
+
+        /* 3) BUG-020 修复: 设置 LAPIC TPR=0xFF 屏蔽所有 IOAPIC 路由中断。
+         *    实机多核平台中断通常经 IOAPIC 而非 PIC，PIC mask 不影响
+         *    IOAPIC redirection entry。通过 IA32_APIC_BASE MSR 读取 LAPIC
+         *    基地址，写入 TPR（偏移 0x80）=0xFF 可在 LAPIC 层面屏蔽所有
+         *    可屏蔽中断（低于 0xFF 优先级），确保 DSK 运行期间不会有
+         *    IOAPIC 路由的 IRQ 到达。HHDM 映射后 LAPIC MMIO 可访问。 */
+        {
+            u32 msr_lo, msr_hi;
+            __asm__ volatile("rdmsr" : "=a"(msr_lo), "=d"(msr_hi) : "c"(0x1B));
+            u64 lapic_phys = ((u64)msr_hi << 32) | (msr_lo & 0xFFFFF000ULL);
+            if (lapic_phys && (msr_lo & (1 << 11))) {
+                /* LAPIC 全局启用时（bit 11）才操作 TPR */
+                extern volatile struct limine_hhdm_request g_hhdm_request;
+                u64 hhdm_off = g_hhdm_request.response
+                             ? g_hhdm_request.response->offset : 0;
+                if (hhdm_off) {
+                    u64 lapic_vaddr = lapic_phys + hhdm_off;
+                    *(volatile u32 *)(lapic_vaddr + 0x80) = 0xFF;
+                }
+            }
+        }
+
+        /* 4) 将 IDT 所有 256 个条目替换为安全 halt stub。
+         *    实机会产生 spurious IRQ7/15（即使 PIC 已 mask），
+         *    且 SMI/NMI 可能触发异常。如果 UTSM 的 idt_handler
+         *    所调用的 log 函数或串口驱动被覆盖，会导致双重异常→三重故障。 */
+        extern void idt_halt_all(void);
+        idt_halt_all();
+
+        /* 5) NMI off */
+        outb(0x70, inb(0x70) | 0x80);
+    }
+
+    log_hex64("[UTSM] DSK context magic=", ctx->magic);
+    log_hex64("[UTSM] DSK context api=", ctx->dkm_kernel_api);
+    log_hex64("[UTSM] DSK context fb=", ctx->framebuffer_address);
     log_info("[UTSM] jumping to DSK");
     entry(ctx);
 

@@ -8,21 +8,59 @@ CODE/mouse -> SYSTEM/system/deshab64/mouse/mouseInit.elf
 
 ## 目标
 
-`mouseInit.elf` 是 DSK 直接调度的系统输入初始化器，不属于 FirstInit 用户向导。DSK 在检测到首次启动后先加载并调用它，初始化完成后返回 DSK，再由 DSK 启动 FirstInit 用户设置向导。
+`mouseInit.elf` 是 DSK 直接调度的系统输入初始化器（首启链路：mouseInit → netman → FirstInit），初始化完成后返回 DSK，不驻留阻塞启动流程。任何单步失败只记日志继续执行，绝不阻塞或崩溃首次启动。
 
-第一版职责：
+当前职责：
 
-1. 初始化 PS/2 Controller 的辅助设备通道（mouse / AUX）。
-2. 开启 IRQ12 配置位。
-3. 向鼠标发送默认配置 `0xF6`。
-4. 启用数据报告 `0xF4`。
+1. 完整初始化 PS/2 控制器 AUX 通道与鼠标：drain → 配置字节（bit5=0 / bit1=1 / bit6=1）→ 0xA8 → 0xFF 复位（drain ≤8 字节）→ 0xF6 Set Defaults → 0xF3 采样率 100 → 0xE8 分辨率 2 → 0xF4 启用数据报告，全程 100000 次超时保护并逐步验 ACK(0xFA)。
+2. 实现 IRQ12 中断 handler + 3 字节包解码：同步位(bit3)校验重同步、9 位有符号位移合成（符号扩展）、溢出位丢包、Y 轴翻转、按 framebuffer 尺寸边界钳位。
+3. 经 `kernel_api.irq_register` 注册 IRQ12 handler（仅注册，不解屏蔽 PIC、不 sti）。
+4. 通过导出符号 `g_mouse_state` / `mouse_poll_state()` 暴露鼠标状态契约。
 5. 输出串口日志并返回 DSK。
+
+## 关键设计：handler 存活性与安全不变式
+
+DSK 的 `dsk_load_elf` 把所有 DSK 调度模块（mouseInit/netman/FirstInit/login/desktop）加载进**同一块 1MB 静态镜像缓冲**：mouseInit 返回后，下一个模块加载即覆盖本镜像。因此 IRQ12 handler 与 `g_mouse_state` 只在 mouseInit 驻留期间有效。
+
+本文件维持的安全不变式：
+
+1. UTSM `pic_remap` 后从片 PIC 屏蔽字为 0xFF，IRQ12 保持屏蔽，本文件不解屏蔽；
+2. DSK `dsk_entry` 已 `cli`，整个 DSK 阶段（含 desktop）IF=0，无任何模块 `sti`；
+
+=> handler 已注册进内核 `g_irq_handlers[12]`，但永远不会被调用；镜像被覆盖后也不存在野指针执行风险。
+
+后续集成路径（二选一，需本目录以外配套改动）：
+
+- **DKM 输入驱动**：把解码逻辑搬进内核常驻 .drv（参照 ps2kbd），由它注册 IRQ12 并解屏蔽从片 bit4，desktop 改读共享状态；
+- **DSK 常驻加载**：加载器增加"常驻"标志，mouseInit 镜像不被复用后，再解屏蔽 IRQ12。
+
+## mouse_state_t 布局（ABI v1）
+
+| 偏移 | 字段 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| 0  | magic | u32 | `MOUSE_STATE_MAGIC`（"MOUS" 0x4D4F5553），消费者校验 |
+| 4  | version | u32 | 布局版本，当前 1 |
+| 8  | x | volatile i32 | 光标 X（边界钳位后） |
+| 12 | y | volatile i32 | 光标 Y |
+| 16 | buttons | volatile u32 | bit0=左键 bit1=右键 bit2=中键 |
+| 20 | packet_count | volatile u32 | 成功解码包数 |
+| 24 | overflow_count | volatile u32 | 溢出/失步丢弃计数 |
+| 28 | max_x | i32 | 钳位右边界 = fb_width-1 |
+| 32 | max_y | i32 | 钳位下边界 = fb_height-1 |
+
+消费方式：校验 magic/version 后直接读 `g_mouse_state`，或调用 `mouse_poll_state(mouse_state_t *out)` 取得只读快照（返回 0 成功）。
+
+## 与现有轮询消费者的兼容性
+
+- FirstInit / desktop 均自带 PS/2 鼠标重新初始化（幂等）与 AUX 位感知轮询；mouseInit 启用数据报告后，它们照常读到鼠标包，互不干扰。
+- 当前 handler 永不触发（PIC 屏蔽 + IF=0），不会吞掉轮询者的数据。
+- 未来切换为 IRQ 驱动后，handler 会读走 0x60，desktop 必须同步切换为读共享状态而非轮询端口（见 main.c 顶部注释）。
 
 ## 当前限制
 
-- 当前只做 PS/2 鼠标初始化，不消费鼠标包。
-- 鼠标 IRQ12 的实际数据读取应由后续 DKM 输入驱动或 DSK 输入子系统接管。
-- USB 鼠标需要 xHCI/HID 支持，暂不在第一版范围。
+- handler/状态仅在 mouseInit 驻留期间有效；跨模块消费待 DKM 输入驱动或 DSK 常驻加载支持后落地。
+- mouseInit 仅在首启链路被 DSK 调度；正常启动路径（login → desktop）由 desktop 自行初始化鼠标。
+- USB 鼠标需要 xHCI/HID 支持，暂不在范围。
 
 ## 构建
 
@@ -35,7 +73,8 @@ make -f MAKEFILE CC=clang LD=ld.lld
 
 ```text
 DSK 检测 firstInit=0
-  -> 加载并调用 mouseInit.elf
-  -> mouseInit 初始化 PS/2 鼠标后返回
-  -> DSK 继续加载 FirstInit.elf
+  -> 加载并调用 mouseInit.elf（初始化 + 注册 IRQ12 handler 后返回）
+  -> netman.elf
+  -> FirstInit.elf（用户设置向导，AUX 位感知轮询鼠标/键盘）
+  -> desktop.elf（自带鼠标重初始化 + 轮询 + 光标局部重绘）
 ```

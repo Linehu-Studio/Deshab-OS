@@ -6,7 +6,7 @@ SCRIPT_DIR="/mnt/d/Code/Deshab/CODE/linux"
 PROJECT_ROOT="/mnt/d/Code/Deshab"
 OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
 INITRAMFS_DIR="$SCRIPT_DIR/initramfs"
-LINUX_SRC="$HOME/linux-6.6"
+LINUX_SRC="${LINUX_SRC:-$HOME/linux-6.6}"
 INITRAMFS_TMP="$SCRIPT_DIR/initramfs.tmp"
 
 rm -rf "$INITRAMFS_TMP"
@@ -57,7 +57,7 @@ SPEC="$SCRIPT_DIR/initramfs.tmp.spec"
     if [ -f "$INITRAMFS_TMP/bin/utsm_exec_daemon" ]; then
         echo "file /bin/utsm_exec_daemon $INITRAMFS_TMP/bin/utsm_exec_daemon 755 0 0"
     fi
-    for app in sh mount umount echo sleep uname ls cat ps setsid cttyhack; do
+    for app in sh mount umount echo sleep uname ls cat ps mkdir switch_root setsid cttyhack; do
         echo "slink /bin/$app /bin/busybox 777 0 0"
     done
 } > "$SPEC"

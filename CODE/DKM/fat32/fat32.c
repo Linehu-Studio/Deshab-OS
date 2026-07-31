@@ -6,60 +6,15 @@
 
 #include <stdint.h>
 
+#include "../dkm_shared.h"
+#include "../dkm_instr.h"
+
+DKM_STAT_DECL(fat0_reads);
+DKM_STAT_DECL(fat0_fat_walks);
+
 /* ---------------------------------------------------------------
- * DKM ABI types
+ * FAT32-specific types (DKM ABI types come from dkm_shared.h)
  * --------------------------------------------------------------- */
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
-
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef long long          i64;
-
-#define NULL ((void *)0)
-
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_block_api {
-    int (*register_device)(const void *desc);
-    u32 (*device_count)(void);
-    int (*read)(u32 index, u64 lba, u32 count, void *buffer);
-    int (*write)(u32 index, u64 lba, u32 count, const void *buffer);
-    u64 (*sector_size)(u32 index);
-    const char *(*device_name)(u32 index);
-    int (*set_write_fn)(u32 index, int (*fn)(void *ctx, u64 lba, u32 count, const void *buf));
-};
-
-struct dkm_kernel_api {
-    u32 version; u32 size; u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem,*utsm,*irq,*pci_api,*dma,*vfs_api,*net,*timer,*drr;
-    const void *rsdp_address;
-    const void *fb_address;
-    u64 fb_width,fb_height,fb_pitch; u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-    u64 hhdm_offset;
-    const struct dkm_block_api *block;
-};
-
-struct dkm_driver_handle;
-
-struct dkm_driver_desc {
-    u32 magic; u16 abi_version; u16 desc_size;
-    const char *name,*version,*vendor;
-    u32 driver_class,stage,flags,priority;
-    const char *const *depends; u32 depends_count;
-    const char *const *provides; u32 provides_count;
-    u64 min_kernel_abi,feature_bits,reserved0,reserved1;
-};
 
 struct limine_file {
     u64 revision; void *address; u64 size; char *path; char *cmdline; u8 _pad[56];
@@ -237,6 +192,7 @@ int driver_init(const struct dkm_kernel_api *api,
     (void)handle;
     if (!api||!api->log) return -1;
     g_log=api->log;
+    dkm_instr_init(api);
 
     u64 disk_size = 0;
     const u8 *disk = fat32_select_disk_image(api, &disk_size);
@@ -279,6 +235,7 @@ int driver_init(const struct dkm_kernel_api *api,
 
             /* try to read README.TXT content */
             if (strneq(dir[e].name,"README  TXT",11)) {
+                DKM_STAT_INC(fat0_reads);
                 u32 f_clus = read_u16_le((const u8*)&dir[e].cluster_low);
                 u32 f_off = data_start + (f_clus - 2)*cluster_size;
                 u32 f_size = dir[e].file_size;
@@ -297,6 +254,7 @@ int driver_init(const struct dkm_kernel_api *api,
         /* read next cluster from FAT */
         u32 fat_ent_off = fat_start + clus * 4;
         clus = read_u32_le(disk + fat_ent_off) & 0x0FFFFFFF;
+        DKM_STAT_INC(fat0_fat_walks);
     }
 
     g_log->info("[fat32] driver ready");

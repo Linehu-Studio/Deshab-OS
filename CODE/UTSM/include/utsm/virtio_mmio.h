@@ -153,4 +153,13 @@ int virtio_queue_get_ptrs(u32 device_id, u32 queue_idx,
  * 由后端在写 used ring 元素后调用，内部做内存屏障。 */
 void virtio_queue_bump_used(struct virtq_used *used, u16 new_idx);
 
+/* 异步触发设备中断（设置 INTERRUPT_STATUS bit0 并向 guest 注入虚拟 IRQ）。
+ * 用于后端在 QUEUE_NOTIFY 上下文之外完成工作（如周期轮询收到 RX 包）。
+ * device_id: VIRTIO_ID_*；设备未注册或 irq==0 时为空操作。 */
+void virtio_mmio_raise_irq(u32 device_id);
+
+/* 周期轮询 virtio-net RX 路径（填充 guest 已投递的 RX buffer，
+ * 有填充时自动注入 IRQ）。由 vmexit 的 preemption timer 路径调用。 */
+void virtio_net_poll(void);
+
 #endif /* UTSM_VIRTIO_MMIO_H */

@@ -271,6 +271,18 @@ void virtio_queue_bump_used(struct virtq_used *used, u16 new_idx) {
     __asm__ volatile("mfence" ::: "memory");
 }
 
+void virtio_mmio_raise_irq(u32 device_id) {
+    for (int i = 0; i < g_vdev_count; i++) {
+        struct virtio_dev_state *s = &g_vdevs[i];
+        if (!s->be || s->be->device_id != device_id) continue;
+        s->interrupt_status |= 1;
+        if (s->be->irq != 0) {
+            vmx_guest_queue_irq(0x30 + s->be->irq);
+        }
+        return;
+    }
+}
+
 /* ===== 框架初始化 =====
  *
  * 注册 block 与 net 后端。后端结构体由 virtio_blk.c / virtio_net.c 提供。 */
@@ -281,6 +293,7 @@ extern struct virtio_backend g_virtio_net_backend;
  * 这里声明以便链接；具体注册在各自文件完成。 */
 void virtio_blk_backend_init(void);
 void virtio_net_backend_init(void);
+void virtio_rootfs_blk_init(void);  /* memory-backed Arch rootfs (/dev/vdb) */
 
 void virtio_mmio_init(void) {
     if (g_vio_ready) return;
@@ -288,6 +301,10 @@ void virtio_mmio_init(void) {
 
     virtio_blk_backend_init();
     virtio_net_backend_init();
+    /* Register memory-backed rootfs backend (no-op if no rootfs module found).
+     * Must come after blk/net so /dev/vda (SATA) and /dev/vdb (rootfs) order
+     * is deterministic. */
+    virtio_rootfs_blk_init();
 
     g_vio_ready = 1;
     log_info("[VIO] virtio-mmio backend init ok");

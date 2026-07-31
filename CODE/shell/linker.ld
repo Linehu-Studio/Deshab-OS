@@ -17,8 +17,11 @@ SECTIONS
         *(.data*)
         *(.data.rel.ro*)
         *(COMMON)
-        *(.bss*)
     } :data
     .rela.dyn : ALIGN(8) { *(.rela.dyn*) } :data
     .dynamic : ALIGN(8) { *(.dynamic*) } :data :dynamic
+    /* .bss 分离为独立 NOBITS 段，避免 BSS 占文件空间（见 DSK linker.ld）。 */
+    .bss : ALIGN(4K) {
+        *(.bss*)
+    } :data
 }

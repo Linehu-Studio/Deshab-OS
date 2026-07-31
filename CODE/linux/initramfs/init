@@ -2,17 +2,21 @@
 #
 # init — Linux guest init script for UTSM dual-kernel Linux compat layer.
 #
-# Boot sequence:
-#   1. Mount essential filesystems
-#   2. Load UTSM driver (built-in, /dev/utsm auto-created)
-#   3. Start utsm_exec_daemon (background)
-#   4. Daemon sends EXEC_READY, then HLT (park) → linux_launch() returns to UTSM
-#   5. UTSM proceeds to load DSK; Linux guest stays parked until shell
-#      invokes `linux <prog>` which triggers vmresume.
+# Boot sequence (phase 2 — Arch rootfs via virtio-blk /dev/vdb):
+#   1. Mount essential filesystems (proc/sys/dev)
+#   2. Wait for /dev/vdb (Arch rootfs virtio-blk device) to appear
+#   3. Mount /dev/vdb as ext4 at /mnt/root
+#   4. Copy /dev nodes + daemon (already baked into rootfs) into /mnt/root
+#   5. switch_root /mnt/root /sbin/init
+#   6. Arch /sbin/init starts utsm_exec_daemon → EXEC_READY → HLT (park)
+#      → linux_launch() returns to UTSM
 #
-# The daemon runs forever, parking between requests. This init script
-# should NOT exit (would panic the kernel); it sleeps indefinitely after
-# starting the daemon so the kernel has a runnable init task.
+# Fallback (phase 1 — no rootfs, daemon in initramfs):
+#   - If /dev/vdb never appears, start daemon directly from initramfs.
+#   - If no daemon either, drop to interactive debug shell on ttyS0.
+#
+# The daemon runs forever, parking between requests. After switch_root,
+# Arch /sbin/init owns PID 1 and must not exit.
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
@@ -30,27 +34,64 @@ if [ ! -e /dev/utsm ]; then
     echo "[utsm-linux] WARNING: /dev/utsm not found — UTSM driver not loaded"
 fi
 
-# Start the exec daemon in the background.
-# The daemon sends EXEC_READY then HLTs (parks the guest).
-# UTSM's linux_launch() returns after this first HLT.
+# ===== Phase 2: switch_root to Arch rootfs on /dev/vdb =====
+# The rootfs is exposed as a memory-backed virtio-blk device (GPA 0xF4002000,
+# IRQ7). Wait up to ~5s for the kernel to discover it via devtmpfs.
+echo "[utsm-linux] waiting for /dev/vdb (Arch rootfs)..."
+VDB_OK=0
+i=0
+while [ $i -lt 50 ]; do
+    if [ -b /dev/vdb ]; then
+        VDB_OK=1
+        break
+    fi
+    # 100ms sleep (busybox sleep supports fractional seconds)
+    sleep 0.1
+    i=$((i + 1))
+done
+
+if [ $VDB_OK -eq 1 ]; then
+    echo "[utsm-linux] /dev/vdb found, attempting ext4 mount..."
+    mkdir -p /mnt/root
+    # Try ext4 (preferred); fall back to ext2 if ext4 module absent.
+    if mount -t ext4 -o ro /dev/vdb /mnt/root 2>/dev/null || \
+       mount -t ext2 -o ro /dev/vdb /mnt/root 2>/dev/null; then
+        echo "[utsm-linux] rootfs mounted, verifying /sbin/init..."
+        if [ -x /mnt/root/sbin/init ]; then
+            echo "[utsm-linux] switch_root → Arch /sbin/init"
+            # Move dev/proc/sys into new root so the Arch init can re-mount them.
+            mount --move /dev  /mnt/root/dev  2>/dev/null
+            mount --move /proc /mnt/root/proc 2>/dev/null
+            mount --move /sys  /mnt/root/sys  2>/dev/null
+            exec switch_root /mnt/root /sbin/init
+            # switch_root does not return
+        else
+            echo "[utsm-linux] WARNING: /mnt/root/sbin/init missing, not switching"
+            umount /mnt/root 2>/dev/null
+        fi
+    else
+        echo "[utsm-linux] WARNING: ext4/ext2 mount of /dev/vdb failed"
+        echo "[utsm-linux] available block devices:"
+        ls -l /dev/vd* /dev/sd* 2>/dev/null
+    fi
+else
+    echo "[utsm-linux] /dev/vdb not found after 5s — phase-1 fallback"
+fi
+
+# ===== Fallback: daemon directly from initramfs (phase 1) =====
 if [ -x /bin/utsm_exec_daemon ]; then
-    echo "[utsm-linux] starting utsm_exec_daemon..."
+    echo "[utsm-linux] starting utsm_exec_daemon from initramfs..."
     /bin/utsm_exec_daemon &
     DAEMON_PID=$!
     echo "[utsm-linux] daemon PID=$DAEMON_PID"
-else
-    # 无 daemon（第一阶段 bring-up 冒烟测试构建）：
-    # 直接在 ttyS0 上起交互 shell，验证 console 输入输出。
-    # 注意：此模式下 guest 不会 park，UTSM linux_launch() 不返回，
-    # 仅用于验证"Linux guest 进入 shell 提示符、可执行 uname -a"。
-    echo "[utsm-linux] WARNING: no daemon, starting interactive debug shell on ttyS0"
-    exec /bin/setsid /bin/cttyhack /bin/sh
+    # init must not exit — sleep forever to keep the kernel happy.
+    echo "[utsm-linux] init: daemon running, entering idle hold"
+    while true; do
+        sleep 3600
+    done
 fi
 
-# init must not exit — sleep forever to keep the kernel happy.
-# The daemon handles all UTSM exec requests; init just keeps the
-# root task alive so the kernel doesn't panic.
-echo "[utsm-linux] init: daemon running, entering idle hold"
-while true; do
-    sleep 3600
-done
+# ===== Last resort: interactive debug shell on ttyS0 =====
+# No daemon and no rootfs — bring-up smoke test only.
+echo "[utsm-linux] WARNING: no daemon, no rootfs — starting interactive debug shell on ttyS0"
+exec /bin/setsid /bin/cttyhack /bin/sh

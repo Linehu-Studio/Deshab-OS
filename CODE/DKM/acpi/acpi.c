@@ -103,6 +103,15 @@ typedef struct __attribute__((packed)) {
     u32      creator_revision;
 } acpi_sdt_header;
 
+/* ACPI Generic Address Structure (GAS) — HPET 等表使用 */
+typedef struct __attribute__((packed)) {
+    u8  space_id;     /* 0=SystemMemory, 1=SystemIO, 2=PCIConfig, ... */
+    u8  bit_width;
+    u8  bit_offset;
+    u8  access_size;  /* 0=undefined, 1=byte, 2=word, 3=dword, 4=qword */
+    u64 address;
+} acpi_generic_address;
+
 /* ---------------------------------------------------------------
  * Driver descriptor
  * --------------------------------------------------------------- */
@@ -213,6 +222,168 @@ static const acpi_rsdp_v2 *acpi_find_rsdp(const void *limine_rsdp) {
 }
 
 /* ---------------------------------------------------------------
+ * MCFG (PCIe ECAM Memory-mapped Configuration) 解析
+ *
+ * **QEMU 无法测试但真机必需**: PCIe 配置空间通过 ECAM 访问,
+ * MCFG 表提供 ECAM 基址和总线范围。没有 MCFG 解析,
+ * 真机无法访问 Bus 0 以外的 PCIe 设备配置空间。
+ * QEMU 的 PCI 设备都在 Bus 0, 使用传统 CF8/CFC 端口即可。
+ * --------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    u64 base_address;       /* ECAM 基址 (4K 对齐, 256MB per bus) */
+    u16 pci_segment_group;  /* PCI 段组号 (通常为 0) */
+    u8  start_bus_number;   /* 起始总线号 */
+    u8  end_bus_number;     /* 结束总线号 */
+    u32 reserved;
+} mcfg_entry;
+
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header hdr;
+    u64 reserved;           /* 保留, 通常为 0 */
+    /* mcfg_entry entries[] 紧跟 */
+} mcfg_table;
+
+static void acpi_parse_mcfg(const acpi_sdt_header *hdr) {
+    if (!hdr || hdr->length < sizeof(mcfg_table)) return;
+
+    const mcfg_table *mcfg = (const mcfg_table *)hdr;
+    u32 entry_size = sizeof(mcfg_entry);
+    u32 entries_len = mcfg->hdr.length - sizeof(mcfg_table);
+    u32 count = entries_len / entry_size;
+
+    g_log->info("[acpi] MCFG entries:");
+    log_hex("[acpi]   count=", count);
+
+    for (u32 i = 0; i < count; i++) {
+        const mcfg_entry *e = (const mcfg_entry *)((const u8 *)mcfg + sizeof(mcfg_table) + i * entry_size);
+        log_hex("[acpi]   MCFG base=", e->base_address);
+        log_hex("[acpi]   MCFG seg=", e->pci_segment_group);
+        log_hex("[acpi]   MCFG bus_start=", e->start_bus_number);
+        log_hex("[acpi]   MCFG bus_end=", e->end_bus_number);
+
+        /* 验证 ECAM 基址合理性 */
+        if (e->base_address == 0 || e->base_address == 0xFFFFFFFFFFFFFFFFULL) {
+            g_log->warn("[acpi]   MCFG entry has invalid base address");
+            continue;
+        }
+        /* 真机: ECAM 基址通常在 0xB0000000 - 0xBFFFFFFF (3G-4G 范围),
+         * 但也可能在 4G 以上 (特别是大内存系统) */
+        if (e->base_address >= 0x100000000ULL) {
+            g_log->info("[acpi]   MCFG base above 4G — requires MMIO mapping");
+        }
+    }
+}
+
+/* ---------------------------------------------------------------
+ * HPET (High Precision Event Timer) 解析
+ *
+ * 真机需要 HPET 替代 PIT 作为高精度定时器源。
+ * QEMU 默认也提供 HPET, 但当前内核使用 PIT 即可。
+ * HPET 信息留作后续高精度定时器实现的参考。
+ * --------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    u8  hardware_rev_id;
+    u8  comparator_count : 5;
+    u8  counter_size : 1;       /* 0=32-bit, 1=64-bit */
+    u8  reserved0 : 1;
+    u8  legacy_replacement : 1; /* 1=LegacyReplacement IRQ routing available */
+    u16 pci_vendor_id;
+    acpi_generic_address address;  /* HPET 寄存器基址 */
+    u8  hpet_number;
+    u16 minimum_tick;
+    u8  page_protection;
+} hpet_entry_data;
+
+/* HPET 表不含子条目, 只有 1 个 data block */
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header hdr;
+    u32 event_timer_block_id;  /* 与 hpet_entry_data 的前 4 字节相同 */
+    acpi_generic_address base_address;
+    u8  hpet_number;
+    u16 minimum_tick;
+    u8  page_protection;
+} hpet_table;
+
+static void acpi_parse_hpet(const acpi_sdt_header *hdr) {
+    if (!hdr || hdr->length < sizeof(hpet_table)) return;
+
+    const hpet_table *hpet = (const hpet_table *)hdr;
+
+    u32 block_id = hpet->event_timer_block_id;
+    u8  comp_count = (block_id >> 8) & 0x1f;
+    u8  count_size = (block_id >> 13) & 1;
+    u8  legacy     = (block_id >> 15) & 1;
+    u8  rev_id     = block_id & 0xff;
+    u16 vendor_id  = (block_id >> 16) & 0xffff;
+
+    g_log->info("[acpi] HPET info:");
+    log_hex("[acpi]   rev_id=", rev_id);
+    log_hex("[acpi]   comparators=", comp_count);
+    log_hex("[acpi]   counter_size=", count_size ? 64 : 32);
+    log_hex("[acpi]   legacy_irq=", legacy);
+    log_hex("[acpi]   vendor_id=", vendor_id);
+    log_hex("[acpi]   min_tick=", hpet->minimum_tick);
+
+    /* HPET 地址空间类型 */
+    if (hpet->base_address.space_id == 0) {
+        /* System Memory — MMIO 访问 */
+        u64 addr = hpet->base_address.address;
+        log_hex("[acpi]   HPET MMIO addr=", addr);
+        if (addr >= 0x100000000ULL) {
+            g_log->info("[acpi]   HPET base above 4G — requires MMIO mapping");
+        }
+    } else if (hpet->base_address.space_id == 1) {
+        /* System I/O — 端口 I/O */
+        log_hex("[acpi]   HPET I/O port=", hpet->base_address.address);
+    }
+}
+
+/* ---------------------------------------------------------------
+ * MADT (APIC) 解析 — 为 apic 驱动提供数据
+ * --------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header hdr;
+    u32 lapic_addr;
+    u32 flags;
+} acpi_madt;
+
+static void acpi_parse_madt(const acpi_sdt_header *hdr) {
+    if (!hdr || hdr->length < sizeof(acpi_madt)) return;
+    const acpi_madt *madt = (const acpi_madt *)hdr;
+
+    g_log->info("[acpi] MADT detail:");
+    log_hex("[acpi]   LAPIC addr=", madt->lapic_addr);
+    log_hex("[acpi]   flags=", madt->flags);
+    if (madt->flags & 1) {
+        g_log->info("[acpi]   PCAT_COMPAT=1 (8259 PIC present)");
+    }
+
+    /* 枚举 MADT 子条目做汇总统计 */
+    const u8 *base = (const u8 *)madt;
+    u32 off = sizeof(acpi_madt);
+    u32 lapic_count = 0, ioapic_count = 0, iso_count = 0, nmi_count = 0;
+
+    while (off + 2 <= madt->hdr.length) {
+        const u8 *entry = base + off;
+        u8 type = entry[0];
+        u8 len = entry[1];
+        if (len < 2 || off + len > madt->hdr.length) break;
+
+        if (type == 0) lapic_count++;
+        else if (type == 1) ioapic_count++;
+        else if (type == 2) iso_count++;
+        else if (type == 3 || type == 4) nmi_count++;
+
+        off += len;
+    }
+
+    log_hex("[acpi]   LAPIC entries=", lapic_count);
+    log_hex("[acpi]   IOAPIC entries=", ioapic_count);
+    log_hex("[acpi]   ISO entries=", iso_count);
+    log_hex("[acpi]   NMI entries=", nmi_count);
+}
+
+/* ---------------------------------------------------------------
  * Table enumeration
  * --------------------------------------------------------------- */
 static void acpi_enumerate_rsdt(const acpi_sdt_header *rsdt, u32 entry_size) {
@@ -241,6 +412,15 @@ static void acpi_enumerate_rsdt(const acpi_sdt_header *rsdt, u32 entry_size) {
         g_log->info(sig);
         log_hex("[acpi]   addr=", addr);
         log_hex("[acpi]   len =", (u64)hdr->length);
+
+        /* 对关键表做详细解析 */
+        if (sig[0]=='A' && sig[1]=='P' && sig[2]=='I' && sig[3]=='C') {
+            acpi_parse_madt(hdr);
+        } else if (sig[0]=='M' && sig[1]=='C' && sig[2]=='F' && sig[3]=='G') {
+            acpi_parse_mcfg(hdr);
+        } else if (sig[0]=='H' && sig[1]=='P' && sig[2]=='E' && sig[3]=='T') {
+            acpi_parse_hpet(hdr);
+        }
     }
 }
 

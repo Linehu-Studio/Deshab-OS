@@ -292,6 +292,9 @@ int linux_launch(void) {
      * virtio_mmio.device= 发现。幂等：重复调用直接返回。 */
     virtio_mmio_init();
 
+    /* 真机 EPT TLB 刷新：在 vmlaunch 前确保 EPT 映射对 TLB 可见 */
+    ept_flush_ept();
+
     /* Reset VM-Exit state */
     g_guest_terminated = 0;
     g_last_exit_reason = 0xFFFFFFFFULL;

@@ -5,43 +5,10 @@
 
 #include <stdint.h>
 
-/* DKM ABI types */
-#define DKM_DRIVER_MAGIC 0x444B4D31u
-#define DKM_ABI_VERSION  1u
+#include "../dkm_shared.h"
+#include "../dkm_instr.h"
 
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef long long          i64;
-#define NULL ((void *)0)
-
-struct dkm_log_api {
-    void (*info)(const char *msg);
-    void (*warn)(const char *msg);
-    void (*error)(const char *msg);
-    void (*panic)(const char *msg);
-};
-
-struct dkm_kernel_api {
-    u32 version; u32 size; u64 feature_bits;
-    const struct dkm_log_api *log;
-    const void *mem,*utsm,*irq_api,*pci_api,*dma,*vfs_api,*net,*timer,*drr;
-    const void *rsdp_address,*fb_address;
-    u64 fb_width,fb_height,fb_pitch; u16 fb_bpp;
-    const void *boot_modules_response;
-    int (*irq_register)(u8 irq, void *handler);
-};
-
-struct dkm_driver_handle;
-struct dkm_driver_desc {
-    u32 magic; u16 abi_version; u16 desc_size;
-    const char *name,*version,*vendor;
-    u32 driver_class,stage,flags,priority;
-    const char *const *depends; u32 depends_count;
-    const char *const *provides; u32 provides_count;
-    u64 min_kernel_abi,feature_bits,reserved0,reserved1;
-};
+DKM_STAT_DECL(ps2kbd_irq_count);
 
 /* Driver descriptor */
 static const char *const g_depends[] = {"irq"};
@@ -86,6 +53,7 @@ static int kbd_handler(u8 irq) {
     (void)irq;
     g_last_sc = inb(0x60);
     g_has_key = 1;
+    DKM_STAT_INC(ps2kbd_irq_count);
     return 0; /* let kernel send EOI */
 }
 
@@ -95,6 +63,7 @@ int driver_init(const struct dkm_kernel_api *api,
     (void)handle;
     if (!api||!api->log) return -1;
     g_log=api->log;
+    dkm_instr_init(api);
 
     if (!api->irq_register) {
         g_log->warn("[kbd] irq_register not available");

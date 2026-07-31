@@ -115,6 +115,140 @@ int ept_identity_map(u64 gpa, u64 size, u64 flags) {
     return ept_map_range(gpa, gpa, size, flags);
 }
 
+/* ===== EPT 大页映射（2MB 大页，真机 MTRR 感知） =====
+ *
+ * 在 PD 层级直接映射 2MB 大页（bit 7 = EPT_LARGE_PAGE），
+ * 减少 EPT walk 深度（4 级 → 3 级）和 TLB 压力。
+ * 真机要求大页 memory type 与 MTRR 一致：
+ *   - RAM 区域用 WB (6)
+ *   - MMIO 区域用 UC (0)
+ * QEMU 忽略 MTRR，但真机会检查。
+ *
+ * 用法：ept_map_2m_page(GPA, HPA, flags, memtype)
+ *   flags = EPT_RWX 等
+ *   memtype = EPT_MEMORY_TYPE_WB / EPT_MEMORY_TYPE_UC 等 */
+int ept_map_2m_page(u64 gpa, u64 hpa, u64 flags, u64 memtype) {
+    if (!g_ept_ready) return -1;
+    /* GPA 和 HPA 必须 2MB 对齐 */
+    if ((gpa & 0x1FFFFFULL) || (hpa & 0x1FFFFFULL)) {
+        log_error("[EPT] 2MB page unaligned");
+        return -2;
+    }
+
+    u64 *table = (u64 *)g_ept_pml4_virt;
+    u64 pml4_idx = (gpa >> 39) & 0x1FF;
+    u64 pdpt_idx = (gpa >> 30) & 0x1FF;
+    u64 pd_idx   = (gpa >> 21) & 0x1FF;
+
+    /* PML4 */
+    u64 entry = table[pml4_idx];
+    if (!(entry & EPT_READ)) {
+        u64 new_phys = ept_alloc_page();
+        if (new_phys == 0) return -3;
+        table[pml4_idx] = new_phys | EPT_RWX | (EPT_MEMORY_TYPE_WB << 3);
+        table = (u64 *)phys_to_virt(new_phys);
+    } else {
+        table = (u64 *)phys_to_virt(entry & 0x000FFFFFFFFFF000ULL);
+    }
+
+    /* PDPT */
+    entry = table[pdpt_idx];
+    if (!(entry & EPT_READ)) {
+        u64 new_phys = ept_alloc_page();
+        if (new_phys == 0) return -4;
+        table[pdpt_idx] = new_phys | EPT_RWX | (EPT_MEMORY_TYPE_WB << 3);
+        table = (u64 *)phys_to_virt(new_phys);
+    } else {
+        table = (u64 *)phys_to_virt(entry & 0x000FFFFFFFFFF000ULL);
+    }
+
+    /* PD：直接写 2MB 大页项 */
+    u64 pd_entry = (hpa & 0x000FFFFFFFE00000ULL)  /* 物理地址（2MB 对齐） */
+                 | flags                             /* R/W/X 权限 */
+                 | EPT_LARGE_PAGE                    /* bit 7 = 大页标志 */
+                 | (memtype << 3);                   /* memory type */
+    table[pd_idx] = pd_entry;
+    return 0;
+}
+
+/* ===== INVVPID 支持（真机 VPID 刷新） =====
+ *
+ * 启用 VPID 后，真机要求在修改 EPT 映射后执行 INVVPID 刷新
+ * stale TLB entry。QEMU 不检查，但真机会在以下场景触发 VMX abort：
+ *   - guest 修改了 CR3 但 TLB 中缓存了旧 VPID 的映射
+ *   - EPT 重映射后未刷新
+ *   - VMCS VPID 字段变更后未执行 INVVPID
+ *
+ * INVVPID 类型：
+ *   0 = 不支持
+ *   1 = 单个 VPID 刷新（INVVPID_DESC.vpid）
+ *   2 = 全局 VPID 刷新（所有 VPID）
+ *   3 = 单个 VPID + PCID 刷新
+ *
+ * 当前实现：使用类型 2（全局刷新），最安全但性能最差。
+ * 优化路径：在 EPT 重映射时调用类型 1 刷新特定 VPID。 */
+static int g_invvpid_supported;
+static int g_invept_supported;
+
+void ept_check_vpid_support(void) {
+    u64 cap = vmx_read_msr(IA32_VMX_EPT_VPID_CAP);
+    /* INVVPID 类型 2 (all-context) 支持：bit 32 */
+    g_invvpid_supported = (cap & (1ULL << 32)) ? 1 : 0;
+    /* INVEPT 类型 2 (all-context) 支持：bit 25 */
+    g_invept_supported = (cap & (1ULL << 25)) ? 1 : 0;
+    log_hex64("[EPT] VPID cap=", cap);
+    log_info(g_invvpid_supported ? "[EPT] INVVPID supported" : "[EPT] INVVPID NOT supported");
+    log_info(g_invept_supported ? "[EPT] INVEPT supported" : "[EPT] INVEPT NOT supported");
+}
+
+/* 执行 INVEPT（EPT TLB 刷新）。真机要求在修改 EPT 后调用。 */
+void ept_flush_ept(void) {
+    if (!g_invept_supported) return;
+    /* INVEPT 类型 2: all-context invalidate
+     * 操作数：{EPTP=0, reserved=0} 表示刷新所有 EPT 上下文 */
+    u64 desc[2] = {0, 0};
+    int err;
+    __asm__ volatile(
+        "invept (%2), %1\n"
+        "jnc 1f\n"
+        "mov $1, %0\n"
+        "jmp 2f\n"
+        "1:\n"
+        "mov $0, %0\n"
+        "2:\n"
+        : "=r"(err)
+        : "r"((u64)2), "r"(desc)
+        : "memory"
+    );
+    if (err) {
+        log_warn("[EPT] INVEPT failed (non-critical on QEMU)");
+    }
+}
+
+/* 执行 INVVPID（VPID TLB 刷新）。真机要求在 VPID 变更后调用。 */
+void ept_flush_vpid(u16 vpid) {
+    if (!g_invvpid_supported) return;
+    /* INVVPID 类型 2: all-context invalidate */
+    u64 desc[2] = {0, 0};
+    desc[0] = (u64)vpid;
+    int err;
+    __asm__ volatile(
+        "invvpid (%2), %1\n"
+        "jnc 1f\n"
+        "mov $1, %0\n"
+        "jmp 2f\n"
+        "1:\n"
+        "mov $0, %0\n"
+        "2:\n"
+        : "=r"(err)
+        : "r"((u64)2), "r"(desc)
+        : "memory"
+    );
+    if (err) {
+        log_warn("[EPT] INVVPID failed (non-critical on QEMU)");
+    }
+}
+
 /* Walk the EPT to translate a GPA to its mapped HPA.
  * Returns 0 if the GPA is not mapped (no present entry at any level).
  * Handles 4KB pages and 2MB large pages (bit 7 = PS in PD entry). */

@@ -43,6 +43,20 @@ u64 ipc_shm_get_gpa(void);
 /* Get the size of the shared memory region. */
 u64 ipc_shm_get_size(void);
 
+/* ===== Payload pool access (bulk data channel) =====
+ *
+ * The payload_pool area of the SHM region carries bulk file-transfer data
+ * (Phase 3 FILE_LIST/FILE_READ). Linux daemon writes into it (via
+ * UTSM_IOCTL_WRITE_POOL) before sending UTSM_MSG_FILE_RESPONSE; UTSM reads
+ * it directly through its own HHDM mapping. */
+
+/* Host virtual pointer into payload_pool at byte offset.
+ * Returns NULL if not initialized or offset out of range. */
+void *ipc_shm_payload_ptr(u32 offset);
+
+/* Total capacity of the payload pool in bytes. */
+u32 ipc_shm_payload_capacity(void);
+
 /* ===== Message API (UTSM-side) ===== */
 
 /* Send a message from UTSM to Linux (enqueues into utsm_to_linux ring).

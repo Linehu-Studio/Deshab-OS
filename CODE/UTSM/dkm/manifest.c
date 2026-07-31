@@ -2,6 +2,10 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
+#include "../kernel/ini_parser.h"
+
+/* 前向声明：带 FUCK [drivers] 过滤的加载入口（定义见下文） */
+void dsm_load_by_manifest_ex(const ini_config *cfg);
 
 #define DSM_MAX_DRIVERS_PER_STAGE 8
 #define DSM_MAX_STAGES 4
@@ -283,6 +287,10 @@ static int dsm_parse_manifest(const char *text, u64 size) {
 }
 
 void dsm_load_by_manifest(void) {
+    dsm_load_by_manifest_ex(NULL);
+}
+
+void dsm_load_by_manifest_ex(const ini_config *cfg) {
     struct limine_module_response *rsp = g_module_request.response;
     if (!rsp) {
         log_warn("[DSM] no Limine module response");
@@ -316,6 +324,16 @@ void dsm_load_by_manifest(void) {
 
         for (u32 di = 0; di < stage->driver_count; di++) {
             dsm_driver_entry *drv = &stage->drivers[di];
+
+            /* === FUCK [drivers] 驱动开关检查 === */
+            if (cfg) {
+                int enabled = ini_get_bool(cfg, "drivers", drv->name, 1);
+                if (!enabled) {
+                    log_info("[DSM] driver disabled by FUCK: ");
+                    log_info(drv->name);
+                    continue;  /* 跳过此驱动 */
+                }
+            }
 
             drv->boot_module = dsm_find_boot_module(drv->path);
             if (!drv->boot_module) {

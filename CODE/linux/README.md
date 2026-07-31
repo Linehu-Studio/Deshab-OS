@@ -112,3 +112,54 @@ Limine (UEFI)
         → virtio-fs mount /utsm
         → User space (init/shell)
 ```
+
+## Guest Networking (virtio-net)
+
+UTSM vmm 侧模拟一块 virtio-net 网卡（virtio-mmio 模型，GPA `0xF4001000`，
+guest ISA IRQ6），数据路径桥接到 host 真实网卡（e1000/virtio-net DKM 驱动，
+经 `kernel_api.net` 的 `tx`/`rx_poll` 收发帧）。guest 内核 cmdline 已自动注入：
+
+```
+virtio_mmio.device=4K@0xF4001000:6
+```
+
+`utsm_x86_64_defconfig` 已启用 `CONFIG_VIRTIO_NET=y`（内置，非模块），
+内核启动后应出现 `eth0`（virtio-mmio 无 PCI 拓扑，网卡名固定为 eth0）：
+
+```bash
+# 确认网卡已识别（dmesg 应能看到 virtio_net  probe 日志）
+ip link show
+
+# 拉起接口
+ip link set eth0 up
+
+# 方式一：DHCP（QEMU user-net/slirp 环境，网关 10.0.2.2，DNS 10.0.2.3）
+dhcpcd eth0
+# 或：dhclient eth0
+
+# 方式二：静态地址（无 DHCP 服务器时）
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.2
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+
+# 验证连通性
+ping -c3 10.0.2.2        # QEMU slirp 网关（永远在线，适合冒烟测试）
+ping -c3 10.0.2.3        # slirp 内建 DNS
+pacman -Sy               # 联网同步包数据库
+```
+
+注意事项：
+
+- **MAC 共用**：guest virtio-net 的 MAC 与 host e1000 相同（UTSM 桥接模型，
+  config 空间直接回填 host 网卡 MAC）。QEMU user-net 下 slirp 按 MAC 分配
+  `10.0.2.15`；若 host Deshab 原生网络栈同时用该网卡联网，两者会抢同一
+  DHCP 租约，实测时请只让一侧做 DHCP（或 host 完全不用网络）。
+- **MTU**：后端按标准 1500 MTU 转发，不支持 GSO/TSO（feature 未协商，
+  guest 自动走软件分片/checksum 路径）。
+- **无中断收包**：RX 走 UTSM 周期轮询（VMX preemption timer，~1kHz）
+  填充 guest RX ring 并注入 IRQ6；大流量下串口统计日志每 512 帧打印一行
+  `[VNET] stat ...`（rx_filled / rx_drop_nobuf / tx_sent / tx_drop），
+  可用于判断包在哪一段丢失。
+- 若 `ip link` 看不到 eth0：检查 dmesg 中 `virtio_mmio` probe 是否成功，
+  以及 host 串口日志是否有 `[VNET] bound to UTSM net device 0`
+  （host 侧 e1000/virtio-net DKM 驱动需先注册 netdev）。

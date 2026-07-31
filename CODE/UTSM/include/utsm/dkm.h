@@ -5,6 +5,7 @@
 #include <utsm/dma.h>
 #include <utsm/block.h>
 #include <utsm/net.h>
+#include <utsm/paging.h>
 
 #define DKM_DRIVER_MAGIC 0x444B4D31u
 #define DKM_ABI_VERSION  1u
@@ -95,6 +96,10 @@ typedef struct dkm_kernel_api {
     int (*irq_register)(u8 irq, void *handler);  /* kernel irq_register */
     u64 hhdm_offset;                               /* physical → virtual */
     const dkm_block_api *block;                    /* block provider registry */
+    const dkm_mmio_api *mmio;                      /* 页表/高位 MMIO 映射服务（尾部追加，ABI 兼容） */
+    /* —— 新增字段只允许追加在末尾（DSK 以 api+0xA8 硬偏移读取 block） —— */
+    void *(*mm_map_mmio)(u64 phys, u64 size);      /* MMIO 独立窗口映射（PCD|PWT），返回虚拟地址，失败返回 0 */
+    void (*mm_unmap_mmio)(void *virt, u64 size);   /* 解除 MMIO 独立窗口映射 */
 } dkm_kernel_api;
 
 typedef enum dkm_driver_state {

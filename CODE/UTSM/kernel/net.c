@@ -52,7 +52,6 @@ static int net_tx_impl(u32 index, const void *packet, u32 length) {
     if (index >= g_net_device_count) return -2;
     const dkm_net_device_desc *dev = &g_net_devices[index];
     if (!dev->tx) return -3;
-    log_hex64("[NET] tx dispatch fn=", (u64)dev->tx);
     return dev->tx(dev->ctx, packet, length);
 }
 
@@ -92,6 +91,20 @@ static int net_is_wireless_impl(u32 index) {
     return (dev->flags & DKM_NET_F_WIRELESS) ? 1 : 0;
 }
 
+/* 统计查询：返回驱动层累计的收发统计。
+ * 当前实现为占位：返回全零统计。
+ * 后续由驱动在 tx/rx 回调内更新共享统计区，此处直接读取。
+ * 驱动层的本地统计（如 e1000 的 g_stat_tx_ok 等）与 netdev 层统计
+ * 通过 driver_ctx 统一后即可返回精确值。 */
+static int net_device_stats_impl(u32 index, dkm_net_stats *out) {
+    if (!out) return -1;
+    if (index >= g_net_device_count) return -2;
+    /* 占位：全零。后续由驱动填充实际统计。 */
+    for (u32 i = 0; i < sizeof(dkm_net_stats); i++)
+        ((u8 *)out)[i] = 0;
+    return 0;
+}
+
 static const dkm_net_api g_net_api = {
     .register_device = net_register_device_impl,
     .device_count = net_device_count_impl,
@@ -101,7 +114,8 @@ static const dkm_net_api g_net_api = {
     .scan_start = net_scan_start_impl,
     .scan_count = net_scan_count_impl,
     .scan_result = net_scan_result_impl,
-    .is_wireless = net_is_wireless_impl
+    .is_wireless = net_is_wireless_impl,
+    .device_stats = net_device_stats_impl
 };
 
 const dkm_net_api *net_get_api(void) {

@@ -15,7 +15,7 @@ u64 vmx_read_msr(u32 msr) {
     return ((u64)hi << 32) | lo;
 }
 
-static void vmx_write_msr(u32 msr, u64 value) {
+static __attribute__((unused)) void vmx_write_msr(u32 msr, u64 value) {
     u32 lo = (u32)(value & 0xFFFFFFFFULL);
     u32 hi = (u32)(value >> 32);
     __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr));

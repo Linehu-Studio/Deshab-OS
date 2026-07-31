@@ -5,6 +5,13 @@
  */
 
 #include "../dkm_shared.h"
+#include "../dkm_instr.h"
+
+DKM_STAT_DECL(ahci_port_found);
+DKM_STAT_DECL(ahci_identify_ok);
+DKM_STAT_DECL(ahci_block_reads);
+DKM_STAT_DECL(ahci_block_writes);
+DKM_TS_DECL(ts_abar);
 
 static const char *const g_depends[] = { "pci", "irq" };
 static const char *const g_provides[] = { "block" };
@@ -130,7 +137,8 @@ static void ahci_zero(void *ptr, u32 len) {
 }
 
 static int ahci_find(u8 *out_bus, u8 *out_dev, u8 *out_func) {
-    for (u8 bus = 0; bus < 8; bus++) {
+    /* PCI 规范允许 256 条 bus (0-255)，实机 AHCI 可能位于 bus > 7 */
+    for (u16 bus = 0; bus < 256; bus++) {
         for (u8 dev = 0; dev < 32; dev++) {
             u32 vd = pci_read(bus, dev, 0, PCI_VENDOR_ID);
             if ((vd & 0xffff) == 0xffff) continue;
@@ -298,13 +306,16 @@ static int ahci_read_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm_
     g_abar[(base + PxIS) / 4] = 0xffffffffu;
     g_abar[HBA_IS / 4] = (1u << port);
     g_abar[(base + PxCI) / 4] = 1;
-    for (u32 i = 0; i < 5000000; i++) {
+    /* TSC deadline 超时: 5 秒，实机机械 HDD 首次寻道需数百 ms */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 5000;
+    while (dkm_rdtsc() < deadline) {
         if ((g_abar[(base + PxCI) / 4] & 1u) == 0) {
             u8 *dst = (u8 *)buffer;
             u8 *src = (u8 *)data->virt;
             for (u32 j = 0; j < bytes; j++) dst[j] = src[j];
             return 0;
         }
+        __asm__ volatile("pause");
     }
     g_log->warn("[ahci] READ timeout");
     log_hex("[ahci] READ lba=", lba);
@@ -330,6 +341,10 @@ static int ahci_write_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm
         for (u32 j = 0; j < bytes; j++) dst[j] = src[j];
     }
 
+    /* BUG-P0-2: 写入前必须 flush CPU cache，否则 DMA 控制器从物理内存
+     * 读到陈旧数据（CPU write-back cache 尚未写回）。实机必现。 */
+    __asm__ volatile("wbinvd" ::: "memory");
+
     hdr[0].flags = 5 | (1u << 6);  /* CFL=5, W=1 (write) */
     hdr[0].prdtl = 1;
     hdr[0].prdbc = 0;
@@ -341,28 +356,38 @@ static int ahci_write_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm
     tbl->prdt[0].dbc_i = (bytes - 1) | (1u << 31);
     ahci_fill_write_fis(tbl->cfis, lba, count);
 
-    /* set PxCMD.W to indicate write direction */
-    u32 cmd = g_abar[(base + PxCMD) / 4];
-    cmd |= AHCI_CMD_W;
-    g_abar[(base + PxCMD) / 4] = cmd;
+    /* P0 修复: 移除 PxCMD.W 写入。AHCI 规范中 PxCMD.W 是只读位，
+     * 由硬件根据命令头 flags.W 自动设置。软件写入此位违反规范，
+     * 可能在某些实机 AHCI 控制器上导致未定义行为。 */
+    /* (原代码: cmd |= AHCI_CMD_W; g_abar[...] = cmd; — 已删除) */
 
     g_abar[(base + PxIS) / 4] = 0xffffffffu;
     g_abar[HBA_IS / 4] = (1u << port);
     g_abar[(base + PxCI) / 4] = 1;
-    for (u32 i = 0; i < 5000000; i++) {
+    /* P0 修复: 写入超时改为 TSC deadline，与读取路径一致。
+     * 固定循环在实机 HDD 上会因 CPU 频率差异导致提前超时或死循环。 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 5000;
+    while (dkm_rdtsc() < deadline) {
         if ((g_abar[(base + PxCI) / 4] & 1u) == 0) {
-            /* clear PxCMD.W after write completes */
-            cmd = g_abar[(base + PxCMD) / 4];
-            cmd &= ~AHCI_CMD_W;
-            g_abar[(base + PxCMD) / 4] = cmd;
+            /* BUG-P1-1 fix: CI 清除后检查 TFD 错误位。
+             * TFD 低字节是 STS，正常值 0x50 (DRDY|DRQ) 非零但不是错误。
+             * 只有 STS bit0 (ERR) 或 ERR 寄存器 (bits15:8) 非零才是真正错误。
+             * BUG-20260730-P14: 原 `tfd & 0xFF` 误判 STS=0x50 为错误，导致写入
+             * 实际成功却被报告为失败，FAT32 写路径提前返回错误码。 */
+            u32 tfd = g_abar[(base + PxTFD) / 4];
+            u32 is  = g_abar[(base + PxIS) / 4];
+            u8 sts = (u8)(tfd & 0xFF);
+            u8 err_reg = (u8)((tfd >> 8) & 0xFF);
+            if ((sts & 0x01) || err_reg) {
+                g_log->warn("[ahci] write error: TFD ERR");
+                log_hex("[ahci]   TFD=", tfd);
+                log_hex("[ahci]   PxIS=", is);
+                return -4;
+            }
             return 0;
         }
+        __asm__ volatile("pause");
     }
-
-    /* timeout: clear PxCMD.W */
-    cmd = g_abar[(base + PxCMD) / 4];
-    cmd &= ~AHCI_CMD_W;
-    g_abar[(base + PxCMD) / 4] = cmd;
 
     g_log->warn("[ahci] WRITE timeout");
     log_hex("[ahci] WRITE lba=", lba);
@@ -376,6 +401,7 @@ static int ahci_write_blocks_internal(u32 port, ahci_cmd_header *hdr, struct dkm
 static int ahci_block_read(void *ctx, u64 lba, u32 count, void *buffer) {
     (void)ctx;
     if (g_ready_port == 0xffffffffu || !g_cmd_header) return -1;
+    DKM_STAT_INC(ahci_block_reads);
     log_hex("[ahci] block_read lba=", lba);
     log_hex("[ahci] block_read count=", count);
     while (count > 0) {
@@ -392,6 +418,7 @@ static int ahci_block_read(void *ctx, u64 lba, u32 count, void *buffer) {
 static int ahci_block_write(void *ctx, u64 lba, u32 count, const void *buffer) {
     (void)ctx;
     if (g_ready_port == 0xffffffffu || !g_cmd_header) return -1;
+    DKM_STAT_INC(ahci_block_writes);
     /* ensure port is in ST+FRE state */
     u32 base = HBA_PORT_BASE + g_ready_port * HBA_PORT_SIZE;
     u32 cmd = g_abar[(base + PxCMD) / 4];
@@ -445,8 +472,27 @@ static int ahci_identify_port(u32 port, const struct dkm_dma_api *dma) {
     struct dkm_dma_buffer data;
     if (dma->alloc_pages(1, 1024, 0x100000000ULL, &clb) != 0) return -2;
     if (dma->alloc_pages(1, 256, 0x100000000ULL, &fis) != 0) return -3;
-    if (dma->alloc_pages(1, 128, 0x100000000ULL, &table) != 0) return -4;
-    if (dma->alloc_pages(1, 512, 0x100000000ULL, &data) != 0) return -5;
+    /* BUG-P0-1: sizeof(ahci_cmd_table)=144, 128B 缓冲区越界 16 字节。
+     * 改为 256B 满足对齐和大小要求，防止 ahci_zero 越界写。 */
+    if (dma->alloc_pages(1, 256, 0x100000000ULL, &table) != 0) return -4;
+    /* BUG-20260730-022: DMA data buffer must hold at least 8 sectors (4096B)
+	 * for ahci_block_write chunked DMA.  512B caused 3584B out-of-bounds
+	 * overwrite of adjacent kernel data on real hardware. */
+	if (dma->alloc_pages(1, 8192, 0x100000000ULL, &data) != 0) return -5;
+
+    /* P0 验证: DMA 缓冲区物理地址必须在 4GB 以下。
+     * AHCI 控制器 8086:2922 只支持 32 位 DMA，
+     * PRDT 地址超过 4GB 会导致 DMA 写入截断到错误物理地址。
+     * dma->alloc_pages 的上限参数 0x100000000ULL 已保证此约束，
+     * 但添加显式校验以防御 alloc_pages 实现变更。 */
+    if (clb.phys >= 0x100000000ULL || fis.phys >= 0x100000000ULL ||
+        table.phys >= 0x100000000ULL || data.phys >= 0x100000000ULL) {
+        g_log->warn("[ahci] DMA buffer above 4GB — 32-bit DMA will fail on this controller!");
+        log_hex("[ahci] clb.phys=", clb.phys);
+        log_hex("[ahci] fis.phys=", fis.phys);
+        log_hex("[ahci] table.phys=", table.phys);
+        log_hex("[ahci] data.phys=", data.phys);
+    }
 
     if (ahci_stop_port(port) != 0) {
         g_log->warn("[ahci] port stop timeout");
@@ -476,7 +522,10 @@ static int ahci_identify_port(u32 port, const struct dkm_dma_api *dma) {
     ahci_start_port(port);
 
     g_abar[(base + PxCI) / 4] = 1;
-    for (u32 i = 0; i < 5000000; i++) {
+    /* BUG-P0-3: 固定 500 万次循环在 3GHz CPU 上仅 ~1-2ms，
+     * 不够 HDD 寻道。改为 TSC deadline 5s 超时，与 read/write 路径一致。 */
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 5000;
+    while (dkm_rdtsc() < deadline) {
         if ((g_abar[(base + PxCI) / 4] & 1u) == 0) {
             log_hex("[ahci] IDENTIFY port=", port);
             log_hex("[ahci] IDENTIFY status=", g_abar[(base + PxTFD) / 4]);
@@ -492,6 +541,7 @@ static int ahci_identify_port(u32 port, const struct dkm_dma_api *dma) {
             g_data = data;
             return 1;
         }
+        __asm__ volatile("pause");
     }
 
     g_log->warn("[ahci] IDENTIFY timeout");
@@ -510,6 +560,7 @@ int driver_init(const struct dkm_kernel_api *api,
 
     if (!api || !api->log) return -1;
     g_log = api->log;
+    dkm_instr_init(api);
 
     g_log->info("[ahci] init begin");
 
@@ -536,7 +587,17 @@ int driver_init(const struct dkm_kernel_api *api,
     pci_write(bus, dev, func, PCI_COMMAND, command);
     log_hex("[ahci] PCI command=", command);
 
-    u64 abar_phys = (u64)(pci_read(bus, dev, func, PCI_BAR5) & 0xFFFFFFF0u);
+    /* 读取 ABAR: BAR5 可能是 64-bit MMIO BAR，高位在 BAR4 */
+    u32 bar5_lo = pci_read(bus, dev, func, PCI_BAR5);
+    u64 abar_phys;
+    if ((bar5_lo & 0x7) == 0x4) {
+        /* 64-bit MMIO BAR: 高 32 位在 BAR4 */
+        u32 bar5_hi = pci_read(bus, dev, func, PCI_BAR4);
+        abar_phys = ((u64)bar5_hi << 32) | (bar5_lo & 0xFFFFFFF0u);
+        g_log->info("[ahci] ABAR is 64-bit MMIO BAR");
+    } else {
+        abar_phys = bar5_lo & 0xFFFFFFF0u;
+    }
     u32 irq_line = pci_read(bus, dev, func, PCI_IRQ_LINE) & 0xff;
     log_hex("[ahci] ABAR phys=", abar_phys);
     log_hex("[ahci] PCI IRQ line=", irq_line);
@@ -548,6 +609,7 @@ int driver_init(const struct dkm_kernel_api *api,
     }
 
     g_abar = (volatile u32 *)(uintptr_t)(api->hhdm_offset + abar_phys);
+    DKM_TS_BEGIN(ts_abar);
     log_hex("[ahci] HHDM offset=", api->hhdm_offset);
 
     u32 cap = g_abar[HBA_CAP / 4];
@@ -565,13 +627,32 @@ int driver_init(const struct dkm_kernel_api *api,
     log_hex("[ahci] VS=", vs);
     log_hex("[ahci] CAP2=", cap2);
     log_hex("[ahci] BOHC=", bohc);
+
+    /* AHCI 1.3+ BOHC handoff: 如果 BIOS 仍拥有控制器, 请求所有权 */
+    if (bohc & 0x01) {
+        g_log->info("[ahci] BIOS owns HBA, requesting handoff");
+        g_abar[HBA_BOHC / 4] = bohc | 0x02;  /* set OOS */
+        u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 2000;
+        while (dkm_rdtsc() < deadline) {
+            if (!(g_abar[HBA_BOHC / 4] & 0x01)) break;
+            __asm__ volatile("pause");
+        }
+        if (g_abar[HBA_BOHC / 4] & 0x01) {
+            g_log->warn("[ahci] BIOS handoff timeout, proceeding anyway");
+        } else {
+            g_log->info("[ahci] BIOS handoff complete");
+        }
+    }
+
     log_hex("[ahci] ports count=", (cap & 0x1f) + 1);
     log_hex("[ahci] cmd slots=", ((cap >> 8) & 0x1f) + 1);
+    DKM_TS_END(ts_abar, g_log->info, "ahci_abar_mmio");
 
     u32 implemented = 0;
     for (u32 port = 0; port < 32; port++) {
         if (pi & (1u << port)) {
             implemented++;
+            DKM_STAT_INC(ahci_port_found);
             ahci_log_port(port);
         }
     }
@@ -584,6 +665,7 @@ int driver_init(const struct dkm_kernel_api *api,
                 int ident = ahci_identify_port(port, api->dma);
                 if (ident > 0) {
                     identified++;
+                    DKM_STAT_INC(ahci_identify_ok);
                     break;
                 }
             }

@@ -9,6 +9,23 @@
 #define DSK_BOOT_FLAG_FROM_UTSM       (1ULL << 0)
 #define DSK_BOOT_FLAG_DKM_READY       (1ULL << 1)
 #define DSK_BOOT_FLAG_FAT32_PATH      (1ULL << 2)
+#define DSK_BOOT_FLAG_PROBE_INFO      (1ULL << 3)
+
+/* ---- Probe 信息结构（通过 reserved[6] 传递给 shell/desktop） ---- */
+#define PROBE_INFO_MAGIC 0x50524F42u  /* "PRFB" — Probe inFo Buffer */
+
+typedef struct probe_info {
+    u32 magic;              /* PROBE_INFO_MAGIC */
+    u32 version;            /* ABI 版本，当前 1 */
+    u64 probe_buf_addr;     /* probe_entry 缓冲基地址（物理/HHDM 地址） */
+    u32 probe_cap;          /* 缓冲容量（条目数） */
+    u32 probe_head;         /* 当前写入位置（递增取模） */
+    u32 probe_count;        /* 已写入总条目数 */
+    u32 probe_dropped;      /* 因缓冲满而覆盖的条目数 */
+    u32 instr_enabled;      /* g_instr_enabled 当前值 */
+    u32 instr_probe_enable; /* g_instr_probe_enable 当前值 */
+    u64 reserved[4];
+} probe_info;
 
 typedef struct dsk_boot_context {
     u64 magic;

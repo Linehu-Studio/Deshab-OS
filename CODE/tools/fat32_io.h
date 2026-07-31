@@ -52,9 +52,14 @@ static inline int f32_neq11(const char *a, const char *b) {
 }
 
 /* ---- 批量读写缓冲区（与 DSK/shell 对齐：256 扇区覆盖 BPB+FAT+根目录+小文件） ---- */
+/* 文件数据缓冲大小可由包含者在 include 前 #define F32_DATA_BYTES 覆盖
+ * （cmd.elf 需要装载 2MB+ 的 PE64 程序，定义为 4MB；其余默认 256KB）。 */
+#ifndef F32_DATA_BYTES
+#define F32_DATA_BYTES 262144
+#endif
 static u8 f32_disk[131072];      /* 256 扇区 BPB+FAT+根目录缓存 */
 static u8 f32_cluster[4096];     /* 单簇缓冲 */
-static u8 f32_data[262144];      /* 文件数据缓冲（最大 256KB） */
+static u8 f32_data[F32_DATA_BYTES]; /* 文件数据缓冲 */
 static int f32_disk_loaded = 0;  /* f32_disk 是否已加载 BPB+FAT */
 
 /* 初始化：注入 block_read/block_write 函数指针 */

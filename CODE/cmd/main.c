@@ -68,7 +68,8 @@ static void logl(const char *s) { swrite(s); swrite("\n"); }
 /* ASCII 字体 — 必须在 deshab_ui.h 之前包含 */
 #include "../firstInit/ascii_bitmaps.c"
 #include "../UTSM/include/utsm/deshab_ui.h"
-/* FAT32 共享读写库 */
+/* FAT32 共享读写库 — PE64 程序（如 deaicup.exe ~2.2MB）需要大文件缓冲 */
+#define F32_DATA_BYTES (4u * 1024u * 1024u)
 #include "../tools/fat32_io.h"
 
 /* ============================================================
@@ -1225,6 +1226,49 @@ static void execute_command(const char *cmd) {
 }
 
 /* ============================================================
+ *  AUTOEXEC.BAT — 启动时自动执行根目录下的批处理（每行一条命令）
+ *  空行与以 :: 或 rem 开头的行跳过。
+ * ============================================================ */
+static void run_autoexec(void) {
+    if (!f32_blk_read) return;
+    char name11[11];
+    if (f32_name_to_83("AUTOEXEC.BAT", name11) != 0) return;
+    u8 *data = 0; u32 size = 0;
+    if (f32_read_root_file(name11, &data, &size) != 0) {
+        logl("[cmd] no AUTOEXEC.BAT");
+        return;
+    }
+    logl("[cmd] running AUTOEXEC.BAT");
+    term_puts_color("执行 AUTOEXEC.BAT ...\r\n", CMD_DIM);
+
+    u32 pos = 0;
+    while (pos < size && !g_should_exit) {
+        /* 取一行 */
+        char line[128];
+        int li = 0;
+        while (pos < size && data[pos] != '\n' && data[pos] != '\r' && li < 127) {
+            line[li++] = (char)data[pos++];
+        }
+        while (pos < size && (data[pos] == '\n' || data[pos] == '\r')) pos++;
+        line[li] = 0;
+        /* 去前导空格 */
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        if (p[0] == ':' && p[1] == ':') continue;
+        if ((p[0] == 'r' || p[0] == 'R') && (p[1] == 'e' || p[1] == 'E')
+            && (p[2] == 'm' || p[2] == 'M') && (p[3] == ' ' || p[3] == 0)) continue;
+
+        /* 回显并执行 */
+        term_puts_color(PROMPT, CMD_PROMPT);
+        term_puts(p);
+        term_puts("\r\n");
+        term_redraw_all();
+        execute_command(p);
+    }
+}
+
+/* ============================================================
  *  主入口
  * ============================================================ */
 
@@ -1297,6 +1341,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
     term_putc('\r');
     term_putc('\n');
     term_redraw_all();
+
+    /* AUTOEXEC.BAT 自动执行（存在则逐行运行） */
+    run_autoexec();
+    if (g_should_exit) return;
 
     /* 主循环 */
     int shift = 0;

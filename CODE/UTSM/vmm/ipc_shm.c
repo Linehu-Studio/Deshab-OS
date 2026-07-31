@@ -121,6 +121,18 @@ u64 ipc_shm_get_size(void) {
     return UTSM_IPC_SHM_SIZE;
 }
 
+/* ===== Payload pool access ===== */
+
+void *ipc_shm_payload_ptr(u32 offset) {
+    if (!g_shm_ready || !g_shm) return (void *)0;
+    if (offset >= UTSM_IPC_PAYLOAD_SIZE) return (void *)0;
+    return (void *)(g_shm->payload_pool + offset);
+}
+
+u32 ipc_shm_payload_capacity(void) {
+    return UTSM_IPC_PAYLOAD_SIZE;
+}
+
 /* ===== Message API (UTSM-side) ===== */
 
 int ipc_shm_send(u32 msg_type, const void *data, u32 data_len) {

@@ -30,4 +30,19 @@ int ept_identity_map(u64 gpa, u64 size, u64 flags);
  * Handles 4KB pages and 2MB large pages. */
 u64 ept_gpa_to_hpa(u64 gpa);
 
+/* Map a 2MB large page in EPT (PD-level direct mapping).
+ * GPA and HPA must be 2MB-aligned. memtype = EPT_MEMORY_TYPE_*.
+ * Required for real hardware MTRR compliance. */
+int ept_map_2m_page(u64 gpa, u64 hpa, u64 flags, u64 memtype);
+
+/* Check INVVPID/INVEPT support from IA32_VMX_EPT_VPID_CAP MSR.
+ * Call once after VMX init. */
+void ept_check_vpid_support(void);
+
+/* Flush EPT TLB entries (INVEPT). Required after EPT mapping changes on real hardware. */
+void ept_flush_ept(void);
+
+/* Flush VPID TLB entries (INVVPID). Required after VPID changes on real hardware. */
+void ept_flush_vpid(u16 vpid);
+
 #endif

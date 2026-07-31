@@ -109,6 +109,15 @@ struct dkm_net_device_desc {
     int (*is_wireless)(void *ctx);
 };
 
+struct dkm_net_stats {
+    u64 tx_ok;
+    u64 tx_err;
+    u64 rx_ok;
+    u64 rx_err;
+    u64 rx_overflow;
+    u64 link_changes;
+};
+
 struct dkm_net_api {
     int (*register_device)(const struct dkm_net_device_desc *desc);
     u32 (*device_count)(void);
@@ -119,6 +128,7 @@ struct dkm_net_api {
     int (*scan_count)(u32 index);
     int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
     int (*is_wireless)(u32 index);
+    int (*device_stats)(u32 index, struct dkm_net_stats *out);
 };
 
 typedef int (*dkm_block_read_fn)(void *ctx, u64 lba, u32 count, void *buffer);
@@ -141,6 +151,16 @@ struct dkm_block_api {
     u64 (*sector_size)(u32 index);
     const char *(*device_name)(u32 index);
     int (*set_write_fn)(u32 index, dkm_block_write_fn fn);
+};
+
+/* 与 UTSM/include/utsm/paging.h 中的 dkm_mmio_api 布局一致 */
+struct dkm_mmio_api {
+    /* 四级页表 walk。返回 0=未映射；1=4K PTE；2=2M PDE；3=1G PDPTE */
+    int  (*is_mapped)(u64 vaddr);
+    /* 把物理区间映射到 hhdm_offset + phys（4KiB UC 页），返回 0 成功 */
+    int  (*map_mmio)(u64 phys, u64 size);
+    /* 当前 CR3 物理地址（诊断用） */
+    u64  (*cr3)(void);
 };
 
 /* 与 UTSM/include/utsm/dkm.h 中的 dkm_kernel_api 布局完全一致.
@@ -168,7 +188,11 @@ struct dkm_kernel_api {
     const void *boot_modules_response;
     int (*irq_register)(u8 irq, void *handler);
     u64 hhdm_offset;
-    const struct dkm_block_api *block;   /* 末尾字段, 不使用 block 的驱动可不访问 */
+    const struct dkm_block_api *block;   /* 不使用 block 的驱动可不访问 */
+    const struct dkm_mmio_api *mmio;     /* 页表/高位 MMIO 映射服务（HHDM 空洞原地补映射） */
+    /* —— 新增字段只允许追加在末尾（DSK 以 api+0xA8 硬偏移读取 block） —— */
+    void *(*mm_map_mmio)(u64 phys, u64 size);    /* MMIO 独立窗口映射（PCD|PWT），返回虚拟地址，失败返回 0 */
+    void (*mm_unmap_mmio)(void *virt, u64 size); /* 解除 MMIO 独立窗口映射 */
 };
 
 struct dkm_driver_handle;

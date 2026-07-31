@@ -309,6 +309,46 @@ static void *linux_find_initrd_module(u64 *size_out) {
     return (void *)0;
 }
 
+/* ===== rootfs module finder =====
+ *
+ * 在 Limine boot module 中查找 Arch rootfs 镜像（路径含 "rootfs"）。
+ * 返回模块数据指针，*size_out 为大小；未找到返回 NULL。
+ * 该镜像通过 virtio-blk（memory-backed）暴露给 Linux guest 作为 /dev/vdb。 */
+void *linux_find_rootfs_module(u64 *size_out) {
+    if (!g_module_request.response) return (void *)0;
+
+    struct limine_module_response *resp = g_module_request.response;
+    for (u64 i = 0; i < resp->module_count; i++) {
+        struct limine_file *file = resp->modules[i];
+        if (!file || !file->path) continue;
+
+        const char *p = file->path;
+        int match = 0;
+        for (const char *s = p; *s; s++) {
+            /* 匹配 "rootfs"（如 linux-rootfs.img） */
+            if ((s[0] == 'r' || s[0] == 'R') &&
+                (s[1] == 'o' || s[1] == 'O') &&
+                (s[2] == 'o' || s[2] == 'O') &&
+                (s[3] == 't' || s[3] == 'T') &&
+                (s[4] == 'f' || s[4] == 'F') &&
+                (s[5] == 's' || s[5] == 'S')) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        if (size_out) *size_out = file->size;
+        log_info("[LINUX] found rootfs module:");
+        log_info(file->path);
+        log_hex64("[LINUX] rootfs size=", file->size);
+        return file->address;
+    }
+
+    log_warn("[LINUX] no rootfs module found");
+    return (void *)0;
+}
+
 /* ===== bzImage parser ===== */
 
 int linux_parse_bzimage(const void *bzimage, u64 size,

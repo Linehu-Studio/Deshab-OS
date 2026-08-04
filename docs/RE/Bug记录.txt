@@ -344,6 +344,20 @@
 - 修复提交: 待提交（工作区已修复）
 - 验证: 代码核查——main.c L372–377 关闭热区判定与退出存在。
 
+### BUG-20260803-010 [P1] [DKM/nvme] QEMU 在 MSI-X unmask 边界向 IO CQ 补投 CID=0 幽灵 CQE：无 CID 校验时被静默当当前命令完成 → 数据面偶发 MISMATCH
+- 现象: B7 阶段3 NVMe MSI-X 中断驱动化后，apic_route=0 回归首次运行 stress 校验失败 (readback MISMATCH, first bad idx=0x9000 页边界，DMA 半途特征)，第二次运行不复现；route=1 未观测。命令对账 (slot+poll=命令总数) 与 timeout=0 表明无命令丢失，疑似 CQE 被"提前消费"。
+- 复现步骤: QEMU q35 + nvme 测试盘 + FUCK nvme_msi=1 + apic_route=0，驱动 init 内 stress (128 扇区×50 W+R)。
+- 串口/日志证据: `.build_tmp/w5b_nvme_msi.log`: `[ERR ] [nvme] stress readback MISMATCH` / `first bad idx= 0x0000000000009000`；加固 CID 校验后每次启动稳定抓到 `[ERR ] [nvme] CID mismatch (slot)` + `expect cid= 0x5` (首个 IO 命令 LBA0 READ) + `got cid= 0x0`，时机恒在 `INTMC unmask IV0` 之后、LBA0 READ 完成之前。
+- 根因分析: QEMU nvme 设备模型在 INTMC 解除 IV0 屏蔽 (MSI-X unmask) 边界向 IO CQ entry0 写入一枚 CID=0/phase 正确/status 成功的幽灵 CQE 并补投 MSI。g_cid 从 1 起始，CID=0 不属于任何已提交命令；MSI handler 无差别摘取填槽后，提交侧统一等待不校验 CID，把幽灵 CQE 当 LBA0 READ 的完成消费——若此刻 READ 的 DMA 尚未落盘 (128 扇区 PRP list 多页传输)，memcpy 读到半新半旧数据即 MISMATCH。route=0 下 PIC 活跃 (PIT 200Hz) 改变中断/轮询竞速窗口故更易命中，属时序竞态非确定性路径。
+- 修复方案: 三层防御 (nvme.c):
+  1. nvme_iocq_harvest 返回 CQE dw3 低 16 位 CID；统一等待两条路径 (slot 消费 / irqsave poll) 均与提交 cid 比对，不匹配则计数 (g_msi_cid_mismatch) + 报错 + 丢弃继续等真 CQE，绝不静默当成功；
+  2. g_cid 回绕跳过 0 (if (g_cid == 0) g_cid = 1)，CID=0 永久保留，幽灵 CQE 在数学上不可能被误判合法；
+  3. stress 校验失败时追加 expect/actual/cq head/phase/slot valid 打点。
+  顺带加固: nvme_msi_handler 改为自写 LAPIC EOI (0xFEE000B0) 并返回 1 抑制钩子——MSI 直投 LAPIC 与 apic_route 开关无关，route=0 下钩子未注册会导致 ISR 位残留、MSI 退化为 one-shot。
+- 状态: [FIXED]
+- 修复文件: CODE/DKM/nvme/nvme.c (harvest CID 返回 / handler 自 EOI / 统一等待 CID 校验 / g_cid 跳 0 / stress 诊断)
+- 验证: route=0 连跑 4+3 次：幽灵 CQE 每次恰好捕获 1 次并安全丢弃，stress verify 全 OK，对账自洽 (slot+poll=159 真命令+1 幽灵)；route=1 生产配置复验 PASS；nvme_msi=0 纯轮询回归 PASS；tests/qemu/driver-matrix.ps1 全 PASS (32.1s)。真机无 QEMU 该模型怪癖，CID 校验作为零成本常驻防御保留。
+
 ---
 
 ## 附：遗留条目对照

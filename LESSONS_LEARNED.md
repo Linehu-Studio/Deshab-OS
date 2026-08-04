@@ -626,6 +626,25 @@
 
 1. **PS/2 控制器交互期间绝不能有 IRQ handler 偷读 0x60**: diag handler 先于 `ps2_aux_enable_stream()` 注册时，控制器命令响应字节（0xFA ACK 等）被 handler 当数据包读走，轮询侧 wait_output 超时（表现为 F3 nack 假象，实为字节被偷）。铁律：控制器命令序列全轮询完成后再注册 handler；交互期间到达的 IRQ 因 handler 未注册只会被 EOI 丢弃，无副作用。
 2. **真机级别的寄存器语义要按设备类强制**: PCI INTx（e1000 IRQ11）无 MADT ISO 覆盖时必须强制 level/active-low（PCI 规范 + QEMU pci irq 电平语义 + Linux/Windows 同配置），ISA 线才按 ISO 表缺省 edge/high；一概套 ISO 缺省会让 PCI 设备中断一次性投递后卡死。
-3. **验证脚本数组参数经 -File 传递会被合并**: `powershell -File xxx.ps1 -Scenarios @('B1','B2')` 中数组变单字符串 "B1 B2"（场景被跳过且报"未知场景"），需用 `powershell -Command "& 'xxx.ps1' -Scenarios 'B1','B2'"`。
+3. **验证脚本数组参数经 -File 传递会被合并**: `powershell -File xxx.ps1 -Scenarios @('B1','B2')` 中数组变单字符串 "B1 B2"（场景被跳过且报"未知场景"），需用 `powershell -Command "& 'xxx.ps1' -Scenarios 'B1','B2'"。
+
+## 2026-08-03 — B7 阶段3 IDT 向量分配器 + NVMe MSI/MSI-X 中断驱动化
+
+### 经验
+
+1. **动态向量池选型：位图 + ctzll 是最适合内核的 O(1) 方案**: 池范围 0x40-0xDF（160 向量，3×u64 位图），alloc 用 `~bitmap` + `__builtin_ctzll` 一次定位首个空位，free 清位，均 O(1) 无锁（SAS-R0 单核 BSP，alloc/free 只在 driver_init 主上下文，MSI 编程期间设备中断尚屏蔽，IRQ 上下文无并发分配）。段划分：0x00-0x1F 异常 / 0x20-0x2F PIC legacy / 0x30-0x3F 预留 GSI 扩展 / 0x40-0xDF 动态池 / 0xE0 tick 预留 / 0xFF spurious。
+2. **动态 IDT 入口零新增 stub**: idt_stubs.S 已为 0-255 全向量预生成入口，g_irq_handlers[256] 分发表就位——`irq_register(vector, handler)` 的 u8 参数天然覆盖全向量命名空间（<16  shim 为 ISA IRQ 号），kernel_api 只需尾部追加 `irq_vector_alloc/free` 两个函数指针，ABI 双向兼容（旧内核无字段 → 驱动判空回轮询；旧驱动不用 → 无感）。
+3. **MSI 使能的正确顺序：先写 addr/data 再置 Enable，最后注册 handler**: MSI-X 表项（addr=0xFEE00000|dest<<12, data=vector, vctl unmask）写完并 nvme_mb 后才置 cap Enable；Enable 回读验证（addr/data/vctl 三比对）失败完整回滚（恢复 msg_ctl + 表项重 mask + 释放向量），不留半编程状态。QEMU nvme 只有 MSI-X cap(0x11) 无 MSI(0x05)，两条编程路径都要备。
+4. **"完成槽 + irqsave 自适应轮询"混合模型对单 outstanding 队列最优**: handler 摘 CQE 填槽（中断路径）；提交侧等待循环先查槽、再在 irqsave 临界区内手动摘取（轮询路径）——pushf/cli 临界区与 handler 天然互斥，消除"phase 判定后 head 推进前被抢摘"的双消费竞态。实测中断/轮询命中比随时序漂移（route=1 约 17:142，route=0 约 46:113），两路径语义完全等价，调用方零感知。
+5. **MSI handler 应自写 LAPIC EOI 并返回 1，不依赖路由开关注册的钩子**: MSI 是设备直投 LAPIC 的消息中断，投递不经过 IOAPIC/PIC，与 apic_route 无关；但 EOI 钩子只在 route=1 注册，route=0 下依赖钩子会漏 EOI → LAPIC ISR 位残留 → 同优先级中断永久阻塞（one-shot 退化）。handler 内直写 0xFEE000B0（SAS-R0 恒等映射覆盖，LAPIC 未使能时为无害 no-op）后返回 1，两种路由模式行为一致。
+6. **命令对账是中断驱动化验证的基本功**: slot_hits + poll_harvests 必须等于 IO 命令总数（init 1 + multipage 1 + rw 3×2 + stress 150 + sig 复查 1 = 159），irq_count ≥ 命令数（合并/幽灵会多）。对账不平必有路径漏计或双消费。
+7. **admin 队列保持纯轮询是正确取舍**: admin 命令只在 init 期使用，且 INTMC 解除前 IV0 屏蔽、admin 完成本就不产生 MSI；Create IOCQ 的 IEN=1/IV=0 只影响 IO CQ，无需为 admin 路径引入中断复杂度。
+
+### 教训
+
+1. **QEMU 会在 MSI-X unmask 边界补投幽灵 CQE——完成路径必须校验 CID**: INTMC 解除 IV0 瞬间，QEMU nvme 模型向 IO CQ entry0 写入 CID=0/phase 正确/status 成功的幽灵 CQE 并补投 MSI（4 连跑稳定复现）。无 CID 校验时它被静默当首个命令的完成消费，DMA 未落盘即 memcpy → stress readback MISMATCH @0x9000 页边界（BUG-20260803-010）。铁律：**任何"完成事件"都要带身份（CID/序号）并与等待方比对，不匹配显式报错丢弃，绝不默认"CQ 里只会有我的完成"**。配套：命令 ID 空间跳过幽灵 ID（g_cid 回绕跳 0），让误判在数学上不可能。
+2. **偶发数据损坏先加"身份校验"把静默错位变显式错误，再谈根因**: 第一次 route=0 MISMATCH 后第二次不复现，纯推理无法定位；加入 CID 校验后立刻变成每次启动稳定抓到 expect=5/got=0 的铁证，根因从"疑似竞态"收敛为"确定的外部幽灵事件"。可观测性投资远优于玄学调试。
+3. **中断 handler 返回码语义要在 idt 分发层就设计好双轨**: UTSM 既有"返回 0 钩子补 EOI / 返回 1 自负 EOI"约定让 NVMe 自 EOI 加固成为两行改动；若分发层只有单一 EOI 策略，此类设备级适配会倒逼内核改 ABI。
+4. **MSI 收益在 QEMU 内存后端的轻负载下不体现于耗时**: stress 50×(128sec W+R) MSI 16-33ms vs 纯轮询 42ms，差异主要来自完成等待的采样粒度而非 CPU 占用；MSI 的真实价值在 DSK 阶段 IF=0 轮询语义不变的前提下的路径统一性，以及未来多 outstanding/异步 IO 的扩展空间。
 
 

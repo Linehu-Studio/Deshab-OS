@@ -44,7 +44,7 @@ lapic_enable=1
 # 0=保持 8259 PIC 路由 (默认, 现状不回归)
 # 1=IOAPIC->LAPIC 接管: 注册 LAPIC EOI 钩子 + PIC IMR 全屏蔽 + TPR=0
 #   + tick 链路自验 (vector 0x20, 失败自动完整降级回 PIC 并注销钩子)
-apic_route=0
+apic_route=1
 # B7 阶段2: 随 apic_route=1 额外放开 legacy IRQ1(键盘)/12(鼠标)/11(e1000)
 # UTSM EOI 钩子已落地, 这些线可持续投递 (ISA 线 edge/high, e1000 强制
 # level/active-low 按 PCI INTx 规范), 默认 0 关闭

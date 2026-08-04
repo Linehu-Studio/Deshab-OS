@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     boot-regression — 启动链路回归测试（docs/RE/test-cases/boot-regression.md）
@@ -67,7 +67,7 @@ function Complete-FirstInitWizard {
 function Invoke-ScenarioB1 {
     Write-Host "`n--- B1 首次启动 (firstInit=0) ---"
     Set-DeshabFirstInit -First 0 -DevMode 0
-    $s = Start-QemuSession -Name 'bootreg-b1'
+    $s = Start-QemuSession -Name 'bootreg-b1' -MonitorPort 45501
     try {
         if (-not (Complete-FirstInitWizard -Session $s)) { return }
         $hit = Wait-QemuLog -Session $s -Patterns @('desktop ready') -TimeoutSeconds 120
@@ -100,7 +100,7 @@ function Invoke-ScenarioB2 {
     Write-Host "`n--- B2 正常启动 (firstInit=1, AUTOEXEC=ver/exit) ---"
     Set-DeshabFirstInit -First 1 -DevMode 0
     Set-DeshabAutoexec -Lines @('ver', 'exit')
-    $s = Start-QemuSession -Name 'bootreg-b2'
+    $s = Start-QemuSession -Name 'bootreg-b2' -MonitorPort 45501
     try {
         $hit = Wait-QemuLog -Session $s -Patterns @('desktop ready') -TimeoutSeconds 150
         $log = Read-QemuLogText $s.LogPath
@@ -131,7 +131,7 @@ function Invoke-ScenarioB3 {
     Write-Host "`n--- B3 dev_mode (firstInit=1\1) ---"
     Set-DeshabFirstInit -First 1 -DevMode 1
     Set-DeshabAutoexec -Lines @('ver', 'exit')
-    $s = Start-QemuSession -Name 'bootreg-b3'
+    $s = Start-QemuSession -Name 'bootreg-b3' -MonitorPort 45501
     try {
         $hit = Wait-QemuLog -Session $s -Patterns @('[8] rm TEST.TXT') -TimeoutSeconds 150
         if (-not $hit) {
@@ -165,7 +165,7 @@ function Invoke-ScenarioB3 {
 
 function Invoke-ScenarioB4 {
     Write-Host "`n--- B4 无 SATA 盘 (DSK 回退 Limine module) ---"
-    $s = Start-QemuSession -Name 'bootreg-b4' -NoSata
+    $s = Start-QemuSession -Name 'bootreg-b4' -NoSata -MonitorPort 45501
     try {
         $hit = Wait-QemuLog -Session $s -Patterns @('[DSK] firstInit.txt not found', '[DSK] desktop load failed', '[PANIC]') -TimeoutSeconds 120
         Start-Sleep -Seconds 3
@@ -190,7 +190,7 @@ function Invoke-ScenarioB5 {
     Write-Host "`n--- B5 无 NIC (e1000/virtio_net not found, 继续启动) ---"
     Set-DeshabFirstInit -First 1 -DevMode 0
     Set-DeshabAutoexec -Lines @('ver', 'exit')
-    $s = Start-QemuSession -Name 'bootreg-b5' -NoNet
+    $s = Start-QemuSession -Name 'bootreg-b5' -NoNet -MonitorPort 45501
     try {
         $hit = Wait-QemuLog -Session $s -Patterns @('desktop ready') -TimeoutSeconds 150
         $log = Read-QemuLogText $s.LogPath

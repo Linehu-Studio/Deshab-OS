@@ -253,7 +253,7 @@ typedef struct {
 
 **统计**：rx_filled / rx_drop_nobuf / rx_badbuf / tx_sent / tx_drop，每 512 事件串口打一行
 
-### Phase 4: desktop 集成 Linux 命令为应用图标
+### Phase 4: desktop 集成 Linux 命令为应用图标 ✅ 已完成（2026-08-03，桌面 Phase 5）
 
 **文件**：`CODE/tools/desktop_app.h` + `CODE/desktop/main.c`
 
@@ -263,6 +263,16 @@ typedef struct {
 - `g_lxc_svc` 通过 `reserved[5]` + `LINUX_COMPAT_MAGIC` 校验
 - `lnx_on_create`：bash_reset → 标题 "NAME . Linux" → `$ <cmd>` 回显 → 同步 `exec()` 阻塞 → 输出经 ANSI CSI 剥离/`^M` 忽略/`\t` 展开后一次性追加 → `[exit N]`
 - `draw_icon_linux`：暗底 + 霓虹绿 `>_`
+
+**补齐与验证（桌面 Phase 5）**：
+- Linux 应用图标追加进桌面图标网格（4 个 .lnk 快捷方式之后），`setup_desktop_icons()` 统一上架
+- **无论服务是否可用都注册图标**：`g_lnx_svc_up = is_available()`，不可用时 `draw_icon_linux` 用 `KS_TEXT_DIM` 置灰；双击仍开终端窗口，`lnx_on_create` 运行时复查服务，不可用显示红色 `linux: compat service unavailable` + `[exit -1]`，绝不 panic
+- `SYSTEM/LINUXAPP.CNF` 随镜像分发（mkfat32 8.3 名 LINUXAPPCNF），默认登记 HELLO/UNAME/LS 三条（guest Arch rootfs 与 initramfs busybox 共有命令）；CNF 缺失回退内置同款默认
+- QEMU 验证（`.build_tmp/w5c_desktop_verify.ps1`，服务状态感知断言，TCG/WHPX 各 14 项全 PASS）：
+  - 串口锚点：`linux apps: loaded LINUXAPP.CNF`、`linux app registered: HELLO/UNAME/LS`、（降级时）`linux apps: service unavailable (icons greyed)`
+  - 像素佐证：图标网格 7 图标（4 快捷方式 + 3 Linux 应用）；降级时 HELLO 图标 grey=46 green=0
+  - 双击 HELLO：`[desktop] app launched`，窗口显示 `$ /bin/echo hello from deshab linux` + 红色不可用提示 + `[exit -1]`（red=149），无 PANIC
+- **注意**：本机 TCG(`-cpu max`)/WHPX 均无 VMX（TCG 不模拟 VMX 指令），只能验证降级路径；服务可用路径（绿图标 + `linux exec` + guest 输出回显）需真机 / Linux KVM / 嵌套 Hyper-V，验证脚本同一套断言自动切换
 
 ### 构建问题记录
 

@@ -48,7 +48,7 @@ typedef struct {
     const image_file_header *file_hdr;
     const void *optional_hdr;
     int is_pe32_plus;
-    u32 image_base;        /* 32位截断的加载基址（PE32+ 也截断用于 RVA 计算） */
+    u64 image_base;        /* 链接时首选基址（PE32+ 为 64 位，如 0x140000000，必须全宽保留） */
     u32 size_of_image;
     u32 size_of_headers;
     u32 entry_rva;
@@ -75,7 +75,7 @@ static int parse_nt_headers(const void *pe_data, u64 size, pe_nt_info *out) {
     if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         const image_optional_header64 *oh = (const image_optional_header64 *)opt;
         out->is_pe32_plus = 1;
-        out->image_base = (u32)oh->image_base;
+        out->image_base = oh->image_base;   /* PE32+: u64 全宽，禁止截断（重定位 delta 依赖高位） */
         out->size_of_image = oh->size_of_image;
         out->size_of_headers = oh->size_of_headers;
         out->entry_rva = oh->address_of_entry_point;
@@ -98,7 +98,7 @@ static int parse_nt_headers(const void *pe_data, u64 size, pe_nt_info *out) {
 }
 
 /* ---- 应用基址重定位 ---- */
-static void apply_relocations(u8 *image, u32 image_size, u64 image_base_actual, u32 image_base_preferred,
+static void apply_relocations(u8 *image, u32 image_size, u64 image_base_actual, u64 image_base_preferred,
                               const image_data_directory *reloc_dir,
                               const image_section_header *sections, int nsec,
                               const void *pe_data, u64 pe_size, int is_pe32_plus) {
@@ -313,7 +313,7 @@ int pe_load_image(const void *pe_data, u64 size, pe_image_info *out) {
 
     /* 基址重定位 */
     u64 actual_base = (u64)image;
-    u32 preferred_base = nt.image_base;
+    u64 preferred_base = nt.image_base;
     /* image 缓冲区按 RVA 排列（image[0]=RVA 0），重定位写入 image 内 */
     /* 注意：apply_relocations 直接操作 image 缓冲区，delta = actual_base - preferred_base */
     {

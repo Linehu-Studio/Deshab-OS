@@ -70,6 +70,40 @@ shell → run CURL.ELF → curl.elf
 | 窗口拖动 | 流畅，无撕裂 | ⬜ |
 | 任务栏点击 | 窗口切换 | ⬜ |
 
+## 自动化脚本
+
+[tests/qemu/userapps-matrix.ps1](../../../tests/qemu/userapps-matrix.ps1) dev_mode 单会话覆盖
+shell 内建命令与工具程序（dev_mode 串口镜像开启，全程可断言）：
+
+```powershell
+.\tests\qemu\userapps-matrix.ps1            # 复用现有镜像
+.\tests\qemu\userapps-matrix.ps1 -Build     # 先全量构建再测
+```
+
+自动断言（两阶段，单会话；2026-08-04 BUG-20260801-001/002/003/008 全部修复后，
+原 MANUAL 降级项已回收为自动化）：
+
+1. **dev_tests 硬编码序列**：`[DSK:SCHED] decision: dev_mode -> shell.elf` →
+   `[1] ls` → `[2] echo>` → `[3] cat` → `[4] cp` → `[6] mv` → `[8] rm` → `[10] ls`
+   → `=== 自动测试完成 ===`（SATA 镜像无 test.bas 时走 fallback 分支）。
+2. **交互阶段**（monitor sendkey 驱动）：`help` → `id`（断言 `uid=0(root) gid=0(root)`，
+   BUG-001 修复回归守护）→ `pci` 存活验证 →
+   `ping`（PATH 查找 `/bin/PING.ELF` → `[ping] boot`，输入 10.0.2.2 发四报文，
+   Esc → `[ping] exit` → `[shell] path: tool returned`）→
+   `run EDITOR.ELF`（`[editor] boot` → 按键插入 → Esc → `[editor] exit`，
+   BUG-002 修复后行为，原"超限优雅拒绝"断言已升级）→
+   `run FILEMAN.ELF`（`[fileman] boot` → 方向键选区移动 → Esc → `[fileman] exit`，
+   BUG-003/008 修复后键盘路径）→
+   `run BROWSER.ELF`（`[browser] boot` → Esc → `[browser] exit`）→
+   Esc 回 DSK → cmd(AUTOEXEC=ver/exit) → `desktop ready`。
+   锚点：`[shell] path: running /bin/ tool` / `[shell] path: tool returned` /
+   `[shell] run: jumping to tool` / `[shell] run: tool returned` /
+   `[ping|editor|fileman|browser] boot|exit`。
+
+标 MANUAL 项（帧缓冲限定，无串口锚点）：ping ICMP reply/RTT 与四报文统计、
+editor 编辑内容渲染与保存、fileman 列表渲染/进入子目录；
+FirstInit/login/desktop UI（双击/拖动/任务栏，boot-regression B1 已覆盖向导按键）。
+
 ## 已知问题
 
 - fileman.elf 之前触发过 QEMU 退出（访问未支持 boot context 字段），需观察是否复现

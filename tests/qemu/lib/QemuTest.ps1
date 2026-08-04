@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Deshab QEMU 自动化测试公共库（tests/qemu/lib/QemuTest.ps1）
@@ -20,6 +20,14 @@ $script:BuildTmp    = Join-Path $script:RepoRoot '.build_tmp'
 $script:TestWorkDir = Join-Path $script:BuildTmp 'tests'
 $script:IsoDir      = Join-Path $script:RepoRoot 'ISO'
 $script:SystemDir   = Join-Path $script:RepoRoot 'SYSTEM'
+# 并发隔离布局（另一代理并发跑 QEMU/build，共享路径一律只读，写入全进私有区）：
+#   .build_tmp\tests\img\        私有镜像副本（deshab/nvme/usb，QEMU 只挂副本）
+#   .build_tmp\tests\SYSTEM\     SYSTEM 镜像树（robocopy /MIR；场景文件只翻这里）
+#   .build_tmp\tests\CODE\...\deaicup.exe   mkfat32 引用的单文件副本
+#   .build_tmp\tests\fat32gen\   mkfat32.ps1 副本 + 私有 SATA 镜像输出
+$script:SuiteImgDir  = Join-Path $script:TestWorkDir 'img'
+$script:MkFat32Dir   = Join-Path $script:TestWorkDir 'fat32gen'
+$script:MirrorSystem = Join-Path $script:TestWorkDir 'SYSTEM'
 $script:Config      = $null
 
 # 场景备份（模块级，保证只备份一次、恢复幂等）
@@ -56,60 +64,147 @@ function Initialize-QemuTest {
     if (-not $ovmf) { throw 'OVMF UEFI firmware not found under QEMU install directory' }
 
     New-Item -ItemType Directory -Force -Path $script:TestWorkDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:SuiteImgDir  | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:MkFat32Dir   | Out-Null
 
-    $img  = Join-Path $script:IsoDir   'deshab.img'
-    $sata = Join-Path $script:BuildTmp 'sata_fat32_dsk.img'
-    $nvme = Join-Path $script:BuildTmp 'nvme_test.img'
-    $usb  = Join-Path $script:BuildTmp 'usb_test.img'
+    $imgSrc  = Join-Path $script:IsoDir   'deshab.img'
+    $nvmeSrc = Join-Path $script:BuildTmp 'nvme_test.img'
+    $usbSrc  = Join-Path $script:BuildTmp 'usb_test.img'
 
-    if ($Build -or -not (Test-Path $img)) {
+    if ($Build -or -not (Test-Path $imgSrc)) {
         Write-Host '[init] building images via build.ps1 ...'
         Stop-ResidualQemu
         & powershell -ExecutionPolicy Bypass -File (Join-Path $script:RepoRoot 'build.ps1') | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed with exit code $LASTEXITCODE" }
     }
-    if (-not (Test-Path $img))  { throw "image missing: $img (run with -Build)" }
-    if (-not (Test-Path $sata)) {
-        Write-Host '[init] sata_fat32_dsk.img missing, regenerating via mkfat32.ps1 ...'
-        Invoke-MkFat32
-    }
-    if (-not (Test-Path $sata)) { throw "sata image missing: $sata" }
+    if (-not (Test-Path $imgSrc)) { throw "image missing: $imgSrc (run with -Build)" }
 
-    $nvmeOk = $null; if (Test-Path $nvme) { $nvmeOk = $nvme }
-    $usbOk  = $null; if (Test-Path $usb)  { $usbOk  = $usb }
+    # --- 并发隔离：SYSTEM 镜像树 + 私有 SATA 生成器 + 私有镜像副本 ---
+    Sync-SuiteTree
+    Invoke-MkFat32
+    $sata = Join-Path $script:MkFat32Dir 'sata_fat32_dsk.img'
+    if (-not (Test-Path $sata)) { throw "private sata image not generated: $sata" }
+
+    $img  = Copy-SuiteImage -Source $imgSrc -FileName 'deshab.img' -Mandatory
+    $nvme = Copy-SuiteImage -Source $nvmeSrc -FileName 'nvme_test.img'
+    $usb  = Copy-SuiteImage -Source $usbSrc  -FileName 'usb_test.img'
 
     $script:Config = [pscustomobject]@{
         QemuExe = $qemu
         Ovmf    = $ovmf
         Img     = $img
         SataImg = $sata
-        NvmeImg = $nvmeOk
-        UsbImg  = $usbOk
+        NvmeImg = $nvme
+        UsbImg  = $usb
     }
     Write-Host "[init] QEMU: $qemu"
     Write-Host "[init] OVMF: $ovmf"
-    Write-Host "[init] IMG:  $img"
+    Write-Host "[init] IMG:  $img (private copy)"
     return $script:Config
+}
+
+# ================================================================
+#  并发隔离：共享文件只读复制到套件私有区
+# ================================================================
+
+# share-tolerant 复制：源可能被并发代理的 QEMU/打包器短暂占用，重试至多 60s。
+# 目标不变（mtime+size 相同）时跳过，避免每用例重复拷 768MB。
+function Copy-SuiteImage {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FileName,
+        [switch]$Mandatory
+    )
+    if (-not (Test-Path $Source)) {
+        if ($Mandatory) { throw "image missing: $Source (run with -Build)" }
+        return $null
+    }
+    $dest = Join-Path $script:SuiteImgDir $FileName
+    $srcItem = Get-Item $Source
+    if ((Test-Path $dest)) {
+        $dstItem = Get-Item $dest
+        if ($dstItem.Length -eq $srcItem.Length -and $dstItem.LastWriteTimeUtc -eq $srcItem.LastWriteTimeUtc) {
+            return $dest
+        }
+    }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ($true) {
+        $in = $null; $out = $null
+        try {
+            $in  = [System.IO.File]::Open($Source, 'Open', 'Read', [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+            $out = [System.IO.File]::Open($dest, 'Create', 'Write', [System.IO.FileShare]::None)
+            $in.CopyTo($out, 1048576)
+            $out.Close(); $in.Close()
+            [System.IO.File]::SetLastWriteTimeUtc($dest, $srcItem.LastWriteTimeUtc)
+            Write-Host "[init] private copy: $FileName ($([math]::Round($srcItem.Length/1MB))MB)"
+            return $dest
+        } catch [System.IO.IOException] {
+            if ($out) { try { $out.Close() } catch {} }
+            if ($in)  { try { $in.Close() } catch {} }
+            if ((Get-Date) -gt $deadline) {
+                throw "cannot copy $Source (locked by concurrent process for >60s)"
+            }
+            Start-Sleep -Seconds 2
+        } catch {
+            if ($out) { try { $out.Close() } catch {} }
+            if ($in)  { try { $in.Close() } catch {} }
+            throw
+        }
+    }
+}
+
+# SYSTEM 镜像树 + deaicup.exe 单文件 + mkfat32.ps1 生成器副本。
+# 场景翻转（firstInit/AUTOEXEC）只作用于镜像树，共享工作树绝不写入。
+function Sync-SuiteTree {
+    & robocopy $script:SystemDir $script:MirrorSystem /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy SYSTEM mirror failed (rc=$LASTEXITCODE)" }
+
+    $deaSrc = Join-Path $script:RepoRoot 'CODE\Deaicup Software\pe\target\x86_64-pc-windows-msvc\release\deaicup.exe'
+    if (Test-Path $deaSrc) {
+        $deaDst = Join-Path $script:TestWorkDir 'CODE\Deaicup Software\pe\target\x86_64-pc-windows-msvc\release\deaicup.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $deaDst) | Out-Null
+        $srcItem = Get-Item $deaSrc
+        $need = $true
+        if (Test-Path $deaDst) {
+            $dstItem = Get-Item $deaDst
+            if ($dstItem.Length -eq $srcItem.Length -and $dstItem.LastWriteTimeUtc -eq $srcItem.LastWriteTimeUtc) { $need = $false }
+        }
+        if ($need) { Copy-Item $deaSrc $deaDst -Force }
+    }
+
+    $mkSrc = Join-Path $script:BuildTmp 'mkfat32.ps1'
+    if (-not (Test-Path $mkSrc)) { throw "mkfat32.ps1 not found: $mkSrc (run build.ps1 once)" }
+    Copy-Item $mkSrc (Join-Path $script:MkFat32Dir 'mkfat32.ps1') -Force
 }
 
 # ================================================================
 #  进程管理
 # ================================================================
 
-# 清理持有本项目镜像的残留 QEMU（deshab.img 被锁会导致 build/启动失败）。
-# 只杀命令行中引用本仓库路径的 qemu 进程，避免误伤他人虚拟机。
+# 清理本套件历史会话残留的 QEMU（Start-QemuSession 以 -name deshabtest-... 标记）。
+# 只按 deshabtest- 标记精确匹配，绝不动其他代理/人工启动的 QEMU（并发隔离要求：
+# 另一代理可能正挂着本仓库镜像跑调试，全局或按路径匹配都会误杀）。
 function Stop-ResidualQemu {
     $procs = Get-CimInstance Win32_Process -Filter "Name='qemu-system-x86_64.exe'" -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
-        if ($p.CommandLine -and $p.CommandLine.ToLower().Contains('deshab')) {
-            Write-Host "[qemu] killing residual qemu pid=$($p.ProcessId)"
+        if ($p.CommandLine -and $p.CommandLine.Contains('deshabtest-')) {
+            Write-Host "[qemu] killing residual suite qemu pid=$($p.ProcessId)"
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
 }
 
+# monitor 端口：45501-45508 按用例分配，deaicup-e2e 固定 45454
+# （避开人工调试 4444 与其他套件 456xx/457xx）。
+# -Preferred 传入用例固定端口；被占用（如 TIME_WAIT）时扫描段内其余端口，
+# 最后兜底 45509-45599。段内端口被他人占用时只换端口，绝不杀占用进程。
 function Get-FreeMonitorPort {
-    for ($port = 4444; $port -lt 4544; $port++) {
+    param([int]$Preferred = 0)
+    $candidates = New-Object System.Collections.ArrayList
+    if (($Preferred -ge 45501 -and $Preferred -le 45508) -or $Preferred -eq 45454) { [void]$candidates.Add($Preferred) }
+    foreach ($p in 45501..45508) { if ($p -ne $Preferred) { [void]$candidates.Add($p) } }
+    foreach ($p in 45509..45599) { [void]$candidates.Add($p) }
+    foreach ($port in $candidates) {
         $listener = $null
         try {
             $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
@@ -137,6 +232,8 @@ function Start-QemuSession {
         [switch]$NoNet,
         [string]$NetModel = 'e1000',
         [switch]$NoMonitor,
+        [int]$MonitorPort = 0,
+        [switch]$NoSnapshot,
         [string]$Cpu = '',
         [string[]]$ExtraArgs = @()
     )
@@ -167,9 +264,12 @@ function Start-QemuSession {
         '-drive', ('format=raw,file="{0}",if=virtio' -f $cfg.Img)
     )
 
+    # -snapshot 默认开：镜像只读 + 写入落临时 overlay，避免镜像写锁与并发代理冲突。
+    if (-not $NoSnapshot) { $qargs += '-snapshot' }
+
     $port = 0
     if (-not $NoMonitor) {
-        $port = Get-FreeMonitorPort
+        $port = Get-FreeMonitorPort -Preferred $MonitorPort
         $qargs += @('-monitor', "tcp:127.0.0.1:$port,server,nowait")
     }
     if (-not $NoSata) {
@@ -192,13 +292,21 @@ function Start-QemuSession {
         } elseif ($NetModel -eq 'virtio-net-pci') {
             $qargs += @('-device', 'virtio-net-pci,netdev=net0')
         }
+    } else {
+        # 已知坑3：不显式禁网时 QEMU 会自动补一块默认 e1000 网卡（q35 默认型号），
+        #          -NoNet 场景必须用 -nic none 把默认网络整个关掉。
+        $qargs += @('-nic', 'none')
     }
     foreach ($x in $ExtraArgs) { $qargs += $x }
     $qargs += @('-boot', 'menu=on')
 
-    # 已知坑：Start-Process 下 -serial file: 不生效；用 cmd 批处理重定向 stdio。
+    # 已知坑1：Start-Process 下 -serial file: 不生效；用 cmd 批处理重定向 stdio。
+    # 已知坑2：-snapshot 会在 %TEMP% 创建临时 overlay，Windows 用户名含非 ASCII
+    #          （如中文）时 QEMU 创建失败；把 TEMP/TMP 重定向到仓库内 ASCII 目录。
+    $qemuTmp = Join-Path $script:BuildTmp 'qemu-tmp'
+    New-Item -ItemType Directory -Force -Path $qemuTmp | Out-Null
     $cmdline = '"' + $cfg.QemuExe + '" ' + ($qargs -join ' ')
-    $batContent = "@echo off`r`n$cmdline > `"$log`" 2>&1`r`n"
+    $batContent = "@echo off`r`nset `"TEMP=$qemuTmp`"`r`nset `"TMP=$qemuTmp`"`r`n$cmdline > `"$log`" 2>&1`r`n"
     [System.IO.File]::WriteAllText($bat, $batContent)
 
     Stop-ResidualQemu
@@ -213,6 +321,24 @@ function Start-QemuSession {
         Accel       = $Accel
         StartTime   = Get-Date
     }
+
+    # 早夭自愈：WHPX 分区被强杀后偶发重建异常，guest 启动即三重故障
+    # （实测日志仅一行 "Ignoring request for interrupt vector 0"）。
+    # 启动后观察 3s：进程已死且日志近乎为空 → 同一 bat 重开一次
+    # （tag/monitor 端口不变，旧进程已死无冲突；bat 重定向会重建日志）。
+    Start-Sleep -Seconds 3
+    if (Test-QemuSessionExited $session) {
+        $logSize = 0
+        if (Test-Path $log) { $logSize = (Get-Item $log).Length }
+        if ($logSize -lt 4096) {
+            Write-Host "[qemu] session '$Name' died at launch (log ${logSize}B, WHPX startup flake), relaunching once"
+            Start-Sleep -Milliseconds 800
+            Start-Process -FilePath $bat -WindowStyle Hidden
+        } else {
+            Write-Host "[qemu] session '$Name' exited early (log ${logSize}B)"
+        }
+    }
+
     Write-Host "[qemu] session '$Name' started (monitor=$port, log=$log)"
     return $session
 }
@@ -426,20 +552,24 @@ function Get-QemuScreenshot {
 #  场景准备（firstInit.txt / AUTOEXEC.BAT + SATA 镜像重建）
 # ================================================================
 
+# 私有 SATA 镜像生成：运行 fat32gen\ 下的 mkfat32.ps1 副本。
+# 副本的 PSScriptRoot=fat32gen → 输出 fat32gen\sata_fat32_dsk.img（私有），
+# 输入 tests\SYSTEM 镜像树 + tests\CODE\...\deaicup.exe，不读写任何共享路径。
 function Invoke-MkFat32 {
-    $mk = Join-Path $script:BuildTmp 'mkfat32.ps1'
-    if (-not (Test-Path $mk)) { throw "mkfat32.ps1 not found: $mk (run build.ps1 once)" }
+    $mk = Join-Path $script:MkFat32Dir 'mkfat32.ps1'
+    if (-not (Test-Path $mk)) { throw "mkfat32.ps1 copy not found: $mk (Initialize-QemuTest runs Sync-SuiteTree)" }
     & powershell -ExecutionPolicy Bypass -File $mk | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "mkfat32.ps1 failed with exit code $LASTEXITCODE" }
 }
 
-# 写 firstInit.txt（格式 "<first>`n<dev_mode>"，LF）并重建 SATA 镜像；原文件自动备份
+# 写镜像树 firstInit.txt（格式 "<first>`n<dev_mode>"，LF）并重建私有 SATA 镜像；原内容自动备份。
+# 只写 .build_tmp\tests\SYSTEM 镜像树，共享 SYSTEM 工作树保持不变（并发代理可能正在翻转它）。
 function Set-DeshabFirstInit {
     param(
         [Parameter(Mandatory)][int]$First,
         [Parameter(Mandatory)][int]$DevMode
     )
-    $path = Join-Path $script:SystemDir 'system\user\use\firstInit.txt'
+    $path = Join-Path $script:MirrorSystem 'system\user\use\firstInit.txt'
     if ($null -eq $script:FirstInitBackup) {
         $script:FirstInitBackup = [System.IO.File]::ReadAllBytes($path)
     }
@@ -448,7 +578,7 @@ function Set-DeshabFirstInit {
 }
 
 function Restore-DeshabFirstInit {
-    $path = Join-Path $script:SystemDir 'system\user\use\firstInit.txt'
+    $path = Join-Path $script:MirrorSystem 'system\user\use\firstInit.txt'
     if ($null -ne $script:FirstInitBackup) {
         [System.IO.File]::WriteAllBytes($path, $script:FirstInitBackup)
         $script:FirstInitBackup = $null
@@ -456,10 +586,10 @@ function Restore-DeshabFirstInit {
     }
 }
 
-# 替换 AUTOEXEC.BAT 内容（cmd.elf 启动时逐行自动执行）并重建 SATA 镜像；原文件自动备份
+# 替换镜像树 AUTOEXEC.BAT 内容（cmd.elf 启动时逐行自动执行）并重建私有 SATA 镜像；原内容自动备份
 function Set-DeshabAutoexec {
     param([Parameter(Mandatory)][string[]]$Lines)
-    $path = Join-Path $script:SystemDir 'bin\AUTOEXEC.BAT'
+    $path = Join-Path $script:MirrorSystem 'bin\AUTOEXEC.BAT'
     if ($null -eq $script:AutoexecBackup) {
         $script:AutoexecBackup = [System.IO.File]::ReadAllBytes($path)
     }
@@ -468,7 +598,7 @@ function Set-DeshabAutoexec {
 }
 
 function Restore-DeshabAutoexec {
-    $path = Join-Path $script:SystemDir 'bin\AUTOEXEC.BAT'
+    $path = Join-Path $script:MirrorSystem 'bin\AUTOEXEC.BAT'
     if ($null -ne $script:AutoexecBackup) {
         [System.IO.File]::WriteAllBytes($path, $script:AutoexecBackup)
         $script:AutoexecBackup = $null

@@ -100,6 +100,17 @@ typedef struct dkm_kernel_api {
     /* —— 新增字段只允许追加在末尾（DSK 以 api+0xA8 硬偏移读取 block） —— */
     void *(*mm_map_mmio)(u64 phys, u64 size);      /* MMIO 独立窗口映射（PCD|PWT），返回虚拟地址，失败返回 0 */
     void (*mm_unmap_mmio)(void *virt, u64 size);   /* 解除 MMIO 独立窗口映射 */
+    /* B7 阶段2: 驱动向 UTSM 注册 LAPIC EOI 钩子（写 LAPIC EOI 寄存器的函数指针）。
+     * apic.drv 在 LAPIC 接管时注册；idt_handler 的 IRQ 分发末尾调用该钩子，
+     * 使 vector 0x20-0x2F 的 legacy 线在 IOAPIC 路由下可持续投递。
+     * 未注册（PIC 路由）时钩子为 NULL，idt_handler 跳过，行为与旧版一致。 */
+    void (*register_apic_eoi)(void (*eoi_fn)(void));
+    /* B7 阶段3: 动态 IDT 向量分配器（MSI/MSI-X 用），尾部追加保持 ABI。
+     * 池范围 0x40-0xDF；alloc 返回向量号、失败 -1；free 幂等越界忽略。
+     * 驱动拿到向量后经 irq_register(vector, handler) 直接注册（现有
+     * 接口已接受向量命名空间，无需新注册 ABI）。 */
+    int  (*irq_vector_alloc)(void);
+    void (*irq_vector_free)(int vector);
 } dkm_kernel_api;
 
 typedef enum dkm_driver_state {

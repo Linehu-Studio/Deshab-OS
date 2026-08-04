@@ -6,8 +6,17 @@
  *   1. 64-bit BAR 常位于 4G 以上（QEMU/OVMF 把 NVMe BAR0 放到 ~48GiB），
  *      HHDM 直映射不保证覆盖。访问前先用 kernel_api.mmio->is_mapped 做
  *      四级页表 walk 核实；未映射则 map_mmio 原地补建 4KiB UC 页。
- *   2. 同步轮询模型: 单 outstanding 命令 + CQE phase bit 轮询 + TSC 超时,
- *      不依赖 IRQ/MSI（当前 PIC/APIC 后端未完工）。
+ *   2. 完成模型: 单 outstanding 命令 + CQE phase bit。B7 阶段3 起 IO 队列
+ *      默认尝试 MSI/MSI-X 中断驱动（FUCK [drivers] nvme_msi, 默认 1 自动）:
+ *      先 MSI cap 编程, 缺则 MSI-X (QEMU nvme 只暴露 MSI-X) — 表项
+ *      addr=0xFEE00000|dest<<12, data=动态向量, entry unmask + cap Enable;
+ *      Create IOCQ IEN=1/IV=0 + INTMC 解除 IV0; handler 摘 CQE 进完成槽、
+ *      推进 head、写 CQ doorbell, 自写 LAPIC EOI 并返回 1 (MSI 直投 LAPIC,
+ *      与 apic_route 开关无关, 不依赖阶段2 的 EOI 钩子注册状态)。
+ *      提交侧统一等待: 先查完成槽(中断路径), 再在 irqsave 临界区内手动
+ *      摘取(自适应轮询路径) — IF=0 (DSK 阶段) 或 MSI 未投递时零感知降级,
+ *      行为与旧版纯轮询一致。计数: g_msi_irq_count / g_msi_slot_hits /
+ *      g_msi_poll_harvests / g_msi_timeouts, init 末尾与压测后打点。
  *   3. 数据面: 32 页 (128KiB) 物理连续 DMA bounce buffer + 单页 PRP list。
  *      PRP 布局按传输页数分档: 1 页单 PRP1; 2 页 PRP2 直连第二页;
  *      >=3 页 PRP2 指向 PRP list 页 (512 项 u64, 上限 513 页 = 2052KiB)。
@@ -32,7 +41,7 @@ const struct dkm_driver_desc driver_desc = {
     .abi_version    = DKM_ABI_VERSION,
     .desc_size      = sizeof(struct dkm_driver_desc),
     .name           = "nvme",
-    .version        = "0.3.0",
+    .version        = "0.4.0",
     .vendor         = "Deshab",
     .driver_class   = 6,   /* DKM_CLASS_STORAGE */
     .stage          = 1,
@@ -110,6 +119,24 @@ static u32 g_chunk_max_sectors;         /* 单命令扇区上限 (buffer/MDTS/NL
 static int g_io_ready;
 static int g_test_disk;                 /* LBA0 带 DESHABNVME0 签名的测试盘 */
 
+/* ---- B7 阶段3: MSI 状态 ---- */
+static int g_cfg_nvme_msi = 1;      /* FUCK [drivers] nvme_msi, 默认 1 自动尝试 */
+static int g_msi_enabled;           /* MSI/MSI-X 编程成功且 handler 已注册 */
+static int g_msix_mode;             /* 1=MSI-X 表项模式, 0=MSI cap 模式 */
+static int g_msi_vector = -1;       /* 动态分配的 IDT 向量 (0x40-0xDF 池) */
+/* 完成槽: 单 outstanding 前提下, handler 是唯一写者、提交侧是唯一读者,
+ * 且下一命令提交前不可能再有新 CQE, 故读-清无需互斥; valid 最后写/最先读,
+ * x86 TSO  store-store / load-load 天然有序, nvme_mb 只挡编译器重排。 */
+static volatile u32 g_slot_valid;
+static volatile u32 g_slot_status;  /* sc | (sct << 8), 0 = 成功 */
+static volatile u32 g_slot_dw0;     /* CQE dw0 (命令特定返回) */
+static volatile u32 g_slot_cid;     /* CQE dw3 低 16 位 CID, 提交侧比对防错位 */
+static u64 g_msi_irq_count;         /* MSI handler 进入次数 (投递证明) */
+static u64 g_msi_slot_hits;         /* 提交侧经完成槽完成的命令数 (中断路径) */
+static u64 g_msi_poll_harvests;     /* 提交侧 irqsave 手动摘取数 (轮询路径) */
+static u64 g_msi_timeouts;          /* 完成超时计数 (真故障, 非降级) */
+static u64 g_msi_cid_mismatch;      /* 摘到 CID 与提交 cid 不符的 CQE 计数 (队列错位警报) */
+
 /* ---- 基础工具 ---- */
 
 static void log_hex(const char *prefix, u64 value) {
@@ -147,6 +174,66 @@ static void nvme_zero(void *ptr, u32 len) {
 static __inline__ void nvme_mb(void) {
     /* x86 TSO 保证 store-store 顺序, 这里只需阻断编译器重排 */
     __asm__ volatile("" ::: "memory");
+}
+
+/* 十进制打印 (MSI 计数器打点用, 比 hex 直观) */
+static void log_dec(const char *prefix, u64 val) {
+    char buf[24];
+    u32 pos = 0;
+    if (!val) {
+        buf[pos++] = '0';
+    } else {
+        char tmp[20];
+        u32 n = 0;
+        while (val) { tmp[n++] = (char)('0' + (val % 10)); val /= 10; }
+        while (n) buf[pos++] = tmp[--n];
+    }
+    buf[pos] = 0;
+    g_log->info(prefix);
+    g_log->info(buf);
+}
+
+static int memeq(const char *a, const char *b, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+static u32 str_len(const char *s) {
+    u32 n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+/* 在 NUL 结尾字符串中查找子串 (boot module cmdline 匹配用) */
+static int str_contains(const char *hay, const char *needle) {
+    u32 nlen = str_len(needle);
+    if (!nlen) return 1;
+    for (u32 i = 0; hay[i]; i++) {
+        u32 j = 0;
+        while (j < nlen && hay[i + j] && hay[i + j] == needle[j]) j++;
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+static void nvme_cpuid(u32 leaf, u32 *a, u32 *b, u32 *c, u32 *d) {
+    __asm__ volatile ("cpuid"
+                      : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
+                      : "a"(leaf), "c"(0));
+}
+
+/* irqsave 临界区: 提交侧手动摘取 CQE 时屏蔽中断, 与 MSI handler 互斥。
+ * pushf/popf 配对恢复 IF — DSK 阶段 IF=0, 绝不能无条件 sti。 */
+static __inline__ u64 nvme_irqsave(void) {
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static __inline__ void nvme_irqrestore(u64 flags) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
 static u32 mmio_read32(u32 off) {
@@ -204,6 +291,138 @@ static int nvme_find(u8 *out_bus, u8 *out_dev, u8 *out_func) {
     return -1;
 }
 
+/* ---- FUCK 配置自解析 (与 apic.c 同一范式, 不依赖 UTSM ini_parser) ----
+ * UTSM 经 Limine boot module (cmdline="fuck:config") 预加载 FUCK;
+ * kernel_api.boot_modules_response 对所有 DKM 驱动可见。
+ * 此处只找 [drivers] 分区下的 nvme_msi 键; 缺失文件/键一律默认 1
+ * (自动尝试 MSI, 失败回轮询), 与无配置时行为一致。
+ */
+
+/* Limine boot module 最小类型 (与 apic.c / bootfs.c / UTSM limine.h 布局一致) */
+struct limine_file_min {
+    u64 revision;
+    void *address;
+    u64 size;
+    char *path;
+    char *cmdline;
+    u32 media_type;
+    u32 unused;
+    u32 tftp_ip;
+    u32 tftp_port;
+    u32 partition_index;
+    u32 mbr_disk_id;
+    u8 gpt_disk_uuid[16];
+    u8 gpt_part_uuid[16];
+    u8 part_uuid[16];
+};
+
+struct limine_module_response_min {
+    u64 revision;
+    u64 module_count;
+    struct limine_file_min **modules;
+};
+
+/* 解析值 token: 支持 0/1/true/false/on/off/yes/no 及十进制整数 */
+static int parse_scalar(const char *line, u64 start, u64 line_len, int defval) {
+    u64 i = start;
+    while (i < line_len && (line[i] == ' ' || line[i] == '\t')) i++;
+    u64 tok_start = i;
+    while (i < line_len && line[i] != ' ' && line[i] != '\t' &&
+           line[i] != '#' && line[i] != ';' && line[i] != '\r') i++;
+    u64 tok_len = i - tok_start;
+    const char *tok = line + tok_start;
+    if (!tok_len) return defval;
+    if (tok_len == 1 && tok[0] == '1') return 1;
+    if (tok_len == 1 && tok[0] == '0') return 0;
+    if (tok_len == 4 && memeq(tok, "true", 4)) return 1;
+    if (tok_len == 5 && memeq(tok, "false", 5)) return 0;
+    if (tok_len == 2 && memeq(tok, "on", 2)) return 1;
+    if (tok_len == 3 && memeq(tok, "off", 3)) return 0;
+    if (tok_len == 3 && memeq(tok, "yes", 3)) return 1;
+    if (tok_len == 2 && memeq(tok, "no", 2)) return 0;
+    int neg = 0;
+    u64 j = 0;
+    if (tok[0] == '-') { neg = 1; j = 1; }
+    int val = 0;
+    int any = 0;
+    for (; j < tok_len; j++) {
+        if (tok[j] < '0' || tok[j] > '9') return defval;
+        val = val * 10 + (tok[j] - '0');
+        any = 1;
+    }
+    if (!any) return defval;
+    return neg ? -val : val;
+}
+
+static int fuck_get_int(const char *text, u64 size,
+                        const char *section, const char *key, int defval) {
+    u64 pos = 0;
+    int in_section = 0;
+    u32 slen = str_len(section);
+    u32 klen = str_len(key);
+
+    while (pos < size) {
+        u64 end = pos;
+        while (end < size && text[end] != '\n') end++;
+        u64 line_len = end - pos;
+        if (line_len > 0 && text[pos + line_len - 1] == '\r') line_len--;
+        const char *line = text + pos;
+
+        u64 i = 0;
+        while (i < line_len && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i < line_len) {
+            char c = line[i];
+            if (c == '#' || c == ';') {
+                /* 注释行, 跳过 */
+            } else if (c == '[') {
+                in_section = 0;
+                if (line_len >= (u64)(i + 1 + slen + 1) &&
+                    memeq(line + i + 1, section, slen) &&
+                    line[i + 1 + slen] == ']') {
+                    in_section = 1;
+                }
+            } else if (in_section) {
+                if (line_len >= (u64)(i + klen) &&
+                    memeq(line + i, key, klen)) {
+                    u64 j = i + klen;
+                    while (j < line_len && (line[j] == ' ' || line[j] == '\t')) j++;
+                    if (j < line_len && line[j] == '=') {
+                        return parse_scalar(line, j + 1, line_len, defval);
+                    }
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return defval;
+}
+
+static void nvme_load_config(const struct dkm_kernel_api *api) {
+    /* 编译期默认: 自动尝试 MSI (任何前提缺失都会回退纯轮询, 零回归) */
+    g_cfg_nvme_msi = 1;
+
+    const struct limine_module_response_min *resp =
+        (const struct limine_module_response_min *)api->boot_modules_response;
+    if (!resp || !resp->modules) {
+        g_log->warn("[nvme] no boot modules; FUCK defaults in effect");
+        return;
+    }
+
+    for (u64 i = 0; i < resp->module_count; i++) {
+        struct limine_file_min *f = resp->modules[i];
+        if (!f || !f->cmdline || !f->address || !f->size) continue;
+        if (!str_contains(f->cmdline, "fuck:config")) continue;
+
+        g_cfg_nvme_msi = fuck_get_int((const char *)f->address, f->size,
+                                      "drivers", "nvme_msi", 1);
+        g_log->info("[nvme] FUCK config module found");
+        log_dec("[nvme] cfg nvme_msi=", (u64)g_cfg_nvme_msi);
+        return;
+    }
+
+    g_log->warn("[nvme] FUCK module (fuck:config) not found; defaults in effect");
+}
+
 /* ---- CSTS 等待 ---- */
 
 static int nvme_wait_csts(u32 mask, u32 expect, u64 timeout_ms) {
@@ -229,6 +448,142 @@ static int nvme_wait_csts(u32 mask, u32 expect, u64 timeout_ms) {
 /* 前向声明: nvme_dump_regs 在 nvme_submit 中使用 */
 static void nvme_dump_regs(const char *ctx);
 
+/* ---- B7 阶段3: IO CQ 完成摘取 (MSI handler 与提交侧轮询共用) ----
+ * 返回 1 = 摘到一枚 CQE; 0 = 无新完成。
+ * out_cid 返回 CQE dw3 低 16 位的命令 ID, 供调用方与提交 cid 比对 —
+ * 单 outstanding 模型下 CQ 任何时刻只应有当前命令的一枚 CQE, CID 不匹配
+ * 即队列状态错位的硬证据, 必须显式报错而非静默当作当前命令完成
+ * (route=0 曾观测 stress readback MISMATCH @0x9000, 疑 CQE 提前消费)。
+ * 并发模型: 单生产者(控制器 DMA 写 CQ) + 单逻辑消费者, 消费者有两个入口 ——
+ *   1. MSI handler (IRQ 上下文): 同一 vector 在 EOI 前不会被 LAPIC 再次
+ *      投递, handler 对同向量天然不可重入, 无需自锁;
+ *   2. 提交侧统一等待 (主上下文): 必须在 nvme_irqsave 临界区内调用,
+ *      屏蔽中断期间 handler 不可能插入, 消除 "phase 判定后、head 推进前
+ *      被 handler 抢摘同一 CQE" 的双消费竞态。
+ * head 推进 + CQ doorbell 只在此函数内发生, 是两个入口的唯一汇合点。
+ */
+static int nvme_iocq_harvest(u32 *out_status, u32 *out_dw0, u32 *out_cid) {
+    volatile u32 *cq = (volatile u32 *)g_iocq.virt;
+    u32 dw3 = cq[g_iocq_head * 4 + 3];
+    if (((dw3 >> 16) & 1u) != g_iocq_phase) return 0;
+
+    if (out_dw0) *out_dw0 = cq[g_iocq_head * 4 + 0];
+    if (out_cid) *out_cid = dw3 & 0xffffu;
+    u32 sc  = (dw3 >> 17) & 0xffu;
+    u32 sct = (dw3 >> 25) & 0x7u;
+    /* SC 与 SCT 联合编码 (与 nvme_submit 经典路径同一约定):
+     * SCT!=0 且 SC==0 时只返回 sc 会被误判成功。 */
+    *out_status = sc | (sct << 8);
+
+    g_iocq_head = (g_iocq_head + 1) % IO_QSIZE;
+    if (g_iocq_head == 0) g_iocq_phase ^= 1u;
+    nvme_mb();                                  /* head 先于 doorbell 可见 */
+    mmio_write32(cq_head_db(1), g_iocq_head);
+    return 1;
+}
+
+/* MSI 中断 handler: 摘 CQE 进完成槽。
+ * 返回 1 = 自负 LAPIC EOI (抑制 idt_handler 的钩子补 EOI)。
+ * 为何自写 EOI 而不依赖钩子: MSI 是设备向 LAPIC 直投的消息中断,
+ * 投递路径不经过 IOAPIC/PIC, 与 apic_route 开关无关; 但 EOI 钩子只在
+ * route=1 时注册, route=0 下钩子为 NULL 会漏写 EOI — LAPIC ISR 位
+ * 残留将永久阻塞同优先级后续中断, MSI 静默退化为 one-shot。
+ * handler 内直写 LAPIC EOI 寄存器后返回 1, 两种路由模式下行为一致。
+ * LAPIC 未软件使能时该写为无害 no-op (此时 MSI 本就不会投递)。
+ * 地址取 x86 默认 LAPIC base 0xFEE00000 + EOI 偏移 0xB0 (QEMU/MADT
+ * 一致; SAS-R0 恒等映射覆盖 4G 以下, apic.drv 已实证可直访)。
+ * 时序说明: 即使提交侧轮询抢先摘走 CQE, 控制器中断信号早已发出,
+ * 本次 handler 仍会执行并计入 g_msi_irq_count — 投递证据不受竞态影响。 */
+static int nvme_msi_handler(u8 vector) {
+    (void)vector;
+    g_msi_irq_count++;
+    u32 st = 0, dw0 = 0, cid = 0;
+    if (nvme_iocq_harvest(&st, &dw0, &cid)) {
+        g_slot_status = st;
+        g_slot_dw0 = dw0;
+        g_slot_cid = cid;
+        nvme_mb();              /* payload 先于 valid 对提交侧可见 */
+        g_slot_valid = 1;
+    }
+    *(volatile u32 *)(uintptr_t)0xFEE000B0u = 0;    /* LAPIC EOI */
+    return 1;
+}
+
+/* IO 命令统一完成等待 (MSI 模式): 完成槽(中断路径)优先, irqsave 手动摘取
+ * (自适应轮询路径)兜底。MSI 健康时 handler 在 CQE 落盘瞬间填槽; MSI 未投递
+ * (LAPIC 未启用/IF=0/信号丢失) 时手动摘取沿原 phase 语义直接完成, 调用方
+ * 零感知。超时语义与经典路径一致 (CAP.TO*500ms*10, 下限 5s)。 */
+static int nvme_io_wait_completion(u16 cid, u32 opcode, u32 *out_cqe_dw0) {
+    u64 submit_timeout_ms = g_timeout_ms * 10;
+    if (submit_timeout_ms < 5000) submit_timeout_ms = 5000;
+    u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * submit_timeout_ms;
+
+    for (;;) {
+        /* 中断路径: handler 已摘取 CQE 进完成槽 */
+        if (g_slot_valid) {
+            u32 st = g_slot_status;
+            u32 dw0 = g_slot_dw0;
+            u32 scid = g_slot_cid;
+            nvme_mb();
+            g_slot_valid = 0;
+            g_msi_slot_hits++;
+            if (scid != (u32)cid) {
+                /* CID 错位: 槽内 CQE 不属于本命令 — 队列状态已损,
+                 * 显式报错并继续等真 CQE (超时兜底), 绝不静默当成功 */
+                g_msi_cid_mismatch++;
+                g_log->error("[nvme] CID mismatch (slot)");
+                log_hex("[nvme] expect cid=", cid);
+                log_hex("[nvme] got cid=", scid);
+                continue;
+            }
+            if (out_cqe_dw0) *out_cqe_dw0 = dw0;
+            if (st) {
+                g_log->error("[nvme] command failed (msi slot)");
+                log_hex("[nvme] opcode=", opcode);
+                log_hex("[nvme] cid=", cid);
+                log_hex("[nvme] status=", st);
+                return (int)st;
+            }
+            return 0;
+        }
+
+        /* 自适应轮询路径: irqsave 临界区内手动摘取 (与 handler 互斥) */
+        u32 st = 0, dw0 = 0, hcid = 0;
+        u64 flags = nvme_irqsave();
+        int got = nvme_iocq_harvest(&st, &dw0, &hcid);
+        nvme_irqrestore(flags);
+        if (got) {
+            g_msi_poll_harvests++;
+            if (hcid != (u32)cid) {
+                g_msi_cid_mismatch++;
+                g_log->error("[nvme] CID mismatch (poll)");
+                log_hex("[nvme] expect cid=", cid);
+                log_hex("[nvme] got cid=", hcid);
+                continue;
+            }
+            if (out_cqe_dw0) *out_cqe_dw0 = dw0;
+            if (st) {
+                g_log->error("[nvme] command failed");
+                log_hex("[nvme] opcode=", opcode);
+                log_hex("[nvme] cid=", cid);
+                log_hex("[nvme] status=", st);
+                return (int)st;
+            }
+            return 0;
+        }
+
+        if (dkm_rdtsc() > deadline) {
+            g_msi_timeouts++;
+            g_log->error("[nvme] completion timeout (msi mode)");
+            log_hex("[nvme] opcode=", opcode);
+            log_hex("[nvme] cid=", cid);
+            nvme_dump_regs("completion timeout");
+            return -100;
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 /* ---- 命令提交（同步轮询, 单 outstanding） ----
  * dw[16] 为完整 SQE（dw0 低 16 位不含 CID, 由本函数填入）。
  * 返回 0 成功；>0 = NVMe status code；<0 超时/内部错误。
@@ -239,6 +594,10 @@ static int nvme_submit(volatile u32 *sq, u32 *sq_tail, u16 sq_qid,
     dw[0] = (dw[0] & 0xffffu) | ((u32)g_cid << 16);
     u32 cid = g_cid;
     g_cid++;
+    /* CID=0 保留不用: QEMU 在 MSI-X unmask 边界会向 IO CQ 补投一枚
+     * CID=0/phase 正确/status 成功的幽灵 CQE (实测稳定复现), g_cid 回绕
+     * 跳过 0 可保证该幽灵 CQE 永远被 CID 校验拒绝, 绝无误判窗口。 */
+    if (g_cid == 0) g_cid = 1;
 
     /* 逐 dword 写入 SQE（64B），避免 freestanding 下编译器生成 memcpy 调用 */
     u32 pos = *sq_tail;
@@ -247,6 +606,13 @@ static int nvme_submit(volatile u32 *sq, u32 *sq_tail, u16 sq_qid,
     *sq_tail = (pos + 1) % qsize;
     nvme_mb();                                  /* SQ 内容先于 doorbell 可见 */
     mmio_write32(sq_tail_db(sq_qid), *sq_tail);
+
+    /* B7 阶段3: IO 队列 MSI 模式 → 完成槽 + irqsave 摘取统一等待。
+     * admin 队列保持纯轮询 (仅 init 期使用, 且 INTMC 解除前 IV0 处于
+     * 屏蔽态, admin 完成不会触发 MSI)。 */
+    if (cq_qid == 1 && g_msi_enabled) {
+        return nvme_io_wait_completion(cid, dw[0] & 0xffu, out_cqe_dw0);
+    }
 
     /* 真机超时: 使用 CAP.TO * 500ms * 10 (留 10 倍余量), 下限 5s。
      * 真机 NVMe 控制器在重负载下可能需要更长的完成时间。 */
@@ -371,19 +737,277 @@ static int nvme_identify_namespace(u32 nsid, u64 *out_nsze, u32 *out_lbads) {
     return 0;
 }
 
+/* ---- B7 阶段3: PCI MSI 能力编程 ----
+ * MSI cap (ID 0x05) 布局:
+ *   +0x00 u8  Cap ID (=0x05)        +0x01 u8  Next Ptr
+ *   +0x02 u16 Message Control: bit0 Enable, bit[3:1] MMC(可申请向量数-1),
+ *              bit[6:4] MME(已分配向量数-1), bit7 64-bit Capable, bit8 PVM
+ *   +0x04 u32 Message Address
+ *   64-bit 时: +0x08 u32 Message Upper Address, +0x0C u16 Message Data
+ *   32-bit 时: +0x08 u16 Message Data
+ *   PVM(bit8)=1 时另有 Mask/Pending 寄存器, 复位值 0 (全部 unmask)。
+ * x86 LAPIC 投递公式 (physical destination, fixed delivery):
+ *   Address = 0xFEE00000 | (dest_apic_id << 12)   (RH=0, DM=0)
+ *   Data    = vector | (0<<8 delivery=fixed)      (level/trigger 对 MSI 无效)
+ */
+#define PCI_CAP_ID_MSI   0x05
+#define PCI_CAP_ID_MSIX  0x11
+#define PCI_STATUS_CAPLIST 0x10u
+
+static int nvme_find_pci_cap(u8 bus, u8 dev, u8 func, u8 cap_id) {
+    u32 reg04 = dkm_pci_read(bus, dev, func, PCI_COMMAND);
+    if (!((reg04 >> 16) & PCI_STATUS_CAPLIST)) return -1;   /* Status.CapList=0 */
+    u8 ptr = (u8)(dkm_pci_read(bus, dev, func, PCI_CAP_PTR) & 0xFC);
+    int guard = 0;
+    while (ptr && guard++ < 64) {           /* guard 防配置空间坏链死循环 */
+        u32 dw = dkm_pci_read(bus, dev, func, ptr);
+        u8 id   = (u8)(dw & 0xff);
+        u8 next = (u8)((dw >> 8) & 0xff);
+        log_hex("[nvme] pci cap id=", id);
+        log_hex("[nvme] pci cap at=", ptr);
+        if (id == cap_id) return (int)ptr;
+        ptr = next & 0xFC;
+    }
+    return -1;
+}
+
+/* MSI cap (0x05) 编程路径: 成功返回 1, cap 缺失或失败返回 0。
+ * 失败路径完整回滚 (恢复 msg_ctl + 释放向量), 不留半编程状态。 */
+static int nvme_msi_program(const struct dkm_kernel_api *api,
+                            u8 bus, u8 dev, u8 func) {
+    int cap = nvme_find_pci_cap(bus, dev, func, PCI_CAP_ID_MSI);
+    if (cap < 0) {
+        g_log->info("[nvme] MSI capability not present");
+        return 0;
+    }
+
+    u32 cdw = dkm_pci_read(bus, dev, func, (u8)cap);
+    u32 msg_ctl = (cdw >> 16) & 0xffffu;
+    int cap64 = (int)((msg_ctl >> 7) & 1u);
+    int pvm   = (int)((msg_ctl >> 8) & 1u);
+    log_hex("[nvme] MSI msg_ctl=", msg_ctl);
+    log_hex("[nvme] MSI 64bit=", (u64)cap64);
+    log_hex("[nvme] MSI pvm=", (u64)pvm);
+
+    /* 动态向量: UTSM 位图池 0x40-0xDF, 与静态向量 (tick 0xE0/spurious 0xFF)
+     * 及 legacy PIC 段 (0x20-0x2F) 无交叠。 */
+    int vector = api->irq_vector_alloc();
+    if (vector < 0 || vector > 255) {
+        g_log->warn("[nvme] MSI: vector alloc failed; polling");
+        return 0;
+    }
+    log_dec("[nvme] MSI vector=", (u64)vector);
+
+    /* 目的 APIC ID: CPUID.1:EBX[31:24] = BSP initial APIC ID (QEMU=0) */
+    u32 ca, cb, cc_, cd;
+    nvme_cpuid(1, &ca, &cb, &cc_, &cd);
+    (void)ca; (void)cc_; (void)cd;
+    u32 dest = (cb >> 24) & 0xffu;
+    log_hex("[nvme] MSI dest apic id=", dest);
+
+    u32 addr = 0xFEE00000u | (dest << 12);
+    u32 data = (u32)vector & 0xffu;         /* fixed delivery, edge */
+
+    /* 先写 Address/Data, 最后置 Enable — 避免半成品消息被发出 */
+    dkm_pci_write(bus, dev, func, (u8)(cap + 4), addr);
+    if (cap64) {
+        dkm_pci_write(bus, dev, func, (u8)(cap + 8), 0);    /* upper addr */
+        u32 dw = dkm_pci_read(bus, dev, func, (u8)(cap + 12));
+        dw = (dw & 0xffff0000u) | data;                     /* data 为低 u16 */
+        dkm_pci_write(bus, dev, func, (u8)(cap + 12), dw);
+    } else {
+        u32 dw = dkm_pci_read(bus, dev, func, (u8)(cap + 8));
+        dw = (dw & 0xffff0000u) | data;
+        dkm_pci_write(bus, dev, func, (u8)(cap + 8), dw);
+    }
+
+    /* Message Control: MME=0 (单向量), Enable=1; 低 u16 (id/next) 回写原值 */
+    u32 mc = msg_ctl;
+    mc &= ~(0x7u << 4);                     /* MME=0 → 1 vector */
+    mc |= 1u;                               /* MSI Enable */
+    cdw = (cdw & 0x0000ffffu) | (mc << 16);
+    dkm_pci_write(bus, dev, func, (u8)cap, cdw);
+
+    /* PVM: 显式清 mask bit0 (复位值即为 0, 此处防御性 RMW) */
+    if (pvm) {
+        int mask_off = cap64 ? cap + 16 : cap + 12;
+        u32 mask = dkm_pci_read(bus, dev, func, (u8)mask_off);
+        mask &= ~1u;
+        dkm_pci_write(bus, dev, func, (u8)mask_off, mask);
+        log_hex("[nvme] MSI mask cleared=", mask);
+    }
+
+    /* 回读验证: Enable 置位 + Address/Data 与编程值一致 */
+    u32 rb_ctl  = (dkm_pci_read(bus, dev, func, (u8)cap) >> 16) & 0xffffu;
+    u32 rb_addr = dkm_pci_read(bus, dev, func, (u8)(cap + 4));
+    u32 rb_data = dkm_pci_read(bus, dev, func,
+                               (u8)(cap64 ? cap + 12 : cap + 8)) & 0xffffu;
+    log_hex("[nvme] MSI readback ctl=", rb_ctl);
+    log_hex("[nvme] MSI readback addr=", rb_addr);
+    log_hex("[nvme] MSI readback data=", rb_data);
+    if (!(rb_ctl & 1u) || rb_addr != addr || (rb_data & 0xffu) != data) {
+        g_log->warn("[nvme] MSI: readback mismatch; rolling back");
+        u32 rb = dkm_pci_read(bus, dev, func, (u8)cap);
+        rb = (rb & 0x0000ffffu) | (msg_ctl << 16);      /* 恢复原 msg_ctl */
+        dkm_pci_write(bus, dev, func, (u8)cap, rb);
+        api->irq_vector_free(vector);
+        return 0;
+    }
+
+    /* 注册 handler (irq_register 已接受向量命名空间, >0x2F 直挂分发表) */
+    api->irq_register((u8)vector, (void *)(uintptr_t)nvme_msi_handler);
+
+    g_msi_enabled = 1;
+    g_msi_vector = vector;
+    g_log->info("[nvme] MSI enabled (IO CQ IEN=1, IV=0)");
+    return 1;
+}
+
+/* 按 BIR 读取 BAR 物理基址 (处理 64-bit BAR; IO BAR 返回 0) */
+static u64 nvme_bar_phys(u8 bus, u8 dev, u8 func, u32 bir) {
+    u8 reg = (u8)(PCI_BAR0 + bir * 4u);
+    u32 lo = dkm_pci_read(bus, dev, func, reg);
+    if (lo & 1u) return 0;                              /* IO BAR */
+    if ((lo & 0x6u) == 0x4u) {                          /* 64-bit MMIO BAR */
+        u32 hi = dkm_pci_read(bus, dev, func, (u8)(reg + 4));
+        return ((u64)hi << 32) | (u64)(lo & 0xFFFFFFF0u);
+    }
+    return (u64)(lo & 0xFFFFFFF0u);
+}
+
+/* MSI-X cap (0x11) 编程路径: 成功返回 1, cap 缺失或失败返回 0。
+ * QEMU nvme 只暴露 MSI-X (无 0x05), 本路径是 QEMU 下中断驱动化的唯一通道。
+ * 与 MSI 的差异仅在消息存储位置: MSI-X 的 addr/data 存放在 BAR 内的
+ * 表项 (16B/项), 需先把表区 MMIO 映射进 CPU 地址空间再编程 entry 0。
+ * 失败路径完整回滚 (清 Enable + 表项重新 mask + 释放向量)。 */
+static int nvme_msix_program(const struct dkm_kernel_api *api,
+                             u8 bus, u8 dev, u8 func) {
+    int cap = nvme_find_pci_cap(bus, dev, func, PCI_CAP_ID_MSIX);
+    if (cap < 0) {
+        g_log->warn("[nvme] MSI-X capability not present; polling");
+        return 0;
+    }
+    if (!api->mm_map_mmio) {
+        g_log->warn("[nvme] MSI-X: mm_map_mmio unavailable; polling");
+        return 0;
+    }
+
+    u32 cdw = dkm_pci_read(bus, dev, func, (u8)cap);
+    u32 msg_ctl = (cdw >> 16) & 0xffffu;
+    u32 table_size = (msg_ctl & 0x7ffu) + 1u;           /* N-1 encoded */
+    u32 tbl_dw  = dkm_pci_read(bus, dev, func, (u8)(cap + 4));
+    u32 bir     = tbl_dw & 7u;
+    u32 tbl_off = tbl_dw & ~7u;
+    log_hex("[nvme] MSI-X msg_ctl=", msg_ctl);
+    log_dec("[nvme] MSI-X table size=", table_size);
+    log_hex("[nvme] MSI-X table BIR=", bir);
+    log_hex("[nvme] MSI-X table offset=", tbl_off);
+    if (bir > 5u) {
+        g_log->warn("[nvme] MSI-X: invalid BIR; polling");
+        return 0;
+    }
+
+    u64 bar_phys = nvme_bar_phys(bus, dev, func, bir);
+    if (!bar_phys) {
+        g_log->warn("[nvme] MSI-X: table BAR invalid; polling");
+        return 0;
+    }
+    u64 tbl_phys = bar_phys + tbl_off;
+    log_hex("[nvme] MSI-X table BAR phys=", bar_phys);
+    log_hex("[nvme] MSI-X table phys=", tbl_phys);
+
+    /* 映射表区首页 (含 entry0 的 16B)。mm_map_mmio 返回含页内偏移的指针,
+     * 页属性 PCD|PWT (UC), MSI-X 表访问不要求 cache 一致性操作。 */
+    volatile u32 *tbl = (volatile u32 *)api->mm_map_mmio(tbl_phys, 4096);
+    if (!tbl) {
+        g_log->warn("[nvme] MSI-X: table MMIO map failed; polling");
+        return 0;
+    }
+
+    int vector = api->irq_vector_alloc();
+    if (vector < 0 || vector > 255) {
+        g_log->warn("[nvme] MSI-X: vector alloc failed; polling");
+        return 0;
+    }
+    log_dec("[nvme] MSI-X vector=", (u64)vector);
+
+    u32 ca, cb, cc_, cd;
+    nvme_cpuid(1, &ca, &cb, &cc_, &cd);
+    (void)ca; (void)cc_; (void)cd;
+    u32 dest = (cb >> 24) & 0xffu;
+    u32 addr = 0xFEE00000u | (dest << 12);
+
+    /* 先写表项 (addr/data/mask=0), 再置 cap Enable — 避免半成品消息 */
+    volatile u32 *e = tbl;                              /* entry 0 */
+    e[0] = addr;                                        /* Msg Addr Lo */
+    e[1] = 0;                                           /* Msg Addr Hi */
+    e[2] = (u32)vector & 0xffu;                         /* Msg Data = 向量 */
+    e[3] = 0;                                           /* Vector Control: unmask */
+    nvme_mb();
+
+    u32 nc = (msg_ctl | 0x8000u) & ~(1u << 14);         /* Enable=1, FunctionMask=0 */
+    cdw = (cdw & 0x0000ffffu) | (nc << 16);
+    dkm_pci_write(bus, dev, func, (u8)cap, cdw);
+
+    /* 回读验证: cap Enable + 表项 addr/data/mask 与编程值一致 */
+    u32 rb_ctl = (dkm_pci_read(bus, dev, func, (u8)cap) >> 16) & 0xffffu;
+    u32 rb_a0 = e[0], rb_a1 = e[1], rb_d = e[2], rb_vc = e[3];
+    log_hex("[nvme] MSI-X readback ctl=", rb_ctl);
+    log_hex("[nvme] MSI-X readback entry addr=", ((u64)rb_a1 << 32) | rb_a0);
+    log_hex("[nvme] MSI-X readback entry data=", rb_d);
+    log_hex("[nvme] MSI-X readback entry vctl=", rb_vc);
+    if (!(rb_ctl & 0x8000u) || rb_a0 != addr || rb_a1 != 0 ||
+        (rb_d & 0xffu) != ((u32)vector & 0xffu) || (rb_vc & 1u)) {
+        g_log->warn("[nvme] MSI-X: readback mismatch; rolling back");
+        u32 rb = dkm_pci_read(bus, dev, func, (u8)cap);
+        rb = (rb & 0x0000ffffu) | (msg_ctl << 16);      /* 恢复原 msg_ctl */
+        dkm_pci_write(bus, dev, func, (u8)cap, rb);
+        e[3] = 1;                                       /* 表项重新 mask */
+        api->irq_vector_free(vector);
+        return 0;
+    }
+
+    api->irq_register((u8)vector, (void *)(uintptr_t)nvme_msi_handler);
+
+    g_msi_enabled = 1;
+    g_msix_mode = 1;
+    g_msi_vector = vector;
+    g_log->info("[nvme] MSI-X enabled (table entry0, IO CQ IEN=1, IV=0)");
+    return 1;
+}
+
+/* 中断驱动化入口: 先 MSI (0x05), 缺则 MSI-X (0x11), 皆不可则纯轮询。
+ * 前提检查集中在此; 两条编程路径各自保证失败完整回滚。 */
+static int nvme_msi_setup(const struct dkm_kernel_api *api,
+                          u8 bus, u8 dev, u8 func) {
+    if (!g_cfg_nvme_msi) {
+        g_log->info("[nvme] MSI disabled by FUCK (nvme_msi=0); polling mode");
+        return 0;
+    }
+    if (!api->irq_vector_alloc || !api->irq_vector_free || !api->irq_register) {
+        g_log->warn("[nvme] MSI: kernel vector allocator unavailable; polling");
+        return 0;
+    }
+    if (nvme_msi_program(api, bus, dev, func)) return 1;
+    return nvme_msix_program(api, bus, dev, func);
+}
+
 /* ---- IO queue 创建 ---- */
 
 static int nvme_create_io_queues(void) {
     u32 dw[16];
 
-    /* Create IO CQ (qid=1): PC=1, IEN=0 (轮询模式)
-     * CDW10 = QSIZE[31:16](0's based) | QID[15:0] —— QID 必须在低半字 */
+    /* Create IO CQ (qid=1): PC=1; MSI 就绪时 IEN=1 + IV=0
+     * CDW10 = QSIZE[31:16](0's based) | QID[15:0] —— QID 必须在低半字
+     * CDW11 = IV[31:16] | IEN[1] | PC[0] —— IV=0 与 INTMS/INTMC bit0 对应 */
     nvme_zero(dw, sizeof(dw));
     dw[0] = NVME_ADM_CREATE_IOCQ;
     dw[6] = (u32)(g_iocq.phys & 0xffffffffu);
     dw[7] = (u32)(g_iocq.phys >> 32);
     dw[10] = ((u32)(IO_QSIZE - 1u) << 16) | 1u;
-    dw[11] = 1;
+    dw[11] = 1u;
+    if (g_msi_enabled) dw[11] = 1u | (1u << 1);     /* PC=1, IEN=1, IV=0 */
+    log_hex("[nvme] create IOCQ CDW11=", dw[11]);
     int rc = nvme_admin_submit(dw, 0);
     if (rc != 0) {
         g_log->error("[nvme] create IO CQ failed");
@@ -586,6 +1210,61 @@ static void nvme_selftest_rw(u64 lba, u32 sectors) {
     g_log->info("[nvme]   write+flush+readback verify OK");
 }
 
+/* B7 阶段3 压测: 128 扇区 (64KiB, PRP list 路径) × 50 次 写+读。
+ * 统计总耗时与 MSI 计数器增量, 供中断/轮询两模式粗粒度对比。
+ * 仅签名测试盘运行 (写 LBA3000 起的 50 个块, 不碰 LBA0 签名区)。 */
+static void nvme_selftest_stress(void) {
+    static u8 wbuf[65536];
+    static u8 rbuf[65536];
+    for (u32 i = 0; i < sizeof(wbuf); i++) wbuf[i] = (u8)(i * 17u + 3u);
+
+    u64 irq0 = g_msi_irq_count, slot0 = g_msi_slot_hits, poll0 = g_msi_poll_harvests;
+    u64 t0 = dkm_rdtsc();
+    u32 fails = 0;
+    for (u32 i = 0; i < 50; i++) {
+        u64 lba = 3000 + (u64)i * 128;
+        if (nvme_block_write(0, lba, 128, wbuf) != 0) { fails++; break; }
+        if (nvme_block_read(0, lba, 128, rbuf) != 0) { fails++; break; }
+    }
+    u64 elapsed_ms = dkm_tsc_per_ms ? (dkm_rdtsc() - t0) / dkm_tsc_per_ms : 0;
+
+    /* 末次读回全量校验 (数据通路在 MSI 模式下完整性证明) */
+    if (!fails) {
+        for (u32 i = 0; i < sizeof(wbuf); i++) {
+            if (rbuf[i] != wbuf[i]) {
+                g_log->error("[nvme] stress readback MISMATCH");
+                log_hex("[nvme]   first bad idx=", i);
+                log_hex("[nvme]   expect=", wbuf[i]);
+                log_hex("[nvme]   actual=", rbuf[i]);
+                log_hex("[nvme]   cq head=", g_iocq_head);
+                log_hex("[nvme]   cq phase=", g_iocq_phase);
+                log_hex("[nvme]   slot valid=", g_slot_valid);
+                fails++;
+                break;
+            }
+        }
+    }
+
+    log_dec("[nvme] stress 50x(128sec W+R) ms=", elapsed_ms);
+    log_dec("[nvme] stress fails=", fails);
+    log_dec("[nvme] stress irq delta=", g_msi_irq_count - irq0);
+    log_dec("[nvme] stress slot delta=", g_msi_slot_hits - slot0);
+    log_dec("[nvme] stress poll delta=", g_msi_poll_harvests - poll0);
+    if (!fails) g_log->info("[nvme] stress verify OK");
+}
+
+static void nvme_msi_stats_dump(const char *tag) {
+    g_log->info(tag);
+    log_dec("[nvme] msi enabled=", (u64)g_msi_enabled);
+    log_dec("[nvme] msix mode=", (u64)g_msix_mode);
+    log_dec("[nvme] msi vector=", (u64)(g_msi_vector < 0 ? 0 : g_msi_vector));
+    log_dec("[nvme] msi irq count=", g_msi_irq_count);
+    log_dec("[nvme] msi slot hits=", g_msi_slot_hits);
+    log_dec("[nvme] msi poll harvests=", g_msi_poll_harvests);
+    log_dec("[nvme] msi timeouts=", g_msi_timeouts);
+    log_dec("[nvme] msi cid mismatch=", g_msi_cid_mismatch);
+}
+
 /* ---- 真机诊断: dump 关键寄存器 ---- */
 
 static void nvme_dump_regs(const char *ctx) {
@@ -673,6 +1352,7 @@ int driver_init(const struct dkm_kernel_api *api,
     dkm_instr_init(api);
 
     g_log->info("[nvme] init begin");
+    nvme_load_config(api);
 
     u8 bus = 0, dev = 0, func = 0;
     if (nvme_find(&bus, &dev, &func) != 0) {
@@ -867,6 +1547,9 @@ dma_ok:
         log_hex("[nvme] chunk max sectors=", g_chunk_max_sectors);
     }
 
+    /* ---- B7 阶段3: IO queue 创建前尝试 MSI (任何前提缺失回退纯轮询) ---- */
+    nvme_msi_setup(api, bus, dev, func);
+
     /* ---- IO queue ---- */
     if (nvme_create_io_queues() != 0) {
         g_log->error("[nvme] IO queue creation failed");
@@ -875,6 +1558,13 @@ dma_ok:
     }
     g_io_ready = 1;
     g_log->info("[nvme] IO queue live");
+
+    /* MSI 就绪: INTMC 解除 IV0 屏蔽 (此前 IV0 保持屏蔽, admin 完成不产生
+     * MSI; 此后 IO CQ 每次完成经 MSI 投递到 g_msi_vector) */
+    if (g_msi_enabled) {
+        mmio_write32(NVME_INTMC, 1u);
+        log_hex("[nvme] INTMC unmask IV0, INTMS=", mmio_read32(NVME_INTMS));
+    }
 
     /* ---- LBA0 读取验证 ---- */
     {
@@ -921,6 +1611,7 @@ dma_ok:
         nvme_selftest_read_multipage();     /* 32 扇区 16KiB: PRP list 读 */
         nvme_selftest_rw(1000, 16);         /* 8KiB: PRP2 直连 (2 页) 写+读回 */
         nvme_selftest_rw(2000, 32);         /* 16KiB: PRP list (4 页) 写+读回 */
+        nvme_selftest_stress();             /* B7: 128 扇区×50 压测 + MSI 计数 */
         if (nvme_lba0_sig_ok()) {
             g_log->info("[nvme] LBA0 sig intact after write tests");
         } else {
@@ -929,6 +1620,8 @@ dma_ok:
     } else {
         g_log->info("[nvme] not a test disk; write self-test skipped");
     }
+
+    nvme_msi_stats_dump("[nvme] --- MSI stats ---");
 
     g_log->info("[nvme] driver ready");
     return 0;

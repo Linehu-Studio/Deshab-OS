@@ -81,6 +81,32 @@ foreach ($m in $curr.metrics) {
 }
 ```
 
+## 自动化脚本
+
+[tests/qemu/performance-baseline.ps1](../../../tests/qemu/performance-baseline.ps1) 以主机墙上时钟
+轮询串口锚点，测量启动阶段耗时（正常启动 firstInit=`1\n0`，AUTOEXEC=ver/exit）：
+
+```powershell
+.\tests\qemu\performance-baseline.ps1            # 默认 3 轮取中位数
+.\tests\qemu\performance-baseline.ps1 -Runs 5    # 自定义轮数
+```
+
+测量锚点与阶段换算：
+
+| 阶段 | 起 → 止 | 对应指标 |
+|---|---|---|
+| ovmf_bootloader_ms | QEMU 进程启动 → `[UTSM] boot` | OVMF + Limine |
+| utsm_drivers_ms | `[UTSM] boot` → `[UTSM] SELFTEST PASS` | P1（UTSM+16 驱动装载） |
+| selftest_to_dsk_ms | SELFTEST → `[DSK] boot` | DSK 加载（FAT32 read + PIE load） |
+| dsk_to_desktop_ms | `[DSK] boot` → `desktop ready` | DSK → 桌面就绪 |
+| total_boot_ms | QEMU 启动 → `desktop ready` | 端到端总启动 |
+
+结果写入 `.build_tmp\perf_baseline.json`（锚点绝对时刻 + 各轮数据 + 中位数 + 环境信息）。
+本脚本只测量展示、不做阈值断言；轮询精度 ±200ms，QEMU 数值仅作回归参考。
+
+未自动化项（需内核 TSC 打点日志，当前串口无锚点，保持 PENDING）：P2/P3/P6（单 ELF 加载计时）、
+P4 ping RTT、P5 linux RTT、P7 桌面帧率、P8~P11（PE/VMM/Linux）、P12 DHCP 耗时。
+
 ## 已知限制
 
 - QEMU 性能数据不等于真机，仅作回归参考

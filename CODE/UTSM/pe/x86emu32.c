@@ -310,8 +310,15 @@ static int try_iat_call(x86emu_state *emu, u32 target) {
             ret = se->fn32(esp_ptr);
         } else if (se->fn64) {
             /* 回退：调用 64位 shim（最多 4 个参数）。
-             * MS x64 ABI 由 C 编译器处理寄存器分配。 */
-            typedef u64 (*fn4_t)(u64, u64, u64, u64);
+             * BUG-20260801-007 后续修正：fn4_t 必须显式 ms_abi。
+             * UTSM 以 clang x86_64-unknown-none 编译，C 默认 ABI 是 SysV
+             * （arg1=RDI/RSI/RDX/RCX），而 shim 全部 __attribute__((ms_abi))
+             * （arg1=RCX/RDX/R8/R9）。typedef 不带 ms_abi 时编译器生成 SysV
+             * 调用序列 → shim 在 RCX 读到的是 SysV 第4参数 a3(=0) → gp(0)=0
+             * → shim_printf 解引用 NULL → #PF cr2=0（实测寄存器现场:
+             * rdi=0x401017 即 SysV arg1=fmt, rcx=0, cr2=0）。
+             * 原生 PE32+ 路径 guest 是 Windows 程序天生 MS ABI，不受影响。 */
+            typedef u64 (__attribute__((ms_abi)) *fn4_t)(u64, u64, u64, u64);
             fn4_t f = (fn4_t)se->fn64;
             ret = f(a0, a1, a2, a3);
 

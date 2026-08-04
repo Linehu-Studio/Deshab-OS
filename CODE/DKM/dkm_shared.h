@@ -193,6 +193,11 @@ struct dkm_kernel_api {
     /* —— 新增字段只允许追加在末尾（DSK 以 api+0xA8 硬偏移读取 block） —— */
     void *(*mm_map_mmio)(u64 phys, u64 size);    /* MMIO 独立窗口映射（PCD|PWT），返回虚拟地址，失败返回 0 */
     void (*mm_unmap_mmio)(void *virt, u64 size); /* 解除 MMIO 独立窗口映射 */
+    /* B7 阶段2 尾部追加（旧内核无此字段 → 判空使用） */
+    void (*register_apic_eoi)(void (*eoi_fn)(void));
+    /* B7 阶段3 尾部追加：动态 IDT 向量分配器（MSI/MSI-X），池 0x40-0xDF */
+    int  (*irq_vector_alloc)(void);
+    void (*irq_vector_free)(int vector);
 };
 
 struct dkm_driver_handle;

@@ -55,6 +55,28 @@
 - curl 64KB 页面接收无明显停顿
 - DHCP 总耗时 < 5s
 
+## 自动化脚本
+
+[tests/qemu/network-e2e.ps1](../../../tests/qemu/network-e2e.ps1) 分两个场景：
+
+```powershell
+.\tests\qemu\network-e2e.ps1                  # N-A + N-B 全跑
+.\tests\qemu\network-e2e.ps1 -Scenarios NA    # 只跑 netman 全链路
+.\tests\qemu\network-e2e.ps1 -Scenarios NB    # 只跑 curl 主机侧端到端
+```
+
+- **场景 N-A**（netman 全链路，首启调度，覆盖 N1~N5）：firstInit=`0\n0`，挂 e1000(net0) +
+  virtio-net(net1) 双网卡。断言 virtio_net selftest（真实 slirp DHCP OFFER）→
+  netman 双设备枚举 → DHCP DISCOVER/OFFER/REQUEST/ACK → ARP 网关解析 → DNS example.com →
+  `network final rc=0x0000000000000000`，并禁止 `no OFFER / ARP timeout / DNS timeout / [PANIC]`。
+- **场景 N-B**（curl.elf 主机侧端到端，覆盖 N8/N10）：dev_mode shell → 交互 `curl` →
+  输入 `http://10.0.2.2:8000/`。脚本在主机 127.0.0.1:8000 起极简 HTTP 服务器
+  （QemuTest.ps1 `Start-TestHttpServer`），断言主机侧收到 `GET / HTTP/1.0`
+  （TCP+IP+ETH 全链路最强证据），guest 侧断言 `[curl] boot/exit` 与 shell 回收。
+  HTTP 响应体渲染仅帧缓冲，标 MANUAL。
+- N6/N11（ping 链路）由 [userapps-matrix.ps1](../../../tests/qemu/userapps-matrix.ps1) 交互阶段覆盖；
+  N7/N9（外网）依赖主机联网，不在自动化断言范围。
+
 ## 已知限制
 
 - HTTPS/TLS 不支持（curl 仅 http）

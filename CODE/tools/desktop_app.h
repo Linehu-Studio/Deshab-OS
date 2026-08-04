@@ -258,14 +258,30 @@ typedef struct {
     int has_pkt;
 } da_mouse;
 
+/* 冲刷 PS/2 控制器输出缓冲（最多 16 字节） */
+static inline void da_ps2_drain(void) {
+    for (int i = 0; i < 16; i++) {
+        if (!(inb(0x64) & 1)) break;
+        inb(0x60);
+    }
+}
+
 static inline void da_mouse_init(void) {
+    /* 必须先冲刷输出缓冲再发 0x20 读配置字：shell 启动本应用时最后键入的
+     * 回车 break code(0x9C) 或鼠标流字节若残留在输出缓冲，会被误读为"配置字"
+     * 并写回控制器 —— 残留字节 bit4(0x10)=1 会置位 KBD 时钟禁用位，键盘被
+     * 控制器级禁用且应用退出后仍不恢复（BUG-20260801-008）。
+     * 复位/使能后的响应字节也必须全部读完（0xFF 返回 FA AA 00 共 3 字节），
+     * 否则残留字节同样会污染后续配置字读写。
+     * 序列与 desktop/main.c:ps2_mouse_init 保持一致。 */
+    da_ps2_drain();
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x64, 0xA8);
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x64, 0x20);
     for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
     u8 cfg = inb(0x60);
-    cfg |= 0x02; cfg &= ~0x20;
+    cfg &= ~0x20; cfg |= 0x02; cfg |= 0x40; /* AUX 时钟启用 + AUX IRQ + 键盘翻译(集1, 与 desktop 一致) */
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x64, 0x60);
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
@@ -274,21 +290,33 @@ static inline void da_mouse_init(void) {
     outb(0x64, 0xD4);
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x60, 0xFF);
-    for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
-    inb(0x60);
+    for (int i = 0; i < 8; i++) {           /* 读完复位全部响应(FA AA 00) */
+        int got = 0;
+        for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) { got = 1; break; } }
+        if (!got) break;
+        inb(0x60);
+    }
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x64, 0xD4);
     for (int t = 0; t < 100000; t++) { if (!(inb(0x64) & 2)) break; }
     outb(0x60, 0xF4);
-    for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) break; }
-    inb(0x60);
+    for (int i = 0; i < 4; i++) {           /* 读完使能 ACK */
+        int got = 0;
+        for (int t = 0; t < 100000; t++) { if (inb(0x64) & 1) { got = 1; break; } }
+        if (!got) break;
+        inb(0x60);
+    }
+    da_ps2_drain();
 }
 
 static inline int da_mouse_poll(da_mouse *m, da_cursor *c, i64 fb_w, i64 fb_h) {
     u8 st = inb(0x64);
     if (!(st & 1)) return 0;
-    u8 data = inb(0x60);
+    /* 必须先查 AUX 位(bit5)再读数据端口：键盘字节(st&0x20)==0 属于键盘路径，
+     * 此处若先 inb(0x60) 会把键盘扫描码吞掉（BUG-20260801-003）。
+     * 与 desktop/main.c:ps2_mouse_poll 顺序保持一致。 */
     if (!(st & 0x20)) return 0;
+    u8 data = inb(0x60);
     m->buf[m->idx++] = data;
     if (m->idx < 3) return 0;
     m->idx = 0;

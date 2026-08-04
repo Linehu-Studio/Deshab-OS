@@ -9,14 +9,19 @@
  *   ntdll.dll     NtWriteFile、RtlNtStatusToDosError
  *   bcryptprimitives.dll  ProcessPrng (rdtsc xorshift)
  *   api-ms-win-core-synch-l1-2-0.dll  WaitOnAddress、WakeByAddress (futex 桩)
- *   user32.dll    窗口类、窗口、消息泵 (PS/2 键盘轮询)、DefWindowProc
+ *   user32.dll    窗口类、窗口、消息泵 (PS/2 键盘+AUX 鼠标轮询)、DefWindowProc
  *   gdi32.dll     内存 DC、DIBSection、BitBlt 到 Limine 帧缓冲
  *
  * 窗口模型:单顶层窗口 (固定伪句柄),GetDC 返回窗口 DC,
  * BitBlt(窗口 DC, ...) 把 DIB 后台缓冲按窗口原点拷入帧缓冲.
- * 消息泵:PeekMessageW 轮询 PS/2 键盘 (0x64/0x60),生成
- * WM_KEYDOWN、WM_KEYUP、WM_CHAR;Esc 额外合成 WM_CLOSE (无鼠标环境的
- * 唯一退出途径).鼠标字节 (状态位 0x20) 直接丢弃.
+ * 消息泵:PeekMessageW 轮询 PS/2 (0x64/0x60),按状态位 0x20 分流键盘/鼠标:
+ *   键盘 -> WM_KEYDOWN、WM_KEYUP、WM_CHAR;Esc 额外合成 WM_CLOSE;
+ *   鼠标 -> 3 字节包解码(同步位/溢出防御),坐标钳位到帧缓冲,
+ *          边沿生成 WM_MOUSEMOVE 与 WM_xBUTTONDOWN/WM_xBUTTONUP 系列.
+ * 软件光标:BitBlt 上屏后在光标坐标叠画 12x12 箭头(黑边白心),
+ *          下一帧 BitBlt 自动覆盖旧光标,无需保存/恢复背景.
+ * 鼠标初始化:on-demand(首次轮询时),AUX 启用 + 0xF4 数据报告,
+ *          全程超时保护,单步失败只记日志并禁用鼠标,绝不阻塞.
  */
 
 #include "pe_shim.h"
@@ -45,16 +50,39 @@ static int g_exit_jmp_set;
 static u64 g_exit_code;
 static const char *g_cmdline = "";
 
+/* ===== BUG-20260801-007: PE32 guest→host 指针转换 =====
+ * PE32 解释器路径下,fn64 回退 shim 收到的指针参数是 32 位 guest VA
+ * (相对解释器 mem 基址的偏移),直接当 host 指针解引用 → 低地址 #PF
+ * → 三重故障(定案证据:#PF RIP 落在 shim_printf 体内解引用 0x401017)。
+ * x86emu32 执行前经 pe_shim_set_emu_base() 设置 mem 基址,各 shim 在
+ * **指针解引用点**经 gp() 转换(不在参数入口盲目转换——退出码/长度等
+ * 小整数参数会被误转)。阈值 0x10000000 与 pe_service.c 解释器地址
+ * 空间上限一致;shim 伪句柄(0x10000001+)与负值句柄天然豁免。
+ * 原生 PE32+ 路径 g_emu_mem_base 恒为 0,gp() 恒等映射,零影响。 */
+static u64 g_emu_mem_base = 0;
+
+void pe_shim_set_emu_base(u64 base) { g_emu_mem_base = base; }
+
+static inline u64 gp(u64 va) {
+    if (g_emu_mem_base && va && va < 0x10000000ULL)
+        return g_emu_mem_base + va;
+    return va;
+}
+
 void pe_shim_init(const char *cmdline) {
     g_cmdline = cmdline ? cmdline : "";
     g_exit_jmp_set = 0;
     g_exit_code = 0;
+    g_emu_mem_base = 0;  /* BUG-007: 默认非解释器上下文(原生路径恒等映射) */
 }
 
-/* pe_run 调用:保存上下文,返回 0 = 首次(继续执行),1 = ExitProcess 触发 */
-int pe_shim_setup_exit(void) {
+/* 返回 ExitProcess longjmp 目标 jmpbuf(见 pe_shim.h 的 BUG-006 说明).
+ * 本函数只提供缓冲区并重置退出状态;__builtin_setjmp 由调用方
+ * (pe_service_run 本体)直接执行,确保 setjmp 帧在 PE 执行全程存活. */
+void **pe_shim_exit_jmpbuf(void) {
     g_exit_jmp_set = 1;
-    return __builtin_setjmp(g_exit_jmp);
+    g_exit_code = 0;
+    return g_exit_jmp;
 }
 
 void pe_shim_exit_process(u64 exit_code) {
@@ -81,7 +109,18 @@ u64 pe_shim_unimpl_stub(void) {
 }
 
 /* ===== 串口/帧缓冲输出(shim 内部复用) ===== */
+/* 单次输出长度上限:防御 PE 侧传野 (buf,len)(如 panic 递归中损坏的
+ * String)把半个地址空间倒进串口并踩穿未映射页(#PF).正常日志远远
+ * 低于此值;截断时留锚点便于定位. */
+#define SHIM_OUTPUT_MAX (1ULL * 1024ULL * 1024ULL)
+
 static void shim_output(const char *s, u64 len) {
+    if (len > SHIM_OUTPUT_MAX) {
+        log_error("[shim] output len clamped");
+        log_hex64("[shim] output buf=", (u64)s);
+        log_hex64("[shim] output len=", len);
+        len = SHIM_OUTPUT_MAX;
+    }
     for (u64 i = 0; i < len; i++) {
         serial_putc(s[i]);
     }
@@ -115,10 +154,11 @@ static u64 __attribute__((ms_abi)) shim_WriteFile(u64 handle, u64 buffer, u64 le
                                                    u64 bytes_written_ptr, u64 overlapped) {
     (void)overlapped;
     if (handle == SHIM_STDOUT_HANDLE || handle == SHIM_STDERR_HANDLE) {
-        const char *buf = (const char *)buffer;
+        const char *buf = (const char *)gp(buffer);
         shim_output(buf, length);
         /* lpNumberOfBytesWritten 是 DWORD*(4 字节),不能按 u64 写 */
-        if (bytes_written_ptr) *(u32 *)bytes_written_ptr = (u32)length;
+        u64 bwp = gp(bytes_written_ptr);
+        if (bwp) *(u32 *)bwp = (u32)length;
         return 1;  /* TRUE */
     }
     return 0;
@@ -127,8 +167,9 @@ static u64 __attribute__((ms_abi)) shim_WriteFile(u64 handle, u64 buffer, u64 le
 static u64 __attribute__((ms_abi)) shim_ReadFile(u64 handle, u64 buffer, u64 max_length,
                                                   u64 bytes_read_ptr, u64 overlapped) {
     (void)handle; (void)buffer; (void)max_length; (void)overlapped;
-    /* 暂不支持输入读取 */
-    if (bytes_read_ptr) *(u64 *)bytes_read_ptr = 0;
+    /* 暂不支持输入读取;lpNumberOfBytesRead 同为 DWORD*(4 字节) */
+    u64 brp = gp(bytes_read_ptr);
+    if (brp) *(u32 *)brp = 0;
     return 1;
 }
 
@@ -163,12 +204,13 @@ static u64 __attribute__((ms_abi)) shim_HeapAlloc(u64 heap, u64 flags, u64 size)
 }
 static u64 __attribute__((ms_abi)) shim_HeapFree(u64 heap, u64 flags, u64 ptr) {
     (void)heap; (void)flags;
-    shim_heap_free((void *)ptr);
+    /* gp():PE32 野指针收束进 guest 沙盒,避免低地址 host 解引用 */
+    shim_heap_free((void *)gp(ptr));
     return 1;
 }
 static u64 __attribute__((ms_abi)) shim_HeapReAlloc(u64 heap, u64 flags, u64 ptr, u64 size) {
     (void)heap; (void)flags;
-    return (u64)shim_heap_realloc((void *)ptr, size);
+    return (u64)shim_heap_realloc((void *)gp(ptr), size);
 }
 static u64 __attribute__((ms_abi)) shim_GetProcessHeap(void) {
     return 0x10000010;
@@ -216,7 +258,7 @@ static void shim_msvcrt_output(const char *s) {
 static u64 __attribute__((ms_abi)) shim_printf(u64 fmt, u64 a1, u64 a2, u64 a3) {
     /* 可变参数:MS x64 ABI 下 a1-a3 在 RDX/R8/R9,更多参数在栈上.
      * 简化处理:只处理前 3 个参数. */
-    const char *f = (const char *)fmt;
+    const char *f = (const char *)gp(fmt);
     u64 args[3] = {a1, a2, a3};
     int argi = 0;
     char outbuf[512];
@@ -226,7 +268,7 @@ static u64 __attribute__((ms_abi)) shim_printf(u64 fmt, u64 a1, u64 a2, u64 a3) 
             i++;
             switch (f[i]) {
             case 's': {
-                const char *s = (const char *)(args[argi++ & 3]);
+                const char *s = (const char *)gp(args[argi++ & 3]);
                 if (s) while (*s && oi < 510) outbuf[oi++] = *s++;
                 break;
             }
@@ -272,7 +314,7 @@ static u64 __attribute__((ms_abi)) shim_printf(u64 fmt, u64 a1, u64 a2, u64 a3) 
 }
 
 static u64 __attribute__((ms_abi)) shim_puts(u64 str) {
-    const char *s = (const char *)str;
+    const char *s = (const char *)gp(str);
     shim_msvcrt_output(s);
     shim_msvcrt_output("\n");
     return 0;
@@ -292,9 +334,9 @@ static u64 __attribute__((ms_abi)) shim_calloc(u64 count, u64 size) {
     if (p) for (u64 i = 0; i < total; i++) p[i] = 0;
     return (u64)p;
 }
-static u64 __attribute__((ms_abi)) shim_free(u64 ptr) { shim_heap_free((void *)ptr); return 0; }
+static u64 __attribute__((ms_abi)) shim_free(u64 ptr) { shim_heap_free((void *)gp(ptr)); return 0; }
 static u64 __attribute__((ms_abi)) shim_realloc(u64 ptr, u64 size) {
-    return (u64)shim_heap_realloc((void *)ptr, size);
+    return (u64)shim_heap_realloc((void *)gp(ptr), size);
 }
 static u64 __attribute__((ms_abi)) shim_exit(u64 code) {
     pe_shim_exit_process(code);
@@ -302,38 +344,38 @@ static u64 __attribute__((ms_abi)) shim_exit(u64 code) {
 }
 
 static u64 __attribute__((ms_abi)) shim_memcpy(u64 dst, u64 src, u64 n) {
-    u8 *d = (u8 *)dst; const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)gp(dst); const u8 *s = (const u8 *)gp(src);
     for (u64 i = 0; i < n; i++) d[i] = s[i];
     return dst;
 }
 static u64 __attribute__((ms_abi)) shim_memset(u64 dst, u64 val, u64 n) {
-    u8 *d = (u8 *)dst; u8 v = (u8)(val & 0xFF);
+    u8 *d = (u8 *)gp(dst); u8 v = (u8)(val & 0xFF);
     for (u64 i = 0; i < n; i++) d[i] = v;
     return dst;
 }
 static u64 __attribute__((ms_abi)) shim_memmove(u64 dst, u64 src, u64 n) {
-    u8 *d = (u8 *)dst; const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)gp(dst); const u8 *s = (const u8 *)gp(src);
     if (d < s) { for (u64 i = 0; i < n; i++) d[i] = s[i]; }
     else { for (u64 i = n; i > 0; i--) d[i-1] = s[i-1]; }
     return dst;
 }
 static u64 __attribute__((ms_abi)) shim_strlen(u64 str) {
-    const char *s = (const char *)str;
+    const char *s = (const char *)gp(str);
     u64 n = 0; while (s[n]) n++; return n;
 }
 static u64 __attribute__((ms_abi)) shim_strcmp(u64 a, u64 b) {
-    const char *pa = (const char *)a; const char *pb = (const char *)b;
+    const char *pa = (const char *)gp(a); const char *pb = (const char *)gp(b);
     while (*pa && *pa == *pb) { pa++; pb++; }
     return (u64)(i64)(*pa - *pb);
 }
 static u64 __attribute__((ms_abi)) shim_strcpy(u64 dst, u64 src) {
-    char *d = (char *)dst; const char *s = (const char *)src;
+    char *d = (char *)gp(dst); const char *s = (const char *)gp(src);
     while (*s) *d++ = *s++;
     *d = 0;
     return dst;
 }
 static u64 __attribute__((ms_abi)) shim_strncmp(u64 a, u64 b, u64 n) {
-    const char *pa = (const char *)a; const char *pb = (const char *)b;
+    const char *pa = (const char *)gp(a); const char *pb = (const char *)gp(b);
     for (u64 i = 0; i < n; i++) {
         if (pa[i] != pb[i]) return (u64)(i64)(pa[i] - pb[i]);
         if (pa[i] == 0) return 0;
@@ -343,12 +385,12 @@ static u64 __attribute__((ms_abi)) shim_strncmp(u64 a, u64 b, u64 n) {
 static u64 __attribute__((ms_abi)) shim_fwrite(u64 ptr, u64 size, u64 nmemb, u64 stream) {
     (void)stream;
     u64 total = size * nmemb;
-    shim_output((const char *)ptr, total);
+    shim_output((const char *)gp(ptr), total);
     return nmemb;
 }
 static u64 __attribute__((ms_abi)) shim_fputs(u64 str, u64 stream) {
     (void)stream;
-    shim_output_str((const char *)str);
+    shim_output_str((const char *)gp(str));
     return 0;
 }
 static u64 __attribute__((ms_abi)) shim_fputc(u64 ch, u64 stream) {
@@ -372,11 +414,23 @@ static u64 __attribute__((ms_abi)) shim_initterm_e(u64 start, u64 end) {
  *
  *  Rust std 的 GlobalAlloc 走 GetProcessHeap/HeapAlloc/HeapReAlloc/
  *  HeapFree.arena 只增不减,GUI 主循环每帧的 Vec 分配会耗尽内存,
- *  因此 shim 从 arena carve 一块 8MB 区域自行管理:
- *  32B 块头 {size,used,next_free,pad},首次适应 + 分割 + 前向合并.
+ *  因此 shim 从 arena carve 一块 32MB 区域自行管理:
+ *  32B 块头 {size,used,next_free,pad},首次适应 + 分割.
+ *
+ *  合并策略(2026-08-02 修复):空闲链表按地址升序维护,free 时做
+ *  前向 + 后向双向合并.旧实现是 LIFO 头插 + 仅前向合并,egui 每帧
+ *  内部存在非 LIFO 的 alloc/free 序列,物理相邻的空闲块永远无法
+ *  后向合并,堆逐渐碎成小片,实测 ~27KB/帧的速度劣化,第 ~1200 帧
+ *  (BitBlt frames=0x4b0)连 0x2a80 的连续块都分不出而 OOM,随后
+ *  Rust panic 递归损坏 String,NtWriteFile 野性转储 55MB 踩穿
+ *  未映射页 #PF(rip=shim_NtWriteFile+0x30).地址有序空闲链表使
+ *  "物理相邻"等价于"链相邻",前后向合并即可完备回收.
+ *
+ *  (egui 字体 + 每帧 tessellation 缓冲实测 8MB 会在第 3 帧 OOM,扩到 32MB;
+ *   arena 总 64MB,PE 镜像~3MB + 栈 1MB + DIB ~6MB,余量充足.)
  * ========================================================== */
 
-#define SHIM_HEAP_BYTES (8ULL * 1024ULL * 1024ULL)
+#define SHIM_HEAP_BYTES (32ULL * 1024ULL * 1024ULL)
 #define HEAP_HDR 32
 
 typedef struct heap_blk {
@@ -388,6 +442,7 @@ typedef struct heap_blk {
 
 static u8 *g_heap_region;
 static heap_blk *g_heap_free_head;
+static u64 g_heap_live;   /* 已分配字节合计(诊断:区分真泄漏与碎片化) */
 
 static void shim_heap_init_once(void) {
     if (g_heap_region) return;
@@ -404,57 +459,88 @@ static void shim_heap_init_once(void) {
     g_heap_free_head = b;
 }
 
+/* 大/小块阈值:egui 长寿命缓存块多为几十字节,每帧 tessellation 等
+ * 瞬态缓冲为 10-30KB.大块专取地址最高的适配块,使顶部连续区域免于
+ * 被小长寿块钉碎(实测无此策略时 2400 帧后 29.9MB 空闲碎成 6 万个
+ * 平均 500B 的片,free_max 只剩 10.2KB,10.8KB 请求即 OOM). */
+#define SHIM_HEAP_LARGE 2048ULL
+
 static void *shim_heap_alloc(u64 size) {
     shim_heap_init_once();
     if (!g_heap_region) return 0;
     if (size == 0) size = 16;
     size = (size + 15) & ~15ULL;
     heap_blk *prev = 0, *b = g_heap_free_head;
-    while (b) {
-        if (b->size >= size) {
-            if (prev) prev->next_free = b->next_free;
-            else g_heap_free_head = (heap_blk *)b->next_free;
-            /* 剩余足够再分一块则分割 */
-            if (b->size >= size + HEAP_HDR + 16) {
-                heap_blk *nb = (heap_blk *)((u8 *)b + HEAP_HDR + size);
-                nb->size = b->size - size - HEAP_HDR;
-                nb->used = 0;
-                nb->pad = 0;
-                nb->next_free = (u64)g_heap_free_head;
-                g_heap_free_head = nb;
-                b->size = size;
-            }
-            b->used = 1;
-            b->next_free = 0;
-            return (u8 *)b + HEAP_HDR;
+    heap_blk *cand = 0, *cand_prev = 0;
+    if (size < SHIM_HEAP_LARGE) {
+        /* 小块:首次适应(低地址优先)填碎洞,保护顶部大区域 */
+        while (b) {
+            if (b->size >= size) { cand = b; cand_prev = prev; break; }
+            prev = b; b = (heap_blk *)b->next_free;
         }
-        prev = b;
-        b = (heap_blk *)b->next_free;
+    } else {
+        /* 大块:取地址最高的适配块(地址有序链,最后一个适配者) */
+        while (b) {
+            if (b->size >= size) { cand = b; cand_prev = prev; }
+            prev = b; b = (heap_blk *)b->next_free;
+        }
+    }
+    b = cand; prev = cand_prev;
+    if (b) {
+        /* 摘除 b;分割时余量 nb 占据 b 原链位即可保持地址有序
+         * (nb=b+HEAP_HDR+size < 原后继:后继不与 b 重叠 => 后继>=b 块尾 > nb) */
+        if (prev) prev->next_free = b->next_free;
+        else g_heap_free_head = (heap_blk *)b->next_free;
+        if (b->size >= size + HEAP_HDR + 16) {
+            heap_blk *nb = (heap_blk *)((u8 *)b + HEAP_HDR + size);
+            nb->size = b->size - size - HEAP_HDR;
+            nb->used = 0;
+            nb->pad = 0;
+            nb->next_free = b->next_free;
+            if (prev) prev->next_free = (u64)nb;
+            else g_heap_free_head = nb;
+            b->size = size;
+        }
+        b->used = 1;
+        b->next_free = 0;
+        g_heap_live += b->size;
+        return (u8 *)b + HEAP_HDR;
+    }
+    /* OOM 诊断:live 持续增长=真泄漏;live 平稳而 free_max 萎缩=碎片化 */
+    u64 ft = 0, fm = 0, fc = 0;
+    for (heap_blk *f = g_heap_free_head; f; f = (heap_blk *)f->next_free) {
+        ft += f->size; if (f->size > fm) fm = f->size; fc++;
     }
     log_error("[shim] heap OOM");
     log_hex64("[shim] heap req=", size);
+    log_hex64("[shim] heap live=", g_heap_live);
+    log_hex64("[shim] heap free_total=", ft);
+    log_hex64("[shim] heap free_max=", fm);
+    log_hex64("[shim] heap free_blocks=", fc);
     return 0;
 }
 
 static void shim_heap_free(void *ptr) {
     if (!ptr) return;
     heap_blk *b = (heap_blk *)((u8 *)ptr - HEAP_HDR);
+    g_heap_live -= b->size;
     b->used = 0;
-    /* 前向合并:物理下一块若空闲则吸收 */
-    heap_blk *nb = (heap_blk *)((u8 *)b + HEAP_HDR + b->size);
-    if ((u8 *)nb >= g_heap_region && (u8 *)nb < g_heap_region + SHIM_HEAP_BYTES
-        && !nb->used && nb->size) {
-        /* 从空闲链摘除 nb */
-        heap_blk *prev = 0, *x = g_heap_free_head;
-        while (x && x != nb) { prev = x; x = (heap_blk *)x->next_free; }
-        if (x == nb) {
-            if (prev) prev->next_free = nb->next_free;
-            else g_heap_free_head = (heap_blk *)nb->next_free;
-            b->size += HEAP_HDR + nb->size;
-        }
+    /* 地址升序插入空闲链表:prev < b < x(x 可为 0 表尾) */
+    heap_blk *prev = 0, *x = g_heap_free_head;
+    while (x && x < b) { prev = x; x = (heap_blk *)x->next_free; }
+    b->next_free = (u64)x;
+    if (prev) prev->next_free = (u64)b;
+    else g_heap_free_head = b;
+    /* 前向合并:x 与 b 物理相邻则吸收(地址有序 => 物理相邻即链相邻) */
+    if (x && (u8 *)b + HEAP_HDR + b->size == (u8 *)x) {
+        b->size += HEAP_HDR + x->size;
+        b->next_free = x->next_free;
     }
-    b->next_free = (u64)g_heap_free_head;
-    g_heap_free_head = b;
+    /* 后向合并:prev 与 b 物理相邻则把 b 并入 prev */
+    if (prev && (u8 *)prev + HEAP_HDR + prev->size == (u8 *)b) {
+        prev->size += HEAP_HDR + b->size;
+        prev->next_free = b->next_free;
+    }
 }
 
 static void *shim_heap_realloc(void *ptr, u64 size) {
@@ -503,11 +589,13 @@ static void shim_tsc_init(void) {
 
 static u64 __attribute__((ms_abi)) shim_QueryPerformanceFrequency(u64 freq_ptr) {
     shim_tsc_init();
+    freq_ptr = gp(freq_ptr);
     if (freq_ptr) *(u64 *)freq_ptr = g_tsc_per_ms * 1000;
     return 1;
 }
 static u64 __attribute__((ms_abi)) shim_QueryPerformanceCounter(u64 count_ptr) {
     shim_tsc_init();
+    count_ptr = gp(count_ptr);
     if (count_ptr) *(u64 *)count_ptr = shim_rdtsc();
     return 1;
 }
@@ -524,6 +612,7 @@ static u64 __attribute__((ms_abi)) shim_Sleep(u64 ms) {
 
 /* SYSTEM_INFO(x64,48 字节) */
 static u64 __attribute__((ms_abi)) shim_GetSystemInfo(u64 si_p) {
+    si_p = gp(si_p);
     if (!si_p) return 0;
     u8 *p = (u8 *)si_p;
     for (int i = 0; i < 48; i++) p[i] = 0;
@@ -548,7 +637,7 @@ static u64 __attribute__((ms_abi)) shim_WriteConsoleW(u64 handle, u64 buf, u64 n
                                                        u64 written_ptr, u64 reserved) {
     (void)reserved;
     if (handle != SHIM_STDOUT_HANDLE && handle != SHIM_STDERR_HANDLE) return 0;
-    const u16 *s = (const u16 *)buf;
+    const u16 *s = (const u16 *)gp(buf);
     for (u64 i = 0; i < nchars; i++) {
         u32 c = s[i];
         if (c < 0x80) {
@@ -562,12 +651,14 @@ static u64 __attribute__((ms_abi)) shim_WriteConsoleW(u64 handle, u64 buf, u64 n
             serial_putc((char)(0x80 | (c & 0x3F)));
         }
     }
+    written_ptr = gp(written_ptr);
     if (written_ptr) *(u32 *)written_ptr = (u32)nchars;
     return 1;
 }
 
 static u64 __attribute__((ms_abi)) shim_GetCurrentDirectoryW(u64 buflen, u64 buf) {
     static const u16 cwd[] = { 'C', ':', '\\', 0 };
+    buf = gp(buf);
     if (!buf || buflen < 4) return 4;  /* 需要 4 个字符(含 NUL) */
     u16 *out = (u16 *)buf;
     for (int i = 0; i < 4; i++) out[i] = cwd[i];
@@ -603,6 +694,7 @@ static u64 __attribute__((ms_abi)) shim_FormatMessageW(u64 flags, u64 src, u64 m
 }
 
 static u64 __attribute__((ms_abi)) shim_LoadLibraryA(u64 name_p) {
+    name_p = gp(name_p);
     if (!name_p) return 0;
     const char *n = (const char *)name_p;
     /* 已知 DLL 返回伪句柄(大小写不敏感子串匹配) */
@@ -625,7 +717,7 @@ static u64 __attribute__((ms_abi)) shim_LoadLibraryA(u64 name_p) {
 }
 
 static u64 __attribute__((ms_abi)) shim_lstrlenW(u64 str_p) {
-    const u16 *s = (const u16 *)str_p;
+    const u16 *s = (const u16 *)gp(str_p);
     u64 n = 0;
     if (s) while (s[n]) n++;
     return n;
@@ -636,6 +728,7 @@ static u64 __attribute__((ms_abi)) shim_lstrlenW(u64 str_p) {
  * Rust std 用它动态探测 Rtl 系列/dbghelp API,命中返回真实 shim 地址,miss 返回 0。 */
 static u64 __attribute__((ms_abi)) shim_GetProcAddress(u64 module, u64 name_p) {
     (void)module;
+    name_p = gp(name_p);
     if (!name_p) return 0;
     if ((name_p >> 16) == 0) {          /* ordinal 导入 */
         g_last_error = 127;             /* ERROR_PROC_NOT_FOUND */
@@ -660,12 +753,13 @@ static u64 __attribute__((ms_abi)) shim_GetProcAddress(u64 module, u64 name_p) {
 
 /* Rtl* — Rust panic/unwind 机制引用(panic=abort 下不会真正走到) */
 static u64 __attribute__((ms_abi)) shim_RtlCaptureContext(u64 ctx_p) {
-    u8 *p = (u8 *)ctx_p;
+    u8 *p = (u8 *)gp(ctx_p);
     if (p) for (int i = 0; i < 1232; i++) p[i] = 0;  /* x64 CONTEXT ≈ 1232B */
     return 0;
 }
 static u64 __attribute__((ms_abi)) shim_RtlLookupFunctionEntry(u64 rip, u64 base_p, u64 table_p) {
     (void)rip;
+    base_p = gp(base_p); table_p = gp(table_p);
     if (base_p) *(u64 *)base_p = 0;
     if (table_p) *(u64 *)table_p = 0;
     return 0;
@@ -680,8 +774,8 @@ static u64 __attribute__((ms_abi)) shim_RtlVirtualUnwind(u64 a, u64 b, u64 c, u6
 static u64 __attribute__((ms_abi)) shim_MultiByteToWideChar(u64 cp, u64 flags, u64 mbs_p,
                                                              u64 cbmb, u64 wbuf_p, u64 cchw) {
     (void)flags;
-    const u8 *s = (const u8 *)mbs_p;
-    u16 *out = (u16 *)wbuf_p;
+    const u8 *s = (const u8 *)gp(mbs_p);
+    u16 *out = (u16 *)gp(wbuf_p);
     i64 remain = (i64)cbmb;  /* -1 = NUL 结尾 */
     u64 need = 0;
     if (!s) return 0;
@@ -730,10 +824,11 @@ static u64 __attribute__((ms_abi)) shim_WideCharToMultiByte(u64 cp, u64 flags, u
                                                              u64 cchw, u64 mbs_p, u64 cbmb,
                                                              u64 defc, u64 used_p) {
     (void)flags; (void)defc;
-    const u16 *s = (const u16 *)ws_p;
-    u8 *out = (u8 *)mbs_p;
+    const u16 *s = (const u16 *)gp(ws_p);
+    u8 *out = (u8 *)gp(mbs_p);
     i64 remain = (i64)cchw;  /* -1 = NUL 结尾 */
     u64 need = 0;
+    used_p = gp(used_p);
     if (used_p) *(u32 *)used_p = 0;
     if (!s) return 0;
     for (;;) {
@@ -785,8 +880,9 @@ static u64 __attribute__((ms_abi)) shim_NtWriteFile(u64 fh, u64 ev, u64 apc_r, u
                                                      u64 off, u64 key) {
     (void)ev; (void)apc_r; (void)apc_c; (void)off; (void)key;
     if (fh == SHIM_STDOUT_HANDLE || fh == SHIM_STDERR_HANDLE) {
-        shim_output((const char *)buf, len);
+        shim_output((const char *)gp(buf), len);
     }
+    iosb = gp(iosb);
     if (iosb) {  /* IO_STATUS_BLOCK: {NTSTATUS Status; ULONG_PTR Information} */
         ((u64 *)iosb)[0] = 0;
         ((u64 *)iosb)[1] = len;
@@ -799,7 +895,7 @@ static u64 __attribute__((ms_abi)) shim_RtlNtStatusToDosError(u64 status) {
 
 static u64 __attribute__((ms_abi)) shim_ProcessPrng(u64 buf, u64 len) {
     u64 s = shim_rdtsc() ^ 0x9E3779B97F4A7C15ULL;
-    u8 *p = (u8 *)buf;
+    u8 *p = (u8 *)gp(buf);
     for (u64 i = 0; i < len; i++) {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;  /* xorshift64 */
         p[i] = (u8)(s & 0xFF);
@@ -815,7 +911,7 @@ static u64 __attribute__((ms_abi)) shim_WaitOnAddress(u64 addr, u64 expected, u6
 static u64 __attribute__((ms_abi)) shim_WakeByAddress(u64 addr) { (void)addr; return 0; }
 
 /* ============================================================
- *  user32.dll — 单窗口 + 消息泵(PS/2 键盘轮询)
+ *  user32.dll — 单窗口 + 消息泵(PS/2 键盘 + AUX 鼠标轮询)
  * ========================================================== */
 
 #define SHIM_HWND      0x20000001ULL
@@ -827,6 +923,19 @@ static u64 __attribute__((ms_abi)) shim_WakeByAddress(u64 addr) { (void)addr; re
 #define SHIM_WM_KEYDOWN   0x0100u
 #define SHIM_WM_KEYUP     0x0101u
 #define SHIM_WM_CHAR      0x0102u
+#define SHIM_WM_MOUSEMOVE    0x0200u
+#define SHIM_WM_LBUTTONDOWN  0x0201u
+#define SHIM_WM_LBUTTONUP    0x0202u
+#define SHIM_WM_RBUTTONDOWN  0x0204u
+#define SHIM_WM_RBUTTONUP    0x0205u
+#define SHIM_WM_MBUTTONDOWN  0x0207u
+#define SHIM_WM_MBUTTONUP    0x0208u
+/* wparam MK_* 修饰位 */
+#define SHIM_MK_LBUTTON   0x0001u
+#define SHIM_MK_RBUTTON   0x0002u
+#define SHIM_MK_SHIFT     0x0004u
+#define SHIM_MK_CONTROL   0x0008u
+#define SHIM_MK_MBUTTON   0x0010u
 
 static u64 g_wnd_proc = 0;
 static int g_wnd_created = 0;
@@ -846,8 +955,13 @@ typedef struct {
 static shim_msg_t g_msgq[SHIM_MSGQ_CAP];
 static int g_mq_head = 0, g_mq_count = 0;
 
-static void shim_msg_push(u32 msg, u64 w, u64 l) {
-    if (g_mq_count >= SHIM_MSGQ_CAP) return;  /* 满则丢弃 */
+static u32 g_mq_drops = 0;  /* 队列满丢弃计数(诊断) */
+
+static void shim_msg_push_pt(u32 msg, u64 w, u64 l, i32 ptx, i32 pty) {
+    if (g_mq_count >= SHIM_MSGQ_CAP) {
+        if (g_mq_drops < 4) { g_mq_drops++; log_hex64("[shim] msgq drop msg=", msg); }
+        return;
+    }
     int idx = (g_mq_head + g_mq_count) % SHIM_MSGQ_CAP;
     g_msgq[idx].hwnd = SHIM_HWND;
     g_msgq[idx].message = msg;
@@ -856,9 +970,13 @@ static void shim_msg_push(u32 msg, u64 w, u64 l) {
     g_msgq[idx].lparam = l;
     g_msgq[idx].time = 0;
     g_msgq[idx].pad1 = 0;
-    g_msgq[idx].ptx = 0;
-    g_msgq[idx].pty = 0;
+    g_msgq[idx].ptx = ptx;
+    g_msgq[idx].pty = pty;
     g_mq_count++;
+}
+
+static void shim_msg_push(u32 msg, u64 w, u64 l) {
+    shim_msg_push_pt(msg, w, l, 0, 0);
 }
 
 /* PS/2 键盘状态 */
@@ -895,9 +1013,15 @@ static u32 shim_scan_vk(u8 sc, int e0) {
         default: return 0;
         }
     }
-    if (sc >= 0x10 && sc <= 0x19) return 'Q' + (sc - 0x10);
-    if (sc >= 0x1E && sc <= 0x26) return 'A' + (sc - 0x1E);
-    if (sc >= 0x2C && sc <= 0x32) return 'Z' + (sc - 0x2C);
+    /* 字母三行:scancode 顺序与 ASCII 序不一致(QWERTY 布局),且 'Z'+1='['
+     * 在 ASCII 中不连续,必须用显式表,不能算术偏移(此前 shift-b 出 0x5E). */
+    static const u8 vk_row_q[10] = { 'Q','W','E','R','T','Y','U','I','O','P' };
+    static const u8 vk_row_a[9]  = { 'A','S','D','F','G','H','J','K','L' };
+    static const u8 vk_row_z[7]  = { 'Z','X','C','V','B','N','M' };
+    if (sc >= 0x10 && sc <= 0x19) return vk_row_q[sc - 0x10];
+    if (sc >= 0x1E && sc <= 0x26) return vk_row_a[sc - 0x1E];
+    if (sc >= 0x2C && sc <= 0x32) return vk_row_z[sc - 0x2C];
+    /* 数字行 scancode 与 ASCII 均连续,算术偏移正确 */
     if (sc >= 0x02 && sc <= 0x0A) return '1' + (sc - 0x02);
     if (sc == 0x0B) return '0';
     switch (sc) {
@@ -913,13 +1037,134 @@ static u32 shim_scan_vk(u8 sc, int e0) {
     }
 }
 
+/* 前向声明(shim_fb 定义在下方 RegisterClassExW 之后) */
+static const struct limine_framebuffer *shim_fb(void);
+
+/* ============================================================
+ *  PS/2 AUX 鼠标(轮询模式,无 IRQ12)
+ *
+ *  初始化:on-demand(首次消息泵轮询时执行),启用 AUX 端口 +
+ *  清配置字节 bit5(启用 AUX 时钟) + 发 0xF4 启用数据报告.
+ *  全程超时保护:任何单步失败只记日志并永久禁用鼠标,绝不阻塞
+ *  GUI 主循环.包解码:3 字节(同步位 bit3 校验,9 位有符号位移,
+ *  溢出位丢弃位移),坐标钳位到帧缓冲,边沿合成鼠标消息.
+ * ========================================================== */
+
+static int s_mouse_inited = 0;
+static int s_mouse_ok = 0;
+static i32 s_mouse_x = 512, s_mouse_y = 384;  /* 屏幕坐标 */
+static u8 s_mouse_btn = 0;                     /* bit0=L bit1=R bit2=M */
+static u8 s_mpkt[3];
+static int s_mpkt_n = 0;
+static int s_dbg_aux = 0;   /* 调试:前 16 个 AUX 字节计数 */
+static int s_dbg_pkt = 0;   /* 调试:前 8 个完整包计数 */
+static int s_dbg_key = 0;   /* 调试:前 16 个键盘消息计数(KEYDOWN/KEYUP/CHAR) */
+
+static int ps2_wait_ibf_clear(u32 spins) {
+    while (spins--) { if (!(inb(0x64) & 2)) return 0; }
+    return -1;
+}
+static int ps2_wait_obf_set(u32 spins) {
+    while (spins--) { if (inb(0x64) & 1) return 0; }
+    return -1;
+}
+/* 经 0xD4 转发命令到鼠标并等 ACK(0xFA) */
+static int ps2_aux_cmd(u8 v) {
+    if (ps2_wait_ibf_clear(100000) < 0) return -1;
+    outb(0x64, 0xD4);
+    if (ps2_wait_ibf_clear(100000) < 0) return -1;
+    outb(0x60, v);
+    if (ps2_wait_obf_set(100000) < 0) return -1;
+    return inb(0x60) == 0xFA ? 0 : -1;
+}
+
+static void shim_mouse_init_once(void) {
+    if (s_mouse_inited) return;
+    s_mouse_inited = 1;
+    /* 排空控制器残留输出字节 */
+    for (int i = 0; i < 16 && (inb(0x64) & 1); i++) (void)inb(0x60);
+    /* 启用 AUX 端口 */
+    if (ps2_wait_ibf_clear(100000) < 0) { log_warn("[shim] mouse: ctrl busy"); return; }
+    outb(0x64, 0xA8);
+    /* 读配置字节:清 bit5(启用 AUX 时钟),置 bit1(IRQ12 允许,轮询下无害) */
+    if (ps2_wait_ibf_clear(100000) < 0) { log_warn("[shim] mouse: ctrl busy2"); return; }
+    outb(0x64, 0x20);
+    if (ps2_wait_obf_set(100000) < 0) { log_warn("[shim] mouse: no cfg byte"); return; }
+    u8 cfg = inb(0x60);
+    cfg = (u8)((cfg & ~0x20u) | 0x02u);
+    if (ps2_wait_ibf_clear(100000) < 0) { log_warn("[shim] mouse: cfg wbusy"); return; }
+    outb(0x64, 0x60);
+    if (ps2_wait_ibf_clear(100000) < 0) { log_warn("[shim] mouse: cfg wbusy2"); return; }
+    outb(0x60, cfg);
+    /* 启用流模式数据报告 */
+    if (ps2_aux_cmd(0xF4) < 0) { log_warn("[shim] mouse: enable-report nack"); return; }
+    s_mouse_ok = 1;
+    log_info("[shim] mouse init ok (AUX streaming, polled)");
+}
+
+/* 鼠标 1 字节 -> 3 字节包 -> Win32 消息 */
+static void shim_mouse_byte(u8 b) {
+    if (s_mpkt_n == 0 && !(b & 0x08)) return;  /* byte0 同步位(bit3)必须为 1,否则丢弃重同步 */
+    s_mpkt[s_mpkt_n++] = b;
+    if (s_mpkt_n < 3) return;
+    s_mpkt_n = 0;
+
+    u8 f = s_mpkt[0];
+    i32 dx = (i32)s_mpkt[1] - ((f & 0x10) ? 0x100 : 0);  /* 9 位有符号位移 */
+    i32 dy = (i32)s_mpkt[2] - ((f & 0x20) ? 0x100 : 0);
+    if (f & 0x40) dx = 0;  /* X 溢出:位移不可信,只取按钮 */
+    if (f & 0x80) dy = 0;  /* Y 溢出 */
+    if (s_dbg_pkt < 8) {
+        s_dbg_pkt++;
+        log_hex64("[shim] mpkt f=", f);
+        log_hex64("[shim] mpkt dx=", (u64)(i64)dx);
+        log_hex64("[shim] mpkt dy=", (u64)(i64)dy);
+    }
+
+    const struct limine_framebuffer *fb = shim_fb();
+    i32 fw = fb ? (i32)fb->width : 1024;
+    i32 fh = fb ? (i32)fb->height : 768;
+    i32 nx = s_mouse_x + dx;
+    i32 ny = s_mouse_y - dy;  /* PS/2 Y 向前(屏幕上方向)为正 -> 屏幕坐标取反 */
+    if (nx < 0) nx = 0; else if (nx >= fw) nx = fw - 1;
+    if (ny < 0) ny = 0; else if (ny >= fh) ny = fh - 1;
+
+    u8 nbtn = (u8)(f & 0x07);
+    i32 cx = nx - g_wnd_x, cy = ny - g_wnd_y;  /* 客户区坐标(消息 lparam) */
+    u64 lp = (u64)(u32)(((u32)(u16)cy << 16) | (u32)(u16)cx);
+    u64 mk = 0;
+    if (nbtn & 1) mk |= SHIM_MK_LBUTTON;
+    if (nbtn & 2) mk |= SHIM_MK_RBUTTON;
+    if (nbtn & 4) mk |= SHIM_MK_MBUTTON;
+    if (s_kbd_shift) mk |= SHIM_MK_SHIFT;
+    if (s_kbd_ctrl) mk |= SHIM_MK_CONTROL;
+
+    if (nx != s_mouse_x || ny != s_mouse_y) {
+        s_mouse_x = nx; s_mouse_y = ny;
+        shim_msg_push_pt(SHIM_WM_MOUSEMOVE, mk, lp, nx, ny);
+    }
+    /* 按钮边沿(按钮事件罕见,逐一打点:msg/客户区坐标) */
+    if ((nbtn & 1) && !(s_mouse_btn & 1)) { shim_msg_push_pt(SHIM_WM_LBUTTONDOWN, mk, lp, nx, ny); log_hex64("[shim] LDOWN lp=", lp); }
+    if (!(nbtn & 1) && (s_mouse_btn & 1)) { shim_msg_push_pt(SHIM_WM_LBUTTONUP, mk, lp, nx, ny); log_hex64("[shim] LUP   lp=", lp); }
+    if ((nbtn & 2) && !(s_mouse_btn & 2)) shim_msg_push_pt(SHIM_WM_RBUTTONDOWN, mk, lp, nx, ny);
+    if (!(nbtn & 2) && (s_mouse_btn & 2)) shim_msg_push_pt(SHIM_WM_RBUTTONUP, mk, lp, nx, ny);
+    if ((nbtn & 4) && !(s_mouse_btn & 4)) shim_msg_push_pt(SHIM_WM_MBUTTONDOWN, mk, lp, nx, ny);
+    if (!(nbtn & 4) && (s_mouse_btn & 4)) shim_msg_push_pt(SHIM_WM_MBUTTONUP, mk, lp, nx, ny);
+    s_mouse_btn = nbtn;
+}
+
 /* 排空 PS/2 输出缓冲,转成 Win32 消息入队 */
 static void shim_kbd_poll(void) {
+    shim_mouse_init_once();
     for (;;) {
         u8 st = inb(0x64);
         if (!(st & 1)) break;
         u8 sc = inb(0x60);
-        if (st & 0x20) continue;      /* 鼠标字节丢弃 */
+        if (st & 0x20) {
+            if (s_dbg_aux < 16) { s_dbg_aux++; log_hex64("[shim] aux byte=", sc); }
+            if (s_mouse_ok) shim_mouse_byte(sc);
+            continue;
+        }
         if (sc == 0xE0) { s_kbd_e0 = 1; continue; }
         int e0 = s_kbd_e0;
         if (!e0) {
@@ -933,18 +1178,25 @@ static void shim_kbd_poll(void) {
         s_kbd_e0 = 0;
         if (sc & 0x80) {
             u32 vk = shim_scan_vk(sc & 0x7F, e0);
-            if (vk) shim_msg_push(SHIM_WM_KEYUP, vk, sc);
+            if (vk) {
+                shim_msg_push(SHIM_WM_KEYUP, vk, sc);
+                if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYUP vk=", vk); }
+            }
             continue;
         }
         u32 vk = shim_scan_vk(sc, e0);
         if (vk) {
             shim_msg_push(SHIM_WM_KEYDOWN, vk, sc);
+            if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYDOWN vk=", vk); }
             /* Esc -> 额外合成 WM_CLOSE:无鼠标环境下关闭窗口的唯一途径 */
             if (vk == 0x1B && !e0) shim_msg_push(SHIM_WM_CLOSE, 0, 0);
         }
         if (!e0) {
             char c = shim_scan_ascii(sc, s_kbd_shift);
-            if (c >= ' ' && c < 0x7F) shim_msg_push(SHIM_WM_CHAR, (u64)(u8)c, sc);
+            if (c >= ' ' && c < 0x7F) {
+                shim_msg_push(SHIM_WM_CHAR, (u64)(u8)c, sc);
+                if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] CHAR ch=", (u64)(u8)c); }
+            }
         }
     }
 }
@@ -1005,7 +1257,7 @@ static u64 __attribute__((ms_abi)) shim_SetCursor(u64 cur) {
     (void)cur; return SHIM_HCURSOR;
 }
 static u64 __attribute__((ms_abi)) shim_GetCursorPos(u64 pt_p) {
-    if (pt_p) { ((i32 *)pt_p)[0] = g_wnd_w / 2; ((i32 *)pt_p)[1] = g_wnd_h / 2; }
+    if (pt_p) { ((i32 *)pt_p)[0] = s_mouse_x; ((i32 *)pt_p)[1] = s_mouse_y; }
     return 1;
 }
 static u64 __attribute__((ms_abi)) shim_ScreenToClient(u64 hwnd, u64 pt_p) {
@@ -1163,6 +1415,50 @@ static u64 __attribute__((ms_abi)) shim_GdiFlush(void) { return 1; }
 
 static u64 g_blit_count = 0;
 
+/* 12x12 箭头软件光标:'X'=黑边 '#'=白心 '.'=透明.
+ * 设计:BitBlt 上屏后叠画;egui 每帧全量重绘,下一帧 BitBlt 自动覆盖旧光标,
+ * 无需保存/恢复背景.只在窗口矩形内绘制(越界裁剪),避免屏外残影. */
+static const char *const g_cursor_bmp[12] = {
+    "X...........",
+    "XX..........",
+    "X#X.........",
+    "X##X........",
+    "X###X.......",
+    "X####X......",
+    "X#####X.....",
+    "X######X....",
+    "X#######X...",
+    "X########X..",
+    "X####XXXX...",
+    "XXXX........",
+};
+
+static void shim_draw_cursor(const struct limine_framebuffer *fb) {
+    if (!s_mouse_ok || !g_wnd_created) return;
+    i32 wx1 = g_wnd_x + g_wnd_w, wy1 = g_wnd_y + g_wnd_h;
+    if (s_mouse_x < g_wnd_x || s_mouse_y < g_wnd_y) return;
+    if (s_mouse_x >= wx1 || s_mouse_y >= wy1) return;
+    u8 *fbb = (u8 *)fb->address;
+    for (i32 r = 0; r < 12; r++) {
+        i32 fy = s_mouse_y + r;
+        if (fy >= wy1 || fy >= (i32)fb->height) break;
+        u8 *rowb = fbb + (u64)fy * fb->pitch;
+        for (i32 c = 0; c < 12; c++) {
+            char ch = g_cursor_bmp[r][c];
+            if (ch != 'X' && ch != '#') continue;
+            i32 fx = s_mouse_x + c;
+            if (fx >= wx1 || fx >= (i32)fb->width) break;
+            if (fb->bpp == 32) {
+                ((u32 *)rowb)[fx] = (ch == '#') ? 0xFFFFFFFFu : 0xFF000000u;
+            } else {
+                u8 v = (ch == '#') ? 0xFF : 0x00;
+                u8 *p = rowb + (u64)fx * 3;
+                p[0] = v; p[1] = v; p[2] = v;
+            }
+        }
+    }
+}
+
 static u64 __attribute__((ms_abi)) shim_BitBlt(u64 dstdc, u64 x, u64 y, u64 cx, u64 cy,
                                                 u64 srcdc, u64 x1, u64 y1, u64 rop) {
     (void)rop;
@@ -1216,9 +1512,19 @@ static u64 __attribute__((ms_abi)) shim_BitBlt(u64 dstdc, u64 x, u64 y, u64 cx, 
             }
         }
     }
+    shim_draw_cursor(fb);
     g_blit_count++;
     if (g_blit_count == 1) log_info("[shim] BitBlt first frame on screen");
-    if ((g_blit_count % 600) == 0) log_hex64("[shim] BitBlt frames=", g_blit_count);
+    if ((g_blit_count % 600) == 0) {
+        log_hex64("[shim] BitBlt frames=", g_blit_count);
+        /* 堆健康度:live 逐周期线性增长=真泄漏;free_max 持续萎缩=碎片化 */
+        u64 fm = 0;
+        for (heap_blk *f = g_heap_free_head; f; f = (heap_blk *)f->next_free) {
+            if (f->size > fm) fm = f->size;
+        }
+        log_hex64("[shim] heap live=", g_heap_live);
+        log_hex64("[shim] heap free_max=", fm);
+    }
     return 1;
 }
 

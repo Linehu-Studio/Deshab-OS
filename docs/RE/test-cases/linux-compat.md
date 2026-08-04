@@ -38,6 +38,23 @@
 | exec daemon 先发 EXEC_READY 再 HLT | daemon 源码 [utsm_exec_daemon.c](../../CODE/linux/initramfs/bin/utsm_exec_daemon.c) | ⬜ |
 | UTSM hypercall ABI: RAX=magic\|op | 检查 [hypercall.c](../../CODE/UTSM/vmm/hypercall.c) 处理 | ⬜ |
 
+## 自动化脚本
+
+[tests/qemu/linux-compat.ps1](../../../tests/qemu/linux-compat.ps1) 动态检测 VMM 可用性，自动分流：
+
+```powershell
+.\tests\qemu\linux-compat.ps1              # QEMU WHPX：走路径 B（VMM unavailable 优雅降级）
+.\tests\qemu\linux-compat.ps1 -Cpu max     # 真机/KVM nested VMX：走路径 A（完整双内核流程）
+```
+
+- **路径 A**（guest VMX 可用）：按序断言 A5.1~A5.7 启动链锚点
+  （VMM init → self-test → bzImage → IPC shm → vmlaunch → `Linux version` → daemon park →
+  `[LNXC] service ready` → DSK），随后经 monitor 按键执行 `dsl` / `dsl ls` / `dsl uname -a` /
+  `dsl nosuchprog` 覆盖 A5.8~A5.12。
+- **路径 B**（QEMU WHPX/TCG 无 nested VMX，本环境预期）：断言 `[UTSM] VMM unavailable` 后
+  DSK 正常接管、dev_tests 完成、`dsl` 报告运行态不可用、Esc 到 desktop；
+  A5.1~A5.12 标记 SKIP（环境限制，非产品缺陷）。
+
 ## 已知限制
 
 - QEMU TCG 不支持 VMX，必须 WHPX 或真机

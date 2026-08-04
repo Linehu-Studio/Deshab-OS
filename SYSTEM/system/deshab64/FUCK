@@ -40,6 +40,28 @@ ps2kbd=1
 ioapic_init=1
 # lapic_enable=0 可禁用 LAPIC software enable (留 firmware 状态)
 lapic_enable=1
+# B7: APIC 路由接管开关 (apic.drv 自解析, 缺失=0)
+# 0=保持 8259 PIC 路由 (默认, 现状不回归)
+# 1=IOAPIC->LAPIC 接管: 注册 LAPIC EOI 钩子 + PIC IMR 全屏蔽 + TPR=0
+#   + tick 链路自验 (vector 0x20, 失败自动完整降级回 PIC 并注销钩子)
+apic_route=0
+# B7 阶段2: 随 apic_route=1 额外放开 legacy IRQ1(键盘)/12(鼠标)/11(e1000)
+# UTSM EOI 钩子已落地, 这些线可持续投递 (ISA 线 edge/high, e1000 强制
+# level/active-low 按 PCI INTx 规范), 默认 0 关闭
+# QEMU 全链路已验证 (B1 向导按键/B2 启动/e1000 IRQ11), 真机冒烟前可回 0
+apic_route_legacy=1
+# B7 阶段3: NVMe MSI/MSI-X 中断驱动开关 (nvme.drv 自解析, 缺失=1)
+# 1=自动尝试: 先 MSI cap, 缺则 MSI-X (QEMU nvme 只有 MSI-X) — 表项编程
+#   + 动态向量 (0x40-0xDF 池) + Create IOCQ IEN=1/IV=0 + INTMC 解除;
+#   任何前提缺失 (无 MSI/MSI-X cap/旧内核无向量分配器/回读不符)
+#   自动回退纯轮询, 行为与旧版一致
+# 0=强制纯轮询 (CQE phase bit), 与 B7 阶段3 之前完全一致
+nvme_msi=1
+# B7 诊断 (apic.drv): 1=启用 HPET 绝对时基对拍 (tick 2x 定论实验) +
+# IRQ12 鼠标流观察窗 (配合 QEMU monitor mouse_move), 只增观测不改路由语义
+# 每次启动 +10s (6s 观察窗), 定论已完成 (PIT mode3 IOAPIC edge 双触发
+# ~200Hz), 常规构建保持 0
+apic_diag=0
 
 [utsm]
 max_segments=1024

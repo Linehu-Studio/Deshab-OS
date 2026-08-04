@@ -136,7 +136,7 @@ DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解
 
 当前已实现 14 个真实 DKM 驱动：
 - **timer** (stage0): PIT 校准, 100ms busy-wait demo
-- **apic** (stage0): CPUID Local APIC 探测, IA32_APIC_BASE MSR, ACPI MADT 枚举, LAPIC MMIO 只读寄存器验证；当前保留 PIC IRQ 路由
+- **apic** (stage0): CPUID Local APIC 探测, IA32_APIC_BASE MSR, ACPI MADT 枚举, LAPIC enable + IOAPIC 重定向表编程（ISO 表感知）; B7: FUCK `apic_route=1` 时 IOAPIC→LAPIC 接管（注册 UTSM LAPIC EOI 钩子 + PIC 全屏蔽 + TPR=0 + tick vec 0x20 链路自验，失败自动完整降级回 PIC）; `apic_route_legacy=1` 额外放开 IRQ1/12/11 持续投递（e1000 强制 level/active-low）; `apic_diag=1` HPET 绝对时基对拍 + 键鼠流观察窗
 - **acpi** (stage0): Limine RSDP → XSDT, ACPI 表枚举
 - **pci** (stage0): PCI config space 扫描, 设备枚举
 - **console_fb** (stage1): Limine framebuffer, 淡蓝色背景清屏（原四色圆弧加载环已移除，启动画面改由 DSK 静态 Logo 接管）
@@ -150,16 +150,16 @@ DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解
 - **e1000** (stage3): PCI `8086:10d3` 探测, BAR0 HHDM MMIO 映射, MAC 读取, IRQ 注册, 基础 link setup
 - **virtio_net** (stage3): PCI virtio-net `1af4:1001` 探测, BAR 枚举, modern virtio PCI capability 枚举；暂不进行 feature negotiation / virtqueue / 收发包
 
-当前内核平台能力：IDT 0–47 stub、异常处理、PIC remap 到 `0x20–0x2f`、IRQ handler 注册与 EOI、Limine RSDP/framebuffer/module/HHDM request。
+当前内核平台能力：IDT 0–255 stub 全覆盖、异常处理、PIC remap 到 `0x20–0x2f`、IRQ handler 注册与 EOI、UTSM 侧 LAPIC EOI 钩子（`idt_register_apic_eoi`，IRQ 分发末尾调用，spurious 0xFF 特判跳过）、IOAPIC→LAPIC 路由接管（B7，legacy IRQ1/12/11 可持续投递）、Limine RSDP/framebuffer/module/HHDM request。
 
-kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bpp, boot_modules_response, irq_register, hhdm_offset, dma.alloc_pages。
+kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bpp, boot_modules_response, irq_register, hhdm_offset, dma.alloc_pages, block provider registry, mmio/mm_map_mmio/mm_unmap_mmio, register_apic_eoi（尾部追加，ABI 兼容）。
 
 当前 manifest 中 14 个外部 `.drv` 均已替换为真实 DKM 驱动并可加载执行。
 
 下一阶段优先路线：
 1. **内存与 MMIO 基础设施**: 实现物理页分配器、页表映射接口、低位/高位 PCI MMIO 映射，解决 NVMe 4G 以上 BAR 和后续 DMA 映射问题。
 2. **DMA 与块设备数据路径**: 建立 contiguous DMA buffer、cache/屏障约定、PRDT/队列内存管理，然后推进 AHCI IDENTIFY/READ 与 NVMe admin queue/identify。
-3. **IRQ 后端升级**: 在现有 PIC fallback 稳定基础上扩展 IDT/vector allocator/APIC EOI/IOAPIC redirection，逐步迁移设备 IRQ，最后接入 MSI/MSI-X。
+3. **IRQ 后端升级**: ~~APIC EOI/IOAPIC redirection~~（B7 已完成：UTSM EOI 钩子 + legacy IRQ1/12/11 持续投递，QEMU 全链路验证；tick 2x 定论 = PIT mode3 IOAPIC edge 双触发 ~200Hz）。剩余：vector allocator 规范化、设备 IRQ 从 PIC 默认全面迁移、MSI/MSI-X（e1000/NVMe）。
 4. **网络数据路径**: 在 DMA/IRQ 完成后推进 e1000 RX/TX ring 与 virtio-net feature negotiation/virtqueue/RX-TX。
 5. **VFS 与真实块设备接入**: 将 FAT32 从测试镜像迁移到 AHCI/NVMe block provider，完善挂载、读取、目录遍历和错误路径。
 6. **DKM 工程化收尾**: 统一驱动本地 ABI 头、清理 warning、补充自动化 QEMU 场景（e1000/virtio-net/nvme/ahci）。

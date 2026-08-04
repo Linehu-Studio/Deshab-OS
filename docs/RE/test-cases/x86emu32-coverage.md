@@ -84,3 +84,36 @@
 ```
 
 目标：核心指令（MOV/ADD/SUB/CMP/JMP/CALL/RET/PUSH/POP）覆盖率 100%。
+
+## 自动化脚本
+
+[tests/qemu/x86emu32-coverage.ps1](../../../tests/qemu/x86emu32-coverage.ps1) 两层验证：
+
+```powershell
+.\tests\qemu\x86emu32-coverage.ps1            # 复用现有镜像
+.\tests\qemu\x86emu32-coverage.ps1 -Build     # 先全量构建再测
+```
+
+1. **静态枚举**（无需 QEMU）：解析 [x86emu32.c](../../CODE/UTSM/pe/x86emu32.c) 统计
+   `case 0xNN` 操作码分支数（覆盖率分母，含 0F 扩展页），并校验 hello32.exe 头
+   （machine=0x14C / optional magic=0x10B，确为 PE32 样本）。
+2. **动态执行**：正常启动 → cmd.elf，AUTOEXEC.BAT 执行 `pe HELLO32.EXE` + `exit`。
+   自动断言 `[PE] running PE32 via x86emu32` 解释器接管；禁止 `[PE32] emulator error` /
+   `[PE] unimplemented import` / `[PE] unimplemented API called` / `[PANIC]`。
+   注意 `[PE] PE32 (32-bit)` 仅 PE32+ 原生路径（pe_load_image）输出，解释器路径
+   （pe32_load_into）不打印该行，不可作锚点。
+
+   BUG-20260801-006/007 已修复（[Bug记录.txt](../Bug记录.txt)），原软升级项已转
+   硬断言（回归守护）：`Hello from PE32!`（shim IAT 拦截输出）与
+   `[cmd] PE run end` → `[DSK] cmd.elf returned`（完整返回链）。
+
+   已知系统侧阻塞（2026-08-04 monitor 取证定案）：末锚点 `[DSK] cmd.elf returned`
+   当前必缺失。根因不在 PE 层——cmd `run_autoexec` 的 `data`/`size` 直指共享静态
+   缓冲 `f32_data`（fat32_io.h），首行 `pe HELLO32.EXE` 加载 PE 文件即覆盖剩余
+   脚本，`exit` 行丢失，cmd 停留交互主循环轮询键盘（guest 存活、无异常投递、
+   无三重故障）。反证：pe-compat 会话 C（`pe NONEXIST.EXE` + `exit`，文件未找到
+   不覆盖缓冲）返回链正常。待 cmd 侧修复（脚本先拷入私有缓冲再逐行执行）后
+   末锚点自动转绿。
+
+指令级逐条覆盖（上方矩阵 test_arith/test_logic/test_control/test_string）依赖
+CODE/tools/pe-samples/ 下尚未构建的分类测试 PE，标 MANUAL。

@@ -128,7 +128,11 @@ def build_pe32_plus():
     code_rva = 0x1000  # .text RVA
     main_rva = code_rva
     printf_iat_rva = code_rva + 0x200  # IAT 在 .text 后（同一 section 内，简化）
-    exitproc_iat_rva = printf_iat_rva + 8
+    # 注意：每个 import descriptor 的 thunk 数组必须 NULL 终止。
+    # printf thunk 占 0x200..0x207，0x208..0x20F 为 NULL 终止符，
+    # ExitProcess thunk 放 0x210（此前放 0x208 导致 desc0 的 thunk 数组
+    # 无 NULL 终止、加载器把 ExitProcess 误配到 msvcrt.dll）。
+    exitproc_iat_rva = printf_iat_rva + 16
 
     # 修正 lea rcx, [rip + msg]: msg 在 code[19] 之后（lea 7字节 + call 6 + xor 2 + call 6 + ret 1 = 22）
     msg_offset_in_code = 22
@@ -140,30 +144,41 @@ def build_pe32_plus():
     struct.pack_into('<i', code, 3, 15)
     # 修正 call [rip + printf_iat]: printf IAT 在 printf_iat_rva, call 后下一指令 RIP = main_rva + 13
     # disp32 = printf_iat_rva - (main_rva + 13) = 0x200 - 13 = 499
-    struct.pack_into('<i', code, 10, 0x200 - 13)
+    # 注意：call 指令在 code[7..12]（FF 15 + disp32），disp32 位于偏移 9；
+    # 此前误写偏移 10 → disp 变为 0x1F300 且覆盖 xor ecx,ecx 的 0x31 → 三重故障。
+    struct.pack_into('<i', code, 9, (printf_iat_rva - code_rva) - 13)
     # 修正 call [rip + exitproc]: ExitProcess IAT 在 exitproc_iat_rva, call 后下一指令 RIP = main_rva + 21
-    # disp32 = exitproc_iat_rva - (main_rva + 21) = 0x208 - 21 = 491
-    struct.pack_into('<i', code, 17, 0x208 - 21)
+    # disp32 = exitproc_iat_rva - (main_rva + 21)
+    struct.pack_into('<i', code, 17, (exitproc_iat_rva - code_rva) - 21)
 
     # IAT 8字节对齐填充
     while len(code) < 0x200:
         code += b'\x00'
-    # IAT 内容（指向 import 函数名 RVA）
+    # 注意：以下 RVA 都必须带 code_rva(0x1000) 偏置——此前写成裸缓冲区偏移
+    # (0x300/0x320/0x350/0x360/0x400)，导致 import 数据目录指向 headers 区、
+    # rva_to_offset 解析失败、IAT 永远不被 shim 修补，call [IAT] 跳到 0x300
+    # → #PF → DSK 阶段异常无法投递 → 三重故障（QEMU -d int 实测定案）。
+    printf_name_rva = code_rva + 0x300    # 0x1300
+    exitproc_name_rva = code_rva + 0x320  # 0x1320
+    msvcrt_dll_rva = code_rva + 0x350     # 0x1350
+    kernel32_dll_rva = code_rva + 0x360   # 0x1360
+    import_desc_rva = code_rva + 0x400    # 0x1400
+
+    # IAT 内容（指向 import 函数名 RVA），每个 descriptor 的 thunk 数组 NULL 终止
     iat_data = bytearray()
-    iat_data += struct.pack('<Q', 0x300)   # printf function name RVA (hint+name 表)
-    iat_data += struct.pack('<Q', 0x320)   # ExitProcess function name RVA
+    iat_data += struct.pack('<Q', printf_name_rva)    # printf function name RVA (hint+name 表)
+    iat_data += struct.pack('<Q', 0)                  # desc0 thunk 数组 NULL 终止
+    iat_data += struct.pack('<Q', exitproc_name_rva)  # ExitProcess function name RVA
+    iat_data += struct.pack('<Q', 0)                  # desc1 thunk 数组 NULL 终止
     code += iat_data
 
-    # Import descriptor 数据
-    import_desc_rva = 0x400  # 在 IAT 后
+    # Import descriptor 数据（在 IAT 后）
     while len(code) < 0x300:
         code += b'\x00'
 
     # Hint/Name 表
     # "msvcrt.dll\0" + printf name "printf\0"
     # "kernel32.dll\0" + ExitProcess name "ExitProcess\0"
-    printf_name_rva = 0x300
-    exitproc_name_rva = 0x320
     printf_hint_name = struct.pack('<H', 0) + b'printf\0'    # hint=0
     exitproc_hint_name = struct.pack('<H', 0) + b'ExitProcess\0'
     while len(code) < printf_name_rva - code_rva:
@@ -174,8 +189,6 @@ def build_pe32_plus():
     code += exitproc_hint_name
 
     # DLL 名（放在 import descriptor 之后）
-    msvcrt_dll_rva = 0x350
-    kernel32_dll_rva = 0x360
     while len(code) < msvcrt_dll_rva - code_rva:
         code += b'\x00'
     code += b'msvcrt.dll\0'
@@ -324,7 +337,11 @@ def build_pe32():
     code_rva = 0x1000
     main_rva = code_rva
     printf_iat_rva = code_rva + 0x200       # 0x1200
-    exitproc_iat_rva = printf_iat_rva + 4    # 0x1204 (4-byte thunk)
+    # 注意：每个 import descriptor 的 thunk 数组必须 NULL 终止。
+    # printf thunk 占 0x1200，0x1204 为 NULL 终止符，ExitProcess thunk 放 0x1208
+    # （此前放 0x1204 导致 desc0 thunk 数组无 NULL 终止，
+    #  加载器把 ExitProcess 误配到 msvcrt.dll → "[PE32] unimplemented import"）。
+    exitproc_iat_rva = printf_iat_rva + 8    # 0x1208 (4-byte thunk + NULL 间隔)
     printf_name_rva = 0x1300
     exitproc_name_rva = 0x1320
     msvcrt_dll_rva = 0x1350
@@ -348,9 +365,11 @@ def build_pe32():
     # 对齐到 IAT (0x200)
     while len(code) < 0x200:
         code += b'\x00'
-    # IAT (4-byte thunks，初始值 = hint/name RVA)
+    # IAT (4-byte thunks，初始值 = hint/name RVA)，每个 descriptor 的 thunk 数组 NULL 终止
     code += struct.pack('<I', printf_name_rva)
+    code += struct.pack('<I', 0)                 # desc0 thunk 数组 NULL 终止
     code += struct.pack('<I', exitproc_name_rva)
+    code += struct.pack('<I', 0)                 # desc1 thunk 数组 NULL 终止
 
     # 对齐到 hint/name 表 (0x300)
     while len(code) < printf_name_rva - code_rva:
@@ -494,23 +513,31 @@ def build_cmd_exe():
     code_rva = 0x1000
     main_rva = code_rva
     printf_iat_rva = code_rva + 0x200
-    exitproc_iat_rva = printf_iat_rva + 8
+    # 同 build_pe32_plus：thunk 数组 NULL 终止，ExitProcess thunk 放 0x210
+    exitproc_iat_rva = printf_iat_rva + 16
 
     msg_offset_in_code = 22
     struct.pack_into('<i', code, 3, 15)
-    struct.pack_into('<i', code, 10, 0x200 - 13)
-    struct.pack_into('<i', code, 17, 0x208 - 21)
+    # call#1 disp32 位于偏移 9（同 build_pe32_plus 的偏移修正说明）
+    struct.pack_into('<i', code, 9, (printf_iat_rva - code_rva) - 13)
+    struct.pack_into('<i', code, 17, (exitproc_iat_rva - code_rva) - 21)
+
+    # 同 build_pe32_plus 修复：RVA 必须带 code_rva(0x1000) 偏置
+    printf_name_rva = code_rva + 0x300    # 0x1300
+    exitproc_name_rva = code_rva + 0x320  # 0x1320
+    msvcrt_dll_rva = code_rva + 0x350     # 0x1350
+    kernel32_dll_rva = code_rva + 0x360   # 0x1360
+    import_desc_rva = code_rva + 0x400    # 0x1400
 
     while len(code) < 0x200:
         code += b'\x00'
-    code += struct.pack('<Q', 0x300)
-    code += struct.pack('<Q', 0x320)
+    code += struct.pack('<Q', printf_name_rva)
+    code += struct.pack('<Q', 0)       # desc0 thunk 数组 NULL 终止
+    code += struct.pack('<Q', exitproc_name_rva)
+    code += struct.pack('<Q', 0)       # desc1 thunk 数组 NULL 终止
 
-    import_desc_rva = 0x400
     while len(code) < 0x300:
         code += b'\x00'
-    printf_name_rva = 0x300
-    exitproc_name_rva = 0x320
     printf_hint_name = struct.pack('<H', 0) + b'printf\0'
     exitproc_hint_name = struct.pack('<H', 0) + b'ExitProcess\0'
     while len(code) < printf_name_rva - code_rva:
@@ -520,8 +547,6 @@ def build_cmd_exe():
         code += b'\x00'
     code += exitproc_hint_name
 
-    msvcrt_dll_rva = 0x350
-    kernel32_dll_rva = 0x360
     while len(code) < msvcrt_dll_rva - code_rva:
         code += b'\x00'
     code += b'msvcrt.dll\0'
@@ -602,6 +627,89 @@ def build_cmd_exe():
     return bytes(headers) + bytes(code)
 
 
+def build_fault64():
+    """构造 fault64.exe — PE32+ 故意 #PF 验收样本（BUG-20260801-005）。
+
+    用途: 验证 DSK 诊断 IDT 的异常投递。机器码:
+        movabs rax, 0x400000000000   ; 48 B8 <8B>
+        mov    dword [rax], 1        ; C7 00 01 00 00 00
+        jmp    $                     ; EB FE (兜底:万一未 fault 原地死循环)
+    0x400000000000 是低位规范地址(bit47=0)且远超任何已映射区,
+    写入必然 #PF(err=0x2, supervisor write non-present, cr2=0x400000000000)。
+    预期串口: "[IDT] exception" + vector=0xe + cr2=0x0000400000000000。
+    无导入表(pe_loader 对空 import directory 直接跳过)。
+    """
+    image_base = 0x140000000
+    section_align = 0x1000
+    file_align = 0x200
+
+    dos_header = bytearray(64)
+    struct.pack_into('<H', dos_header, 0, IMAGE_DOS_SIGNATURE)
+    struct.pack_into('<I', dos_header, 60, 64)
+
+    pe_sig = struct.pack('<I', IMAGE_NT_SIGNATURE)
+
+    coff_header = struct.pack('<HHIIIHH',
+        IMAGE_FILE_MACHINE_AMD64,
+        1, 0, 0, 0, 240,
+        IMAGE_FILE_MACHINE_AMD64_CHARACTERISTICS)
+
+    code = bytearray()
+    code += b'\x48\xB8' + struct.pack('<Q', 0x400000000000)  # movabs rax, 0x400000000000
+    code += b'\xC7\x00' + struct.pack('<I', 1)               # mov dword [rax], 1
+    code += b'\xEB\xFE'                                       # jmp $
+
+    while len(code) % file_align != 0:
+        code += b'\x00'
+
+    code_rva = 0x1000
+    main_rva = code_rva
+    size_of_code = len(code)
+    size_of_image = code_rva + size_of_code
+    while size_of_image % section_align != 0:
+        size_of_image += 1
+
+    opt_header = bytearray(240)
+    struct.pack_into('<H', opt_header, 0, 0x20b)         # Magic = PE32+
+    struct.pack_into('<I', opt_header, 4, size_of_code)  # SizeOfCode
+    struct.pack_into('<I', opt_header, 16, main_rva)     # AddressOfEntryPoint
+    struct.pack_into('<I', opt_header, 20, code_rva)     # BaseOfCode
+    struct.pack_into('<Q', opt_header, 24, image_base)   # ImageBase
+    struct.pack_into('<I', opt_header, 32, section_align)
+    struct.pack_into('<I', opt_header, 36, file_align)
+    struct.pack_into('<H', opt_header, 40, 6)            # MajorOperatingSystemVersion
+    struct.pack_into('<H', opt_header, 48, 6)            # MajorSubsystemVersion
+    struct.pack_into('<I', opt_header, 56, size_of_image)
+    struct.pack_into('<I', opt_header, 60, 0x200)        # SizeOfHeaders
+    struct.pack_into('<H', opt_header, 68, IMAGE_SUBSYSTEM_WINDOWS_CUI)
+    struct.pack_into('<Q', opt_header, 72, 0x100000)     # SizeOfStackReserve
+    struct.pack_into('<Q', opt_header, 80, 0x1000)       # SizeOfStackCommit
+    struct.pack_into('<Q', opt_header, 88, 0x100000)     # SizeOfHeapReserve
+    struct.pack_into('<Q', opt_header, 96, 0x1000)       # SizeOfHeapCommit
+    struct.pack_into('<I', opt_header, 108, 16)          # NumberOfRvaAndSizes
+    # DataDirectory 全 0（无导入表）
+
+    section_header = bytearray(40)
+    section_header[0:8] = b'.text\0\0\0'
+    struct.pack_into('<I', section_header, 8, size_of_code)
+    struct.pack_into('<I', section_header, 12, code_rva)
+    struct.pack_into('<I', section_header, 16, size_of_code)
+    struct.pack_into('<I', section_header, 20, file_align)
+    struct.pack_into('<I', section_header, 36,
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)
+
+    headers = bytearray()
+    headers += dos_header
+    headers += pe_sig
+    headers += coff_header
+    headers += opt_header
+    headers += section_header
+    while len(headers) % file_align != 0:
+        headers += b'\x00'
+
+    return bytes(headers) + bytes(code)
+
+
 def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -623,7 +731,13 @@ def main():
         f.write(cmd_exe)
     print(f"[gen] Generated cmd.exe: {out_path} ({len(cmd_exe)} bytes)")
 
-    print("[gen] 完成。复制到 SYSTEM/system/deshab64/tools/ 并重新运行 build.bat")
+    fault64 = build_fault64()
+    out_path = os.path.join(out_dir, 'fault64.exe')
+    with open(out_path, 'wb') as f:
+        f.write(fault64)
+    print(f"[gen] Generated fault64.exe: {out_path} ({len(fault64)} bytes)")
+
+    print("[gen] 完成。复制到 SYSTEM/bin/ 并重新运行 build.bat")
 
 
 if __name__ == '__main__':

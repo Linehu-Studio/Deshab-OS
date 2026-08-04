@@ -63,6 +63,26 @@ stage 3 (optional): e1000 → virtio_net → ath9k → ps2kbd
 -device virtio-net-pci,netdev=net0 ^
 ```
 
+## 自动化脚本
+
+[tests/qemu/driver-matrix.ps1](../../../tests/qemu/driver-matrix.ps1) 单次 QEMU 会话挂全设备
+（SATA 测试盘 + NVMe 测试盘 + xHCI USB 盘 + e1000），断言 4 个 stage 共 16 个清单驱动的
+加载顺序与功能锚点：
+
+```powershell
+.\tests\qemu\driver-matrix.ps1            # 复用现有镜像
+.\tests\qemu\driver-matrix.ps1 -Build     # 先全量构建再测
+```
+
+自动断言内容：
+
+- 16 个 `driver ready` 锚点按 manifest 顺序（ath9k 走 FUCK 禁用路径，断言 `[DSM] driver disabled by FUCK`）
+- 功能锚点：ahci/nvme block provider 注册、fat32 经块设备解析镜像、e1000 netdev+link、ps2kbd IRQ1、virtio_net 无设备降级
+- NVMe 写路径回归：LBA0 签名识别 → write+flush+readback 逐字节校验（PRP2 + PRP list 两趟）→ 签名完好，且 ahci0=0 → nvme0=1 注册顺序
+- `[DKM] external driver active` ≥ 15、`[DSM] stage end` × 4
+
+已知限制（与上方一致）：virtio_net 在 e1000-only 拓扑断言降级锚点；xhci USB MSC 枚举仅断言驱动就绪。
+
 ## 已知限制
 
 - NVMe BAR0 在 QEMU 中常位于 4G 以上，当前 HHDM 不能安全访问，需 Phase 0 高位 MMIO 映射解决

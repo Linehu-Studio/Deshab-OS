@@ -33,6 +33,107 @@
 
 <!-- 在此追加 bug 条目，最新放在顶部 -->
 
+### BUG-20260803-009 [P3] [DKM/apic] PIT mode3 方波在 IOAPIC edge 触发下每周期双投递：100Hz 设定实测 200Hz（tick 2x 定论）
+- 现象: apic_route=1 接管验证时，500ms 窗口数到 ~100 ticks（PIT ch0 mode3 设定 100Hz，预期 50）；tick handler 计数恰为 2 倍，且持续投递窗口（sustain）同样双倍。
+- 复现步骤: FUCK [drivers] apic_route=1 启动 → ROUTE VERIFY 阶段计数复现；apic_diag=1 时 HPET 对拍实验自动输出定论。
+- 串口/日志证据: `.build_tmp/tests/apicroute-b7p2-071006.log`：`calib window(us)=10132` / `verify window(us)=504883` / `tick rate(Hz x10)=2000` / `route verify ticks=101` / `sustain window ticks=100` / `TICK2X VERDICT: PIT mode3 double-clocked on IOAPIC edge (~200Hz real)`。
+- 根因分析: HPET 绝对时基（ACPI HPET 表 → MMIO 主计数器，QEMU 100MHz）对拍逐一排除候选假设：① "TSC 校准测半"——calib 窗口实测 10132us ≈ 10.13ms，准确，排除；② "验证窗口偏长"——实测 504883us ≈ 504.9ms，准确，排除。窗口与校时皆正确而计数双倍，定论为 PIT mode3（方波发生器）OUT 引脚每个全周期含上升沿+下降沿各一次翻转，QEMU IOAPIC edge 触发重定向项的输入采样等效双沿触发 → 每 PIT 周期产生 2 次中断，真实投递频率 ~200Hz。与 LESSONS_LEARNED 2026-08-03 B7 阶段1 记录的 "PIT mode3 计数器每 CLK 减 2"（同一硬件特性：mode3 半周期翻转）互证。
+- 修复方案: 无需修复（观测性定论，非功能缺陷；EOI 钩子链路与窗口校时均验证正确）。后续约束：① route 模式下凡按 PIT 中断次数计时的代码须按 200Hz 折算，或改用 PIT mode2（rate generator，每周期单脉冲）根除双触发；② 时延派生一律走 HPET/TSC 绝对时基，禁止用 tick 计数当时间源；③ apic_diag 开关保留（FUCK 默认 0），真机冒烟时可复开对拍。
+- 状态: [CLOSED]
+- 修复提交: 工作区（CODE/DKM/apic/apic.c：HPET 表解析 + 主计数器时基 + TICK2X VERDICT 对拍实验）
+- 验证: apic-route-verify.ps1 18 项全 PASS（route=1+legacy=1+diag=1）；boot-regression.ps1 B1-B5 全 PASS（route=1+legacy=1+diag=0，B1 向导按键全程走 IOAPIC→LAPIC→IDT→ps2kbd 链路）；route=0 回归 B1+B2 PASS（PIC 锚点在、钩子未注册、行为与旧版一致）。
+
+### BUG-20260801-008 [P1] [tools/desktop_app.h] da_mouse_init 读配置字前未冲刷输出缓冲：残留字节写回控制器配置 → KBD 时钟禁用位被置位 → 键盘控制器级全灭且跨应用持续
+- 现象: dev_mode shell 中 `run FILEMAN.ELF`（或 BROWSER.ELF）后应用内键盘全灭：Esc/方向键/回车均无响应；鼠标移动/点击正常。退出应用返回 shell 后键盘仍不恢复（会话级持续，直至重启）。editor（不调用 da_mouse_init）与启动初期 shell 键盘正常。
+- 复现步骤: dev_mode shell → 键入 `run FILEMAN.ELF` 回车 → fileman 内按 Esc/方向键 → 无响应、串口零输出。
+- 串口/日志证据: `.build_tmp/w3b_s2_tools.log`：`[fileman] boot` 后 monitor sendkey esc/down/ret 串口零增量、screendump 选区不动；mouse_move 光标正常移动、mouse_button 点击可选中条目（FIRSTINT.XT 高亮）并可点关闭按钮退出（`[fileman] close button clicked` → `[shell] run: tool returned`）；退回 shell 后 sendkey i/d/ret 仍零输出（键盘未恢复）。运行中 fileman.elf 反汇编证实 da_mouse_poll 与键盘轮询指令顺序均正确（`test al,0x21` 后才 `in 0x60`），排除 BUG-20260801-003 残留。
+- 根因分析: da_mouse_init 序列中 `outb(0x64,0x20)`（读控制器配置字）之前未冲刷输出缓冲。shell 启动应用时最后键入的回车 break code（0x9C）或鼠标流字节残留于输出缓冲 → OBF 等待立即返回、`inb(0x60)` 读到残留字节而非配置字 → `cfg|=0x02; cfg&=~0x20` 后写回 → 残留字节 bit4(0x10)=1（0x9C 即满足）置位配置字 KBD 时钟禁用位 → i8042 控制器级禁用键盘，且应用退出后无人恢复该配置 → 会话级键盘全灭。另：鼠标复位（0xFF）实际返回 FA AA 00 共 3 字节，原实现仅读 1 字节，残留响应同样可污染后续配置字读写。desktop/main.c:ps2_mouse_init（键盘鼠标长期共存的参照实现）首尾均有 ps2_drain 且读完全部响应，故桌面不受影响。
+- 修复方案: da_mouse_init 对齐 desktop/main.c:ps2_mouse_init：①序列开头新增 da_ps2_drain() 冲刷残留；②配置字 `cfg &= ~0x20; cfg |= 0x02; cfg |= 0x40`（补键盘翻译位，与 desktop/mouseInit 0x47 一致）；③复位后有界读完 FA AA 00 全部响应、使能数据报告后读完 ACK；④结尾再次 da_ps2_drain()。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/tools/desktop_app.h da_mouse_init + 新增 da_ps2_drain），2026-08-04 全量构建闭环（BUILD.lock 互斥）：fileman.elf 46848→46888B、browser.elf 48896→48928B、editor.elf 同步重编（MAKEFILE 无头文件依赖，已删 .o 强制重编），ISO/deshab.img 768MB 重打包 + SATA 镜像重建，构建零警告。
+- 验证: 2026-08-04 QEMU 验收 12/12 ALL PASS（`.build_tmp/w4a/w4a_bug008.log`，-snapshot，monitor 45601，WHPX）：dev_mode shell `run FILEMAN.ELF` → `[fileman] boot`（L4794）→ sendkey 方向键选区移动（screendump w4a_fm1/fm2.ppm 像素差异采样 1831）→ ret 打开条目（w4a_fm3.ppm 差异 2170）→ esc → `[fileman] exit`（L4803）→ `[shell] run: tool returned`（L4804）→ 键入 `id` → `uid=0(root) gid=0(root)`（L4806，键盘跨应用存活闭环）；`run BROWSER.ELF` → `[browser] boot`（L5197）→ esc → `[browser] exit`（L5198）→ tool returned（L5199）→ `id` → `uid=0(root)`（L5201）同链路通过；渲染 screendump w4a_fm1/fm2/fm3/br1/shell.ppm 均正常。回归：boot-regression.ps1 PASS（257.8s，B1 首启向导/B2 正常启动/B3 dev_mode/B4 无盘降级/B5 无 NIC 全过，无 [PANIC]）；userapps-matrix.ps1 系统行为全 PASS（dev_tests/help/pci 存活/Esc→cmd→desktop 链路/fileman boot/browser boot），唯一 FAIL 为 editor 断言陈旧——脚本仍期待 BUG-002 修复前的 "run: ELF 加载失败"，实测 `[editor] boot`→`[editor] exit` 正常（userapps-matrix-125211.log L5066-5067），该断言升级属测试脚本维护范畴，非系统回归。
+
+### BUG-20260801-007 [P1] [UTSM/pe] PE32 解释器 shim fn64 回退把 guest 指针当 host 指针：shim_printf 解引用 0x401017 → #PF → 三重故障
+- 现象: `pe HELLO32.EXE` 解释执行时串口止于 "[PE] running PE32 via x86emu32"，无 "Hello from PE32!"，guest 三重故障，QEMU（-no-reboot）静默退出。TCG 与 WHPX 表现一致。
+- 复现步骤: x86emu32-coverage.ps1（AUTOEXEC `pe HELLO32.EXE`）→ 会话在 "[PE] running PE32 via x86emu32" 后立即退出。
+- 串口/日志证据: `.build_tmp/tests/x86emu32-tcg-134351.log` 尾部止于 "[PE] running PE32 via x86emu32"；此前 QEMU `-d int` 捕获 v=0e（#PF）RIP 落在 shim_printf 函数体内（utsm.elf 反汇编确认），无 "[PE32] emulator error"——**解释器本身无差错，故障在 host 侧 shim**。
+- 根因分析（静态全链定案）:
+  1. pe_shim.c shim 表条目第 4 初始化元全为 0（如 `{"msvcrt.dll","printf",(void*)shim_printf,0}` 只设 fn64）→ **全表 fn32=NULL，pe_shim.h 设计的 fn32 列（"从模拟栈读参数调用 fn32"）整体缺失**。
+  2. x86emu32.c try_iat_call() 拦截 CALL IAT（合成地址 0x0001xxxx）后 fn32 为空 → 走 fn64 回退 `f(a0,a1,a2,a3)`，a0..a3 是从模拟栈读出的**原始 32 位 guest 值**：hello32 的 `push 0x401017`（msg guest VA = image_base 0x400000 + 0x1017）→ a0=0x401017。
+  3. shim_printf（pe_shim.c L219）`const char *f = (const char *)fmt;` 把 guest VA 直接当 host 指针解引用，**无 guest→host 转换**（解释器映像驻留在 emu->mem 大缓冲区，正确地址应为 emu->mem + 0x401017）→ host 低地址 0x401017 未映射 → #PF → BUG-20260801-005 放大为三重故障。
+  拦截前链路均正确：0x68 push imm32、FF /2 `call [disp32]` ModRM 解码、read_rm32 读 IAT 合成地址、try_iat_call 参数读取——解释器覆盖率不记倒退。
+- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ①为每个含指针参数的 shim 实现 fn32（接收 esp_ptr=&emu->mem[esp]，guest VA 经 emu->mem 基址转换为 host 指针）；②或 fn64 回退前设置全局 g_emu_mem_base，shim 内对 <0x10000000 的指针统一加基址转换；③kernel32 WriteFile/ReadFile 等指针参数函数同理。
+- 状态: [OPEN]
+- 修复提交: 待提交
+- 验证: 修复后 x86emu32-coverage.ps1 应见 "Hello from PE32!" → "[cmd] PE run end" → "[DSK] cmd.elf returned"；pe-compat.ps1 会话 B 同步验证（两处均已留自动升级断言：日志出现即升 PASS）。
+
+### BUG-20260801-006 [P1] [UTSM/pe] pe_shim setjmp/longjmp 跨已返回函数 UB：longjmp 恢复脏栈寄存器 → 野指针 call → 三重故障
+- 现象: `pe HELLO64.EXE` 原生执行成功打印 "Hello from PE32+!"（BUG-004 修复后），随后在 ExitProcess 阶段 guest 三重故障，QEMU（-no-reboot）静默退出；后续 AUTOEXEC 命令（HELLO32/NONEXIST/exit）全部不再执行。TCG 与 WHPX 表现一致。
+- 复现步骤: pe-compat.ps1（AUTOEXEC `pe HELLO64.EXE`）→ 串口止于 "Hello from PE32+!"。
+- 串口/日志证据: QEMU `-d int` 追踪（`.build_tmp/tests/pe-int-dbg.log`）：
+  `v=0e e=0003 IP=0028:ffffffff80014796 SP=0030:ffffffff80003030 CR2=ffffffff80003028`（**写保护违例**，非缺页）→ 投递 #PF 即 #GP（BUG-005 放大）→ v=08 → Triple fault。
+  现场寄存器：R12=0x6666666666667830("0xfffffff")、R13=0x3033326530386666("ff80e230")——正是 log_hex64("[PE] stack_top=",0xffffffff80e23000) 格式化缓冲区 ASCII 残片；R14/R15/RBP 均为脏值。
+  反汇编定案（utsm.elf）：fault RIP `pe_service_run+0x226` = `call *%r15`（pe_call_on_stack 内联汇编调 PE 入口那条）；但 R15=0xffffffff8055b260 并非 PE 入口 0xffffffff80d22000、RSP=0xffffffff80003030 并非 PE 栈顶 0xffffffff80e23000——**这是 longjmp 用脏栈"恢复"出来的假现场**，不是正常调用路径。
+  pe_shim_setup_exit（0xffffffff80014d60）反汇编：clang 把 __builtin_setjmp 实现为 `g_exit_jmp={RBP,RSP,resume=0x80014d94}`，恢复后从 0x80014d94 起执行函数尾声 `pop rbx;pop r12;pop r13;pop r14;pop r15;pop rbp;ret`——**从恢复的栈上弹 7 个槽**。
+- 根因分析: pe_shim_setup_exit() 内调 __builtin_setjmp 后**即返回**（C 标准：含 setjmp 的函数已返回时再 longjmp 为未定义行为）。setjmp→longjmp 之间 pe_service_run 又调用 log_hex64×2（"[PE] entry="/"[PE] stack_top="），其栈帧**精确复用** pe_shim_setup_exit 尾声要弹的那片栈区 → longjmp 尾声 pop 出的 rbx/r12-r15/rbp 全是 log_hex64 帧残片（R12/R13 即十六进制字符串残片），最后 `ret` 弹到 [X-8] 槽位的残留返回地址 0x8001478c（log_hex64 调用点返回地址）→ 落到 pe_call_on_stack 内联汇编正中间（`mov %rsp,g_pe_saved_rsp; mov %r14,%rsp; call *%r15`）→ 以脏 R14 为栈、脏 R15 为入口野调用 → 写返回地址到只读页 0xffffffff80003028 → #PF(保护违例) → BUG-005 放大为三重故障。PE32 解释器路径同一 setjmp/longjmp 机制，同样暴露在 UB 下（只是中间无 log 调用、脏数据不同，崩溃形态可能不同）。
+- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ①把 setjmp 下沉到 pe_service_run 本体内（含 PE 调用全程存活的作用域），不要用"setjmp 包装函数"；②或弃用 __builtin_setjmp/longjmp，改用显式上下文保存结构（保存 callee-saved + RSP/RIP 到 pe_service_run 帧内，ExitProcess 经受控 trampoline 返航）；③PE32 路径同理。
+- 状态: [OPEN]
+- 修复提交: 待提交
+- 验证: 修复后 pe-compat.ps1 应见 "[PE] ExitProcess code=" → "[cmd] PE run end" → "[DSK] cmd.elf returned" 完整链路；x86emu32-coverage.ps1 动态链路同步验证。
+
+### BUG-20260801-004 [P1] [tools/pe-samples] gen_pe.py PE32+ 二进制双重构造缺陷 → 原生执行三重故障
+- 现象: `pe HELLO64.EXE` 原生执行时 guest 直接三重故障，QEMU（-no-reboot）进程退出；串口最后一行为 `[PE] stack_top=...`，无 "Hello from PE32+!"。WHPX 下表现为 "Unexpected VP exit code 4"，TCG 下同样退出（此前误判为 WHPX 平台限制）。
+- 复现步骤: pe-compat.ps1（AUTOEXEC `pe HELLO64.EXE`）→ 会话在 `[PE] running PE32+ natively` 后退出。
+- 串口/日志证据: QEMU `-d int,cpu_reset` 追踪（`.build_tmp/pe-dbg-qemu.log` 尾部）：`v=0e e=0010 IP=0028:...0300 CR2=0x300`（在 0x300 取指缺页）→ 投递 #PF 时 #GP → `v=08` → Triple fault。RIP=0x300 正是未被 shim 修补的 IAT[0] 原始值（printf 名称 RVA）。
+- 根因分析（双重缺陷，均属 gen_pe.py 构造错误）:
+  1. **call disp32 写错偏移**：call 指令位于 code[7..12]（FF 15 + disp32），disp32 应写偏移 9，实际写偏移 10 → disp 左移一字节变为 0x1F300，同时覆盖下一条指令首字节。
+  2. **import 区 RVA 全部缺 +0x1000（code_rva）偏置**（修复①后仍失败的真正主因）：build_pe32_plus/build_cmd_exe 中 printf_name/exitproc_name/msvcrt/kernel32/import_desc 写成裸缓冲区偏移 0x300/0x320/0x350/0x360/0x400 → 数据目录 Import RVA=0x400 落在 headers 区 → rva_to_offset 返回 0xFFFFFFFF → resolve_imports 静默返回 → IAT 永不被 shim 修补 → `call [rip+0x1F3]` 跳到 0x300 → #PF → 三重故障。build_pe32 一直是正确的（0x1300 等带偏置），PE32+ 两个 builder 抄错。
+  3. 放大器（系统侧，另立 BUG-20260801-005）：DSK 阶段任何 CPU 异常都无法投递，直接三重故障重启，串口零诊断。
+- 修复方案: ①两处 disp32 pack_into 偏移 10→9；②build_pe32_plus/build_cmd_exe 的 name/DLL/import_desc RVA 全部加 code_rva 偏置（0x1300/0x1320/0x1350/0x1360/0x1400），IAT thunk 同步修正；③重新生成 hello64.exe/hello32.exe/cmd.exe 并同步 SYSTEM/bin/。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/tools/pe-samples/gen_pe.py build_pe32_plus/build_cmd_exe）
+- 验证: hello64.exe 静态校验全绿——.text `call [rip+0x1F3]`→IAT 0x1200、ImportDir RVA=0x1400、desc0/desc1 OFT/FT=0x1200/0x1210、Name=0x1350/0x1360、IAT thunk=0x1300/0x1320；pe-compat.ps1 复测。
+
+### BUG-20260801-005 [P1] [UTSM/IDT] DSK 阶段 CPU 异常无法投递：#PF 投递即 #GP → 三重故障重启，串口零诊断
+- 现象: DSK/cmd/PE 阶段一旦发生 #PF/#GP 等异常，guest 立即三重故障，QEMU（-no-reboot）静默退出，串口无任何异常信息（无向量号/RIP/CR2）。
+- 复现步骤: 运行含缺陷的 HELLO64.EXE（BUG-004，call 到未映射地址 0x300）→ QEMU 直接退出；或任何 DSK 阶段空指针解引用。
+- 串口/日志证据: QEMU `-d int` 追踪（`.build_tmp/pe-dbg-qemu.log`）：`check_exception old: 0xffffffff new 0xe`（#PF at RIP=0x300, CR2=0x300, RSP=0xffffffff80e22ff0 栈有效）→ `old: 0xe new: 0xd`（**投递 #PF 时即 #GP**）→ `old: 0x8 new 0xd`（投递 DF 时再 #GP）→ Triple fault。现场：IDT=ffffffff8002b000 lim=0xfff，GDT=ffff80007fe3d000 lim=0x47，CS=0028/SS=0030，TR=0038 且 TSS base=0。
+- 根因分析: BUG-20260729-013 的 `idt_halt_all()` 把 256 个 IDT 条目换成 halt stub，意图 cli;hlt 安全停机；但实测异常**投递本身**就 #GP——halt 门描述符的选择子/IST 与 DSK 阶段 GDT/TSS（TSS base=0）不匹配，异常帧无法压栈。净效果：DSK 阶段是无异常容错的裸奔环境，任何 guest bug 都表现为"QEMU 静默退出"，测试侧只能开 `-d int` 才能定位。
+- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ① halt IDT 门用 DSK 阶段 GDT 内有效选择子重建、IST=0；② 或 DSK 入口自建最小 IDT（#PF/#GP/#DF 打印向量+CR2+RIP 后 cli;hlt）；③ 恢复 TSS 有效基址。
+- 状态: [OPEN]
+- 修复提交: 待提交
+- 验证: 修复后重跑含缺陷 PE：串口应输出异常诊断而非 QEMU 静默退出。
+
+### BUG-20260801-003 [P1] [tools/desktop_app.h] da_mouse_poll 吞键盘扫描码导致应用键盘全灭
+- 现象: fileman/browser/editor（所有 #include desktop_app.h 的全屏应用）内键盘输入完全无效：Esc 无法退出、方向键/回车无响应；应用只能由宿主动作（关机/会话终止）结束。
+- 复现步骤: dev_mode shell → `run FILEMAN.ELF` → 启动后按 Esc → 无 `[fileman] exit`，应用永久停留。
+- 串口/日志证据: `.build_tmp/tests/userapps-matrix-021449.log`：`[fileman] boot` 后 3 次 Esc（每次等 20s）均无 `[fileman] exit`。
+- 根因分析: `da_mouse_poll()`（desktop_app.h L287-291）先 `inb(0x64)` 判有数据即 `inb(0x60)` 读走字节，再判 `st & 0x20` 发现是键盘字节直接 return 丢弃 → 键盘扫描码被鼠标轮询消耗。应用主循环每轮先调 da_mouse_poll 再轮询键盘 → 键盘字节永远到不了键盘分支。desktop/main.c 的 `ps2_mouse_poll()` 顺序正确（先判 0x20 再读 0x60），桌面不受影响；desktop_app.h 注释自称"与 desktop 保持一致"但实际不一致。
+- 修复方案: `da_mouse_poll()` 调整为：`(st & 1) && (st & 0x20)` 时才 `inb(0x60)`，与 desktop/main.c ps2_mouse_poll 对齐。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/tools/desktop_app.h da_mouse_poll：先判 AUX 位 st&0x20 再读 0x60）
+- 验证: QEMU 实测（`.build_tmp/w3b_s2_tools.log`）：editor 键盘输入与 Esc 退出正常（`[editor] boot`→`[editor] exit`→`[shell] run: tool returned`）；fileman 鼠标移动/点击选中/关闭按钮退出正常；运行中 fileman.elf 反汇编确认键盘字节（st&0x20==0）不再被鼠标轮询消耗。注：fileman/browser 键盘在修复后仍全灭，深挖定位为另一独立根因——da_mouse_init 配置字污染（BUG-20260801-008），该条目修复后 `[fileman] exit`/`[browser] exit` 断言方可完全恢复。
+
+### BUG-20260801-002 [P1] [shell] g_run_image 仅 256KB，editor.elf（496KB 内存镜像）run 拒绝加载
+- 现象: dev_mode shell 中 `run EDITOR.ELF` 输出 "run: ELF 加载失败（无效格式或过大）"，编辑器无法从 shell 启动（桌面宿主 g_elf_image=1MB，可正常启动）。
+- 复现步骤: dev_mode shell → `run EDITOR.ELF`。
+- 串口/日志证据: `.build_tmp/tests/userapps-matrix-021449.log` L4821/5167/5513 "run: ELF 加载失败（无效格式或过大）" ×3。
+- 根因分析: shell `g_run_image[262144]`（256KB）上限；editor.elf 文件 43KB 但 BSS NOBITS 内存镜像 496KB（编辑器大文本缓冲）→ `sh_load_elf` 返回 -5。其余工具内存镜像均在限内：fileman 208KB / browser 116KB / ping 128KB / curl 200KB。
+- 修复方案: `g_run_image` 扩至 1MB（与 desktop g_elf_image 对齐），或改为按 ELF memsz 动态划分。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/shell/main.c g_run_image 262144→1048576，与 desktop 宿主 g_elf_image 对齐）
+- 验证: QEMU dev_mode shell 实测（`.build_tmp/w3b_s2_tools.log` L4732-4735）：`run EDITOR.ELF` → `[shell] run: jumping to tool` → `[editor] boot` → `[editor] exit` → `[shell] run: tool returned`，editor.elf 496KB 内存镜像成功载入 1MB 缓冲并运行、退出；userapps-matrix.ps1 的 `[editor] boot` 断言应可升级。
+
+### BUG-20260801-001 [P1] [shell] 扫描码 0x15/0x17/0x0B 被误当 Ctrl+U/W/K，字母 y/i/0 无法输入
+- 现象: shell 交互输入中字母 i、y、数字 0 被吞：`id` 变 "d"、`ping` 变 "ng"、`whoami`/`exit`/`editor` 等含 i 命令均无法键入；串口回显 "未知命令: d" / "未知命令: ng"。
+- 复现步骤: dev_mode shell 提示符下键入 `id` 回车（QEMU monitor sendkey 或真实键盘均可复现）。
+- 串口/日志证据: `.build_tmp/tests/userapps-matrix-021449.log` L4431/4438/4445 "未知命令: d" ×3，L4460/4467/4474 "未知命令: ng" ×3。
+- 根因分析: shell 主循环（CODE/shell/main.c L3399-3401）将扫描码 0x15(y)/0x17(i)/0x0B(0) 直接映射为 Ctrl+U(kill_line)/Ctrl+W(删整行)/Ctrl+K(kill_to_end) 快捷键，但 shell 未跟踪 Ctrl 修饰键状态，也无 Ctrl 按下判定 → 普通按键被当作快捷键吞掉。`ping` 的 p 插入后 i 触发"删整行"→ 剩 "ng"。
+- 修复方案: 增加 Ctrl 修饰键跟踪（0x1D/0x9D 左右 Ctrl），仅在 Ctrl 按下时启用 0x15/0x17/0x0B 快捷键分支。
+- 状态: [FIXED]
+- 修复提交: 工作区已修复（CODE/shell/main.c：新增 ctrl 变量跟踪 0x1D 按下/0x9D 释放，0x15/0x17/0x0B 快捷键分支加 && ctrl 条件）
+- 验证: QEMU dev_mode shell monitor sendkey 实测（`.build_tmp/w3b_s1_shell.log`）：`id` → 输出 `uid=0(root) gid=0(root)`（L4405，i 不再被吞）；吞键对照测试 `y0i ok` 完整回显（L4407，y/0/i 三键全通，修复前分别触发 Ctrl+U/W/K 被吞）；`ping` → `[ping] boot`（L5214，i 不再被吞）。Ctrl+U/W/K 快捷键逻辑保留，仅在按住 Ctrl 时生效。userapps-matrix.ps1 的 id/whoami/ping MANUAL 断言可升级。
+
 ### BUG-20260729-021 [P2] [DSK/kernel_api] 硬偏移读取 kernel_api.block 脆弱性
 - 现象: DSK 通过 `*(u64*)(api + 0xA8)` 硬偏移读取 `dkm_kernel_api.block`，若结构体在 `block` 字段前插入新字段，DSK 将读取到错误指针 → 解引用 → 立即崩溃，无日志。
 - 复现步骤: 修改 dkm.h 中 `dkm_kernel_api` 在 `block` 字段前增加任意字段 → 编译 DSK（不重新编译）→ 启动。

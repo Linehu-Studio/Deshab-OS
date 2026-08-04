@@ -1846,8 +1846,9 @@ typedef struct { u32 type,flags; u64 offset,vaddr,paddr,filesz,memsz,align; } sh
 typedef struct { i64 tag; u64 val; } sh_elf64_dyn;
 typedef struct { u64 offset; u64 info; i64 addend; } sh_elf64_rela;
 
-/* run 加载镜像缓冲（容纳工具 ELF 展开后的 memsz） */
-static u8 g_run_image[262144];
+/* run 加载镜像缓冲（容纳工具 ELF 展开后的 memsz；与 desktop 宿主 g_elf_image 对齐。
+ * editor.elf 文件 43KB 但 BSS NOBITS 内存镜像 ~496KB，256KB 上限曾导致 sh_load_elf -5。） */
+static u8 g_run_image[1048576];
 
 static int sh_load_elf(u8 *data, void **entry_out) {
     const sh_elf64_ehdr *eh = (const sh_elf64_ehdr *)data;
@@ -3314,6 +3315,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     /* 主循环 */
     int shift = 0;
     int e0 = 0;
+    int ctrl = 0;   /* Ctrl 修饰键状态：0x1D 按下 / 0x9D 释放（右 Ctrl 为 E0 前缀同名扫描码） */
     u64 blink_start = rdtsc_shell();
     for (;;) {
         draw_prompt();
@@ -3350,7 +3352,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
             if (sc == 0xE0) { e0 = 1; continue; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
+            /* Ctrl 修饰键跟踪：左 Ctrl 按下 0x1D；右 Ctrl 为 E0 1D（e0 已置位，此处一并清除） */
+            if (sc == 0x1D) { ctrl = 1; e0 = 0; continue; }
             if (sc & 0x80) {
+                /* 左 Ctrl 释放 0x9D；右 Ctrl 释放 E0 9D —— 两者 sc 均为 0x9D */
+                if (sc == 0x9D) { ctrl = 0; }
                 if (e0 && sc == 0x9C) { e0 = 0; }
                 else if (e0 && sc == 0xCB) { e0 = 0; }
                 else if (e0 && sc == 0xCD) { e0 = 0; }
@@ -3396,9 +3402,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
             if (sc == 0x0E) { delete_char_back(); continue; }
             if (sc == 0x0F) { handle_tab_complete(); continue; }
             if (sc == 0x01) { logl("[shell] esc -> return to DSK"); return; }
-            if (sc == 0x15 && !shift) { kill_line(); continue; }
-            if (sc == 0x17 && !shift) { while (input_cursor > 0) delete_char_back(); continue; }
-            if (sc == 0x0B && !shift) { kill_to_end(); continue; }
+            /* Ctrl 组合键：仅 Ctrl 按下时生效，普通键入 y/i/0 走下方 ASCII 插入（BUG-20260801-001） */
+            if (sc == 0x15 && ctrl) { kill_line(); continue; }                            /* Ctrl+U: 清空整行 */
+            if (sc == 0x17 && ctrl) { while (input_cursor > 0) delete_char_back(); continue; } /* Ctrl+W: 删至行首 */
+            if (sc == 0x0B && ctrl) { kill_to_end(); continue; }                          /* Ctrl+K: 删至行尾 */
             char c = scan_to_ascii(sc, shift);
             if (c && c >= 32 && c <= 126) {
                 insert_char(c);

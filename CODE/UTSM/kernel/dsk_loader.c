@@ -731,12 +731,14 @@ int dsk_load_and_jump(void) {
             }
         }
 
-        /* 4) 将 IDT 所有 256 个条目替换为安全 halt stub。
-         *    实机会产生 spurious IRQ7/15（即使 PIC 已 mask），
-         *    且 SMI/NMI 可能触发异常。如果 UTSM 的 idt_handler
-         *    所调用的 log 函数或串口驱动被覆盖，会导致双重异常→三重故障。 */
-        extern void idt_halt_all(void);
-        idt_halt_all();
+        /* 4) BUG-20260801-005: 换装 DSK 诊断 IDT（替代原静默 halt_all）。
+         *    vector 0-31 → UTSM isr_stub（idt_handler 打完整异常现场后
+         *    安全停机），vector 32-255 保持 halt stub 防御 spurious IRQ7/15。
+         *    SAS-R0 下 UTSM .text 常驻内存，DSK 阶段异常投递路径已验证
+         *    可用（BUG-20260729-013 登记行为）；原 halt_all 把 #PF/#GP
+         *    无声吞掉，DSK 阶段零诊断。 */
+        extern void idt_install_dsk_diag(void);
+        idt_install_dsk_diag();
 
         /* 5) NMI off */
         outb(0x70, inb(0x70) | 0x80);

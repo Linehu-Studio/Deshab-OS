@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     driver-matrix — DKM 驱动功能矩阵（docs/RE/test-cases/driver-matrix.md）
@@ -27,7 +27,7 @@ Initialize-QemuTest -Build:$Build
 $result = New-TestCaseResult 'driver-matrix'
 
 Write-Host "`n--- 全设备单会话驱动矩阵 ---"
-$s = Start-QemuSession -Name 'driver-matrix'
+$s = Start-QemuSession -Name 'driver-matrix' -MonitorPort 45502
 try {
     $hit = Wait-QemuLog -Session $s -Patterns @('[DSK] boot') -TimeoutSeconds 150
     Start-Sleep -Seconds 2
@@ -65,6 +65,21 @@ try {
         '[virtio_net] virtio-net device not found',  # virtio_net: e1000-only 拓扑降级
         '[DSM] driver disabled by FUCK'          # ath9k: FUCK 禁用路径
     )
+
+    # ---- NVMe 数据面回归（写路径）：签名盘自检 + 写/刷/读回 + provider 序号 ----
+    Assert-QemuLog $result $log -MustContain @(
+        '[nvme] LBA0 signature OK',                  # LBA0 DESHABNVME0 签名识别（测试盘）
+        '[nvme]   write+flush+readback verify OK',   # 写→FLUSH→读回逐字节校验（PRP2 + PRP list 两趟）
+        '[nvme] LBA0 sig intact after write tests'   # 写测试后 LBA0 签名未损坏
+    )
+    # ahci0=0 → nvme0=1 注册顺序（[BLOCK] device registered → 名称 → index 三联行）
+    Assert-QemuLog $result $log -Ordered @(
+        '[INFO] ahci0',
+        '[BLOCK] index=0x0000000000000000',
+        '[INFO] nvme0',
+        '[BLOCK] index=0x0000000000000001'
+    )
+    Assert-QemuLog $result $log -CountPattern '[nvme]   write+flush+readback verify OK' -MinCount 2
 
     # ---- DSM 装载统计：16 个 manifest 驱动中 15 个 active（ath9k 禁用） ----
     Assert-QemuLog $result $log -CountPattern '[DKM] external driver active' -MinCount 15

@@ -405,10 +405,21 @@ static void pic_remap(void) {
     outb(PIC2_DATA, 0xFF);   /* mask all slave */
 }
 
+/* 运行时读取当前内核 CS — 必须与实际生效的 GDT 一致。
+ * 注意:UTSM 运行在 Limine 提供的 GDT 下(CS=0x28),不能假设
+ * OSDev 教程布局(0x08=code)。若 IDT gate selector 指向无效/非64位
+ * 代码段,异常派发时加载 CS 会 #GP(selector error),异常链升级为
+ * #DF -> triple fault,且全程无任何日志输出。 */
+static u16 idt_kernel_cs(void) {
+    u16 cs;
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+    return cs;
+}
+
 static void idt_set_entry(u8 vector, void *handler, u8 ist, u8 type) {
     u64 addr = (u64)handler;
     g_idt[vector].offset_low  = (u16)(addr & 0xffff);
-    g_idt[vector].selector     = 0x08;  /* kernel code segment (from GDT) */
+    g_idt[vector].selector     = idt_kernel_cs();
     g_idt[vector].ist          = ist;
     g_idt[vector].type_attr    = type;
     g_idt[vector].offset_mid   = (u16)((addr >> 16) & 0xffff);
@@ -459,15 +470,122 @@ void idt_halt_all(void) {
     __asm__ volatile("lidt %0" :: "m"(idtr));
 }
 
+void idt_install_dsk_diag(void) {
+    /* BUG-20260801-005: DSK 交接诊断 IDT（替代原 idt_halt_all 静默化）。
+     * 原 halt_all 将 256 项全部换成静默 halt stub——防御正确，但 DSK
+     * 阶段任何 CPU 异常（PF/GP/UD）被无声吞掉，零日志无法诊断
+     * （实测 pe HELLO64.EXE 早期 #PF 直接表现为"卡死/三重故障"）。
+     * 本函数在保留 IRQ 防御的前提下恢复异常可见性:
+     *   vector 0-31   -> 原 isr_stub（走 idt_handler 异常路径，打完整
+     *                    vector/err/rip/CR2/寄存器日志后安全停机）
+     *   vector 32-255 -> 保持 halt stub（PIC 已全 mask 且 IF=0，IRQ 本
+     *                    不该到达；spurious IRQ 维持原防御行为）
+     * 不做 pic_remap / sti——DSK 上下文 IF=0 不变式保持不变。
+     * isr_stub / idt_handler 是 UTSM .text 代码，SAS-R0 下常驻内存
+     * 有效（BUG-20260729-013 登记行为:halt_all 引入前 DSK 阶段异常
+     * 本就能送达 idt_handler）；异常路径只用 log/serial，不依赖已过期
+     * 的 IRQ handler 状态。 */
+    for (u16 i = 0; i < 32; i++) {
+        idt_set_entry((u8)i, g_isr_table[i], 0, 0x8E);
+    }
+    for (u16 i = 32; i < IDT_ENTRIES; i++) {
+        idt_set_entry((u8)i, (void *)isr_halt_stub, 0, 0x8E);
+    }
+    idt_ptr idtr;
+    idtr.limit = (u16)(sizeof(g_idt) - 1);
+    idtr.base  = (u64)&g_idt;
+    __asm__ volatile("lidt %0" :: "m"(idtr));
+    log_info("[IDT] DSK diag IDT installed (exc 0-31 logged, IRQ halted)");
+}
+
+void idt_install_pe_diag(void) {
+    /* 语义与 idt_install_dsk_diag 相同：BUG-20260801-005 起 DSK 交接
+     * 默认装备诊断 IDT，PE 原生执行前重装一次保持幂等（防御 PE 运行
+     * 期间 IDT 被第三方改写的场景）。 */
+    idt_install_dsk_diag();
+}
+
 /* IRQ handler table — 扩展到 256 个 vector (真机 APIC/IOAPIC/MSI 需要) */
 static irq_handler_t g_irq_handlers[256];
+
+/* B7 阶段2: LAPIC EOI 钩子 (由 apic.drv 经 kernel_api.register_apic_eoi 注册)。
+ * 指向写 LAPIC EOI 寄存器 (0xFEE000B0) 的函数; NULL = PIC 路由模式, 不调用。
+ * 单核 BSP 场景: 注册发生在 apic.drv init (普通上下文), 调用发生在 IRQ
+ * 上下文; 函数指针赋值对齐原子, 无需锁。 */
+static void (*g_apic_eoi_hook)(void) = 0;
+
+void idt_register_apic_eoi(void (*eoi_fn)(void)) {
+    g_apic_eoi_hook = eoi_fn;
+    if (eoi_fn) {
+        log_info("[IDT] APIC EOI hook registered (LAPIC EOI on IRQ dispatch)");
+    } else {
+        log_info("[IDT] APIC EOI hook cleared");
+    }
+}
 
 /* ---- 插桩: IRQ 统计计数器 ---- */
 INSTR_STAT_DECL(pic_irq_total);
 INSTR_STAT_DECL(apic_irq_total);
 
+/* ---- B7 阶段3: 动态 IDT 向量分配器 (MSI/MSI-X 用) ----
+ * 分配范围 0x40-0xDF (160 个向量):
+ *   0x00-0x1F  CPU 异常
+ *   0x20-0x2F  PIC legacy IRQ (保留不动)
+ *   0x30-0x3F  保留给 IOAPIC GSI 16-31 未来扩展 (本阶段不动态分配)
+ *   0x40-0xDF  动态分配池 (MSI/MSI-X)
+ *   0xE0       APIC tick 自测预留 (阶段1 惯例)
+ *   0xFF       LAPIC spurious vector
+ * 数据结构: 3 x u64 位图 (192 bit, 用后 160), __builtin_ctzll 找首个
+ * 零位, 分配/释放均 O(1)。热路径无锁: SAS-R0 单核 BSP, alloc/free 只在
+ * driver_init 主上下文调用 (MSI 编程期间对应设备尚未解除中断屏蔽,
+ * IRQ 上下文不可能并发分配), 位图字为对齐 u64 单写原子。
+ * 动态入口无需新增 stub: idt_stubs.S 已为 0-255 全部向量预生成入口,
+ * 分配后 irq_register(vector, handler) 直接挂上既有分发表。 */
+#define IRQ_VEC_POOL_BASE  0x40
+#define IRQ_VEC_POOL_COUNT 160
+static u64 g_vec_bitmap[3];
+
+int irq_vector_alloc(void) {
+    for (u32 w = 0; w < 3; w++) {
+        u64 free_bits = ~g_vec_bitmap[w];
+        if (!free_bits) continue;
+        u32 bit = (u32)__builtin_ctzll(free_bits);
+        u32 idx = w * 64u + bit;
+        if (idx >= IRQ_VEC_POOL_COUNT) break;
+        g_vec_bitmap[w] |= (1ULL << bit);
+        int vec = IRQ_VEC_POOL_BASE + (int)idx;
+        log_info("[IDT] vector alloc");
+        log_hex64("[IDT]   vector=", (u64)vec);
+        return vec;
+    }
+    log_warn("[IDT] vector alloc failed: pool exhausted");
+    return -1;
+}
+
+void irq_vector_free(int vector) {
+    if (vector < IRQ_VEC_POOL_BASE ||
+        vector >= IRQ_VEC_POOL_BASE + (int)IRQ_VEC_POOL_COUNT) {
+        return;   /* 越界输入幂等忽略 (静态向量不在池内) */
+    }
+    u32 idx = (u32)(vector - IRQ_VEC_POOL_BASE);
+    g_vec_bitmap[idx / 64u] &= ~(1ULL << (idx % 64u));
+    log_info("[IDT] vector free");
+    log_hex64("[IDT]   vector=", (u64)vector);
+}
+
 int irq_register(u8 vector, irq_handler_t handler) {
-    if ((unsigned)vector >= 256) return -1;
+    /* IRQ号/向量兼容 shim: 0-15 视为 ISA IRQ 号, 换算 vector=0x20+IRQ。
+     * 依据: vector 0-15 是 CPU 异常向量 (#DE/#DB/...), idt_handler 的 IRQ
+     * 分发只覆盖 32-255, 故 0-15 作为注册目标永不可达、无歧义。
+     * 现状调用方两命名空间并存: ps2kbd(1)/e1000(11)/mouseInit(12) 传 IRQ 号,
+     * apic(0xE0)/virtio_net(0x20+n) 传向量 — 统一在此归一到向量空间。 */
+    if (vector < 16) {
+        u8 v = (u8)(0x20u + vector);
+        log_info("[IDT] irq_register: ISA IRQ number translated to vector");
+        log_hex64("[IDT]   irq=", vector);
+        log_hex64("[IDT]   vector=", v);
+        vector = v;
+    }
     g_irq_handlers[vector] = handler;
     INSTR_LOG(INSTR_LOG_DEBUG, INSTR_F_UTSM_TRACE, "[IDT] IRQ handler registered");
     return 0;
@@ -483,23 +601,53 @@ typedef struct {
 
 void idt_handler(isr_frame *frame) {
     if (frame->vector < 32) {
+        /* CR2: #PF 的 fault 线性地址；CR3: 当前页表基址。
+         * 寄存器 dump 用于定位 fault 指令的操作数来源。 */
+        u64 cr2, cr3;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
         INSTR_PROBE(EXCP, frame->vector, frame->error_code, frame->rip, 0);
         log_error("[IDT] exception");
         log_hex64("[IDT] vector=", frame->vector);
         log_hex64("[IDT] err=", frame->error_code);
         log_hex64("[IDT] rip=", frame->rip);
+        log_hex64("[IDT] cr2=", cr2);
+        log_hex64("[IDT] cr3=", cr3);
+        log_hex64("[IDT] rax=", frame->rax);
+        log_hex64("[IDT] rcx=", frame->rcx);
+        log_hex64("[IDT] rdx=", frame->rdx);
+        log_hex64("[IDT] rsi=", frame->rsi);
+        log_hex64("[IDT] rdi=", frame->rdi);
+        log_hex64("[IDT] r8=", frame->r8);
+        log_hex64("[IDT] r9=", frame->r9);
+        log_hex64("[IDT] r10=", frame->r10);
+        log_hex64("[IDT] r11=", frame->r11);
+        log_hex64("[IDT] cs=", frame->cs);
+        log_hex64("[IDT] rflags=", frame->rflags);
         for (;;) { __asm__ volatile ("cli; hlt"); }
     }
 
-    /* PIC IRQ: vectors 0x20-0x2F (32-47) */
+    /* PIC IRQ: vectors 0x20-0x2F (32-47)
+     * B7 阶段2: 本分支同时服务两种路由来源:
+     *   - 8259 PIC 路由 (默认): handler 后只需 8259 EOI, 钩子为 NULL 跳过;
+     *   - IOAPIC->LAPIC 路由 (apic_route=1, legacy 线重定向到 0x20-0x2F):
+     *     中断由 LAPIC 递交, ISR 位置位, 必须写 LAPIC EOI (钩子) 清除,
+     *     否则同级 (vector[7:4] 相同) 中断被永久阻塞 — 每条线只投递一次。
+     * LAPIC EOI 先于 8259 EOI; PIC 全屏蔽时 8259 EOI 为无害 no-op
+     * (8259 无 in-service 位, 非特异性 EOI 不写任何状态)。 */
     if (frame->vector >= 32 && frame->vector <= 47) {
         INSTR_STAT_INC(pic_irq_total);
         u8 irq = (u8)(frame->vector - 0x20);
 
-        /* call registered handler */
+        /* call registered handler; 返回 1 = 自负 EOI 全责 (两者皆抑制) */
         if (g_irq_handlers[frame->vector]) {
             int suppress_eoi = g_irq_handlers[frame->vector](irq);
             if (suppress_eoi) return;
+        }
+
+        /* LAPIC EOI (IOAPIC 路由时必需; PIC 路由时钩子为 NULL) */
+        if (g_apic_eoi_hook) {
+            g_apic_eoi_hook();
         }
 
         /* send PIC EOI */
@@ -511,19 +659,23 @@ void idt_handler(isr_frame *frame) {
     }
 
     /* APIC/IOAPIC/MSI IRQ: vectors 0x30-0xFF (48-255)
-     * **QEMU 无法测试但真机必需的代码路径**:
-     *   - APIC EOI 写入 LAPIC EOI 寄存器 (0xFEE000B0)
-     *   - 当前 PIC 仍激活, 不需要 APIC EOI
-     *   - 迁移到 IOAPIC 后需要此处补 APIC EOI */
+     * handler 约定: 返回 0 -> 由钩子补 LAPIC EOI (安全网);
+     *               返回 1 -> handler 已自行 LAPIC EOI, 跳过钩子。
+     * 钩子未注册 (纯 PIC 路由) 时本分支不做任何 EOI — 与旧版行为一致,
+     * 此时 handler 必须自行 LAPIC EOI (参见 apic.drv tick handler)。 */
     if (frame->vector >= 48 && frame->vector <= 255) {
+        /* LAPIC spurious (SVR 低 8 位 = 0xFF): 规范上不置 ISR 位, 永不需 EOI。
+         * 若在此调钩子写 EOI, 会误清嵌套场景下真正 in-service 的最高位,
+         * 故特判直接返回 (EOI 空 ISR 虽无害, 但语义上 spurious 不该有 EOI)。 */
+        if (frame->vector == 0xFF) return;
         INSTR_STAT_INC(apic_irq_total);
+        int suppress_eoi = 0;
         if (g_irq_handlers[frame->vector]) {
-            g_irq_handlers[frame->vector]((u8)frame->vector);
+            suppress_eoi = g_irq_handlers[frame->vector]((u8)frame->vector);
         }
-        /* TODO: LAPIC EOI — 写 0 到 LAPIC EOI 寄存器 (mmio offset 0xB0)
-         * 当从 PIC 迁移到 APIC 中断路由时, 必须在此处添加:
-         *   *(volatile u32 *)(hhdm_offset + lapic_phys + 0xB0) = 0;
-         */
+        if (!suppress_eoi && g_apic_eoi_hook) {
+            g_apic_eoi_hook();
+        }
         return;
     }
 }

@@ -1,0 +1,8 @@
+# Deshab Linux desktop apps (LINUXAPP.CNF)
+# Format per line: DISPLAY_NAME|linux command
+# - '#' starts a comment, blank lines are ignored
+# - display name <= 11 chars, command <= 63 chars, args split on spaces
+# - command runs in the Linux guest via the compat layer (see dsl command)
+HELLO|/bin/echo hello from deshab linux
+UNAME|/bin/uname -a
+LS|/bin/ls -l /

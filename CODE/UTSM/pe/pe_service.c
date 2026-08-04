@@ -17,6 +17,7 @@
 #include "x86emu32.h"
 #include "../include/utsm/pe.h"
 #include <utsm/arena.h>
+#include <utsm/idt.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 
@@ -275,6 +276,12 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         log_info("[PE] running PE32+ natively");
         pe_enable_sse();
 
+        /* 恢复异常可见性:UTSM 交权 DSK 时 idt_halt_all() 将 IDT 全部
+         * 替换为静默 halt stub,PE 原生执行期间的 CPU 异常(PF/GP/UD)
+         * 会被无声吞掉。安装 PE 诊断 IDT 后异常走 idt_handler 打完整
+         * vector/err/rip/CR2/寄存器日志再安全停机。 */
+        idt_install_pe_diag();
+
         /* 独立 1MB 栈(内核栈仅 16KB,egui 渲染会溢出) */
         u8 *pe_stack = (u8 *)kmem_alloc_aligned(PE_STACK_BYTES, 4096);
         if (!pe_stack) {
@@ -283,9 +290,13 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         }
         u64 stack_top = (u64)pe_stack + PE_STACK_BYTES;  /* 4096 对齐 -> 16 对齐 */
 
+        /* BUG-20260801-006: __builtin_setjmp 必须直接出现在
+         * pe_service_run 本体内——该帧在 PE 执行全程存活,longjmp
+         * 恢复合法.原 pe_shim_setup_exit() 包装函数 setjmp 后即返回,
+         * longjmp 跨已销毁帧 = UB(实测从脏栈 pop 出 log_hex64 缓冲
+         * 残片充当 R12-R15/RBP → 野指针 call → 三重故障). */
         u64 code = 0;
-        int jumped = pe_shim_setup_exit();
-        if (jumped == 0) {
+        if (__builtin_setjmp(pe_shim_exit_jmpbuf()) == 0) {
             pe_entry_fn entry = (pe_entry_fn)info.entry_point;
             log_hex64("[PE] entry=", (u64)entry);
             log_hex64("[PE] stack_top=", stack_top);
@@ -323,22 +334,30 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         }
         emu.eip = img.entry_point;
 
+        /* BUG-20260801-007: fn64 回退 shim 收到的指针参数是 32 位
+         * guest VA,设置解释器内存基址使 shim 内 gp() 完成 guest→host
+         * 转换;运行结束立即复位(原生 PE32+ 路径恒为 0,gp 恒等映射). */
+        pe_shim_set_emu_base((u64)img.mem);
+
+        /* BUG-20260801-006: 同 PE32+ 路径,setjmp 直接出现在本体内.
+         * PE32 解释器路径同一 longjmp 机制,同样暴露在 UB 下. */
         u64 code = 0;
-        int jumped = pe_shim_setup_exit();
-        if (jumped == 0) {
+        if (__builtin_setjmp(pe_shim_exit_jmpbuf()) == 0) {
             int rrc = x86emu32_run(&emu, &code);
             if (rrc != 0) {
                 log_error("[PE32] emulator error");
                 code = 0xFFFFFFFFULL;
             }
+            /* emu 字段只在未发生 longjmp 的正常返回路径读取
+             * (setjmp 语义:longjmp 后被修改的自动变量值不确定) */
+            if (emu.error && !emu.exited) {
+                log_warn("[PE32] emulator stopped with error");
+            }
         } else {
             code = pe_shim_get_exit_code();
             log_hex64("[PE32] ExitProcess code=", code);
         }
-
-        if (emu.error && !emu.exited) {
-            log_warn("[PE32] emulator stopped with error");
-        }
+        pe_shim_set_emu_base(0);
 
         if (exit_code) *exit_code = code;
         return 0;

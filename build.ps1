@@ -672,6 +672,10 @@ foreach ($tool in $toolApps) {
 Write-Host '[build] Building DKM framebuffer driver...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\console_fb\console_fb.c') (Join-Path $SystemDir 'driver\console\console_fb.drv')
 
+# B7: apic.drv 纳入构建 (原 platform/apic.drv 为预置二进制, 不随 apic.c 更新)
+Write-Host '[build] Building DKM platform apic driver...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\apic\apic.c') (Join-Path $SystemDir 'driver\platform\apic.drv')
+
 Write-Host '[build] Building DKM storage drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\nvme\nvme.c') (Join-Path $SystemDir 'driver\block\nvme.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\xhci\xhci.c') (Join-Path $SystemDir 'driver\block\xhci.drv')

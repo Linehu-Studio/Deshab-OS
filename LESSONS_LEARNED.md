@@ -593,4 +593,39 @@
 2. **字符范围要覆盖全部可打印 ASCII**: 原 `fb_char` 用 `ch >= ' ' && ch <= 'z'`（0x7a）截断，导致 `{` `|` `}` `~` 显示为空格；改为 `ch > '~'`（0x7e）后覆盖全部 95 个可打印字符。
 3. **布局偏移要跟随字高调整**: ASCII_H 从 16 变为 18 后，硬编码的 `y+(h-16)/2` 需改为 `y+(h-ASCII_H)/2`，wifi 行的 `y+17`（选中标记居中）需改为 `y+16`（(50-18)/2=16）。
 
+## 2026-08-03 — B7 DKM 侧 LAPIC + IOAPIC 接管中断路由（PIC→APIC 迁移第一步）
+
+### 经验
+
+1. **tick 链路自验是路由切换的最强证据**: 切换后用 PIT ch0 mode3 100Hz 作真实中断源，统计 handler 调用次数（阈值 >=2）。重复投递证明 LAPIC EOI 正确（无 EOI 时 edge/level 都只投递一次），比"读寄存器确认"可信得多。验证窗口用 TSC deadline 实现，不依赖任何中断。
+2. **先保存再切换，失败完整降级**: 切换前保存 PIC IMR（0x21/0xA1），验证失败时 IOAPIC 全 mask + 恢复 IMR + 注销 handler + PIT 恢复 18.2Hz，系统无感回到 PIC 路由。stage0 时机早，此时所有 stage1-3 驱动尚未加载，降级零成本。
+3. **FUCK 配置自解析 + 双开关**: `apic_route`（主开关，默认 0 保持 PIC）与 `apic_route_legacy`（legacy 线实验开关）分离，默认行为与旧版本完全一致，回归风险为零。
+4. **tick vector 选 0xE0 避开了 LAPIC ISR 卡位陷阱**: LAPIC 规则要求新中断优先级 (vec>>4) 严格高于当前 ISR 才投递。若 tick 选 0x20-0x2F（优先级 2），一旦有无 EOI 的 0x2x 中断先卡位，tick 将永远静默，验证必失败。0xE0（优先级 14）无此问题。
+5. **MADT ISO 必须查表，不能假设恒等**: QEMU q35 的 PIT IRQ0→GSI2（非恒等），键盘 IRQ1→GSI1（恒等）。`isa_irq_to_gsi` 先查 ISO 再回退恒等，两种拓扑都正确。
+6. **验证脚本参数化**: w3c_route0/1.bat 固定 monitor 端口（45701/45702）+ TMP/TEMP 指向项目内目录（解决 edk2 pflash overlay 在中文用户名 Temp 下创建失败）+ `-snapshot` 保护镜像。
+
+### 教训
+
+1. **IOREDTBL 位布局抄错规范是隐蔽杀手**: 初版把 polarity/trigger/mask 错置于 bit 11/13/14（正确为 13/15/16）。mask 写入只读 remote IRR 位从未生效，"all masked" 名不副实；readback 读 remote IRR 恒 0，给出虚假证据。QEMU（全 active-high edge ISA）下功能侥幸正常，但真机 level/active-low PCI 线必炸。**硬件寄存器位定义必须对照原始 datasheet（82093AA），注释与代码同步修正，readback 证据必须与 claim 交叉验证。**
+2. **build.ps1 漏编 apic.drv 导致修改不生效**: 原 `driver/platform/apic.drv` 是预置二进制，改 apic.c 后镜像不变。任何"驱动源码修改后行为无变化"都应先检查构建脚本是否真的编译了该驱动。
+3. **QEMU pflash overlay 依赖 %TEMP%**: 中文用户名路径下临时 overlay 创建失败（`vl.XXXXXX: No such file or directory`），必须显式设置 TMP/TEMP 到纯 ASCII 路径。
+4. **PIT mode3 计数器每 CLK 减 2**: 用 PIT 校准 TSC 时若按"减 1"假设，tsc_per_ms 偏小 2 倍，所有派生 delay 翻倍。校准代码必须考虑 mode2/mode3 差异（本轮 tick 计数 100@500ms 即为 2x 观察，功能不受影响但时序类代码需注意）。
+
+## 2026-08-03 — B7 阶段2 UTSM 侧 LAPIC EOI 钩子落地 + legacy IRQ 持续投递 + tick 2x HPET 定论
+
+### 经验
+
+1. **EOI 钩子经 kernel_api 尾部追加是 ABI 安全的最小改动**: `register_apic_eoi` 追加在 `dkm_kernel_api` 末尾（不动既有字段偏移），UTSM 侧 `g_apic_eoi_hook` 为 NULL 时跳过调用，PIC 模式行为与旧版逐字节一致。新内核+旧驱动（钩子 NULL）与旧内核+新驱动（驱动判空跳过）双向兼容。
+2. **handler 返回码区分"自 EOI"与"钩子兜底"**: idt_handler 两个 IRQ 分支（PIC 0x20-0x2F / APIC 0x30-0xFF）约定 handler 返回 1 = 已自行 LAPIC EOI（如阶段1 的 0xE0 tick handler），返回 0 = 由钩子补 EOI 安全网。分层职责让 handler 写法自由，链路永不漏 EOI。
+3. **tick 验证 vector 从 0xE0 迁回 0x20 才能证明 legacy 分支**: 阶段1 用 0xE0 自 EOI 只证明了 APIC 分支（0x30+）；阶段2 把 tick handler 迁到 0x20（PIC 分支），与键盘 0x21/鼠标 0x2C 同一代码路径，500ms 内重复投递 101 次即证明 "legacy vector 分支 + 钩子 EOI" 全链路可持续。
+4. **spurious 向量 0xFF 必须特判跳过 EOI 钩子**: LAPIC spurious（SVR 低 8 位）规范上不置 ISR 位、永不需 EOI；若对 0xFF 也调钩子写 EOI，嵌套场景下会误清真正 in-service 的最高优先级位。
+5. **HPET 主计数器是 QEMU 下最干净的绝对时基**: 解析 ACPI HPET 表 → MMIO 主计数器（100MHz，周期从 GCAP_ID[63:32] 读飞秒值）→ 直接换算 us，不依赖 PIT/TSC 任何先验。tick 2x 的两个候选假设（TSC 校准测半 vs PIT mode3 双触发）用一次对拍即定案：calib 窗口 10132us 准确 + verify 窗口 504883us 准确 + 实测 200Hz → PIT mode3 方波全周期双沿触发定论（详见 BUG-20260803-009）。
+6. **观察窗长度必须覆盖注入链路延迟**: "内核打锚点 → 串口落盘（块缓冲）→ 测试脚本轮询可见 → monitor 注入" 链路延迟 ~1s 量级，3s 窗口实测被吃光（注入到达时窗口已关闭，计数=0），6000ms 才稳定拿到注入数据（鼠标 27 包 / 键盘 8 包）。
+
+### 教训
+
+1. **PS/2 控制器交互期间绝不能有 IRQ handler 偷读 0x60**: diag handler 先于 `ps2_aux_enable_stream()` 注册时，控制器命令响应字节（0xFA ACK 等）被 handler 当数据包读走，轮询侧 wait_output 超时（表现为 F3 nack 假象，实为字节被偷）。铁律：控制器命令序列全轮询完成后再注册 handler；交互期间到达的 IRQ 因 handler 未注册只会被 EOI 丢弃，无副作用。
+2. **真机级别的寄存器语义要按设备类强制**: PCI INTx（e1000 IRQ11）无 MADT ISO 覆盖时必须强制 level/active-low（PCI 规范 + QEMU pci irq 电平语义 + Linux/Windows 同配置），ISA 线才按 ISO 表缺省 edge/high；一概套 ISO 缺省会让 PCI 设备中断一次性投递后卡死。
+3. **验证脚本数组参数经 -File 传递会被合并**: `powershell -File xxx.ps1 -Scenarios @('B1','B2')` 中数组变单字符串 "B1 B2"（场景被跳过且报"未知场景"），需用 `powershell -Command "& 'xxx.ps1' -Scenarios 'B1','B2'"`。
+
 

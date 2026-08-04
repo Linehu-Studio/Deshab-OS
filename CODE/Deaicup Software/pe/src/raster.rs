@@ -141,9 +141,15 @@ fn raster_tri(
         let mut w0 = edge(x1, y1, x2, y2, px as f32 + 0.5, fy) * inv_area;
         let mut w1 = edge(x2, y2, x0, y0, px as f32 + 0.5, fy) * inv_area;
         let mut w2 = 1.0 - w0 - w1;
-        // Per-pixel increments (dx = +1)
-        let dw0 = (y1 - y2) * inv_area;
-        let dw1 = (y2 - y0) * inv_area;
+        // Per-pixel increments (dx = +1).
+        // d/dpx edge(a, b, P) = (b.y - a.y):
+        //   w0 = edge(p1, p2, P) -> (y2 - y1)
+        //   w1 = edge(p2, p0, P) -> (y0 - y2)
+        // 符号写反会让 u/v/顶点色沿 +x 反向插值：文字逐行起始像素正确、
+        // 向右逐渐反向采样图集（字形水平镜像/竖条碎裂），纯色面板因
+        // 采样恒白区域不可见而掩盖了该 bug。
+        let dw0 = (y2 - y1) * inv_area;
+        let dw1 = (y0 - y2) * inv_area;
 
         while px < max_x {
             if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {

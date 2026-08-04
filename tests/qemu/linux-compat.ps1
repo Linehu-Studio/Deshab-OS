@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     linux-compat — UTSM+Linux 双内核兼容层端到端（docs/RE/test-cases/linux-compat.md）
@@ -35,7 +35,7 @@ $result = New-TestCaseResult 'linux-compat'
 Set-DeshabFirstInit -First 1 -DevMode 1
 Set-DeshabAutoexec -Lines @('ver', 'exit')
 
-$s = Start-QemuSession -Name 'linux-compat' -Cpu $Cpu
+$s = Start-QemuSession -Name 'linux-compat' -Cpu $Cpu -MonitorPort 45503
 try {
     # ---- 分流点：VMM 自检通过 还是 VMM 不可用 ----
     $fork = Wait-QemuLog -Session $s -Patterns @(

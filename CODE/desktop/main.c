@@ -265,6 +265,10 @@ static int g_drag_off_x, g_drag_off_y;
 static app_descriptor g_apps[MAX_APPS];
 static int g_app_count = 0;
 
+/* Linux 兼容层服务运行态（register_linux_apps 设置）：0 时 Linux 图标置灰，
+ * 双击仍开终端窗口并提示不可用原因（lnx_on_create 运行时复查）。 */
+static int g_lnx_svc_up = 0;
+
 static desktop_icon g_icons[MAX_ICONS];
 static int g_icon_count = 0;
 
@@ -545,24 +549,25 @@ static void draw_icon_browser(du_context *ctx, int cx, int cy) {
     du_pixel(ctx, ccx, ccy, KS_ACCENT2);
 }
 
-/* Linux 应用图标：暗底终端 + 霓虹绿 >_ 提示符（与 bash 终端同色板） */
-static void draw_icon_linux(du_context *ctx, int cx, int cy) {
+/* Linux 应用图标：暗底终端 + 霓虹绿 >_ 提示符（与 bash 终端同色板）。
+ * 服务不可用时 accent 传 KS_TEXT_DIM（置灰，点击仍给原因提示）。 */
+static void draw_icon_linux(du_context *ctx, int cx, int cy, u32 accent) {
     du_fill_rect(ctx, cx, cy, 40, 40, KS_BG_PRIMARY);
-    du_rect_outline(ctx, cx, cy, 40, 40, KS_ACCENT2, 2);
+    du_rect_outline(ctx, cx, cy, 40, 40, accent, 2);
     /* '>' 折线 */
-    du_fill_rect(ctx, cx + 8,  cy + 12, 2, 2, KS_ACCENT2);
-    du_fill_rect(ctx, cx + 10, cy + 14, 2, 2, KS_ACCENT2);
-    du_fill_rect(ctx, cx + 12, cy + 16, 2, 2, KS_ACCENT2);
-    du_fill_rect(ctx, cx + 10, cy + 18, 2, 2, KS_ACCENT2);
-    du_fill_rect(ctx, cx + 8,  cy + 20, 2, 2, KS_ACCENT2);
+    du_fill_rect(ctx, cx + 8,  cy + 12, 2, 2, accent);
+    du_fill_rect(ctx, cx + 10, cy + 14, 2, 2, accent);
+    du_fill_rect(ctx, cx + 12, cy + 16, 2, 2, accent);
+    du_fill_rect(ctx, cx + 10, cy + 18, 2, 2, accent);
+    du_fill_rect(ctx, cx + 8,  cy + 20, 2, 2, accent);
     /* '_' 光标块 */
-    du_fill_rect(ctx, cx + 16, cy + 22, 8, 2, KS_ACCENT2);
+    du_fill_rect(ctx, cx + 16, cy + 22, 8, 2, accent);
 }
 
 static void draw_app_icon(du_context *ctx, int app_id, int cx, int cy) {
     /* Linux 应用走专属图标（暗底绿提示符），其余保持原有映射 */
     if (app_id >= 0 && app_id < g_app_count && g_apps[app_id].linux_cmd) {
-        draw_icon_linux(ctx, cx, cy);
+        draw_icon_linux(ctx, cx, cy, g_lnx_svc_up ? KS_ACCENT2 : KS_TEXT_DIM);
         return;
     }
     switch (app_id) {
@@ -1355,19 +1360,16 @@ static void lnx_on_destroy(void *state) {
 }
 
 /* ---- Linux 应用注册 ----
- * 服务不可用（reserved[5] 为空或 magic 不匹配或 guest 未就绪）时直接返回，
- * 不注册任何图标，desktop 其余功能不受影响。
+ * 无论服务是否可用都注册图标：可用时双击即同步 exec；不可用（VMX 缺失/
+ * guest 未驻留）时图标置灰（g_lnx_svc_up=0），双击由 lnx_on_create 运行时
+ * 复查并显示 "linux: compat service unavailable [exit -1]"，绝不 panic。
  * 配置：FAT32 根目录 LINUXAPP.CNF（8.3 名 LINUXAPPCNF），每行 显示名|linux命令；
- * 文件缺失或无有效行时回退内置默认列表（neofetch / htop）。 */
+ * 文件缺失或无有效行时回退内置默认列表（echo hello / uname -a / ls -l /，
+ * 三条均为 Arch rootfs 与 initramfs busybox 环境共有的可执行命令）。 */
 static void register_linux_apps(void) {
-    if (!g_lxc_svc) {
-        slog("linux apps: service absent");
-        return;
-    }
-    if (!g_lxc_svc->is_available()) {
-        slog("linux apps: service unavailable");
-        return;
-    }
+    g_lnx_svc_up = (g_lxc_svc && g_lxc_svc->is_available()) ? 1 : 0;
+    if (!g_lxc_svc) slog("linux apps: service absent (icons greyed)");
+    else if (!g_lnx_svc_up) slog("linux apps: service unavailable (icons greyed)");
 
     da_linux_app ents[DA_LINUXAPP_MAX];
     int n = 0;
@@ -1379,12 +1381,14 @@ static void register_linux_apps(void) {
     }
 
     if (n <= 0) {
-        /* 内置默认保底 */
-        kstrcpy(g_lnx_name_pool[0], "NEOFETCH", 12);
-        kstrcpy(g_lnx_cmd_pool[0], "/usr/bin/neofetch", 64);
-        kstrcpy(g_lnx_name_pool[1], "HTOP", 12);
-        kstrcpy(g_lnx_cmd_pool[1], "/usr/bin/htop", 64);
-        n = 2;
+        /* 内置默认保底（guest 中确定存在的命令） */
+        kstrcpy(g_lnx_name_pool[0], "HELLO", 12);
+        kstrcpy(g_lnx_cmd_pool[0], "/bin/echo hello from deshab linux", 64);
+        kstrcpy(g_lnx_name_pool[1], "UNAME", 12);
+        kstrcpy(g_lnx_cmd_pool[1], "/bin/uname -a", 64);
+        kstrcpy(g_lnx_name_pool[2], "LS", 12);
+        kstrcpy(g_lnx_cmd_pool[2], "/bin/ls -l /", 64);
+        n = 3;
         slog("linux apps: builtin defaults");
     } else {
         for (int i = 0; i < n; i++) {
@@ -1403,6 +1407,12 @@ static void register_linux_apps(void) {
             0, g_lnx_cmd_pool[i]
         };
         g_app_count++;
+        {
+            char msg[64];
+            kstrcpy(msg, "linux app registered: ", 64);
+            kstrcat(msg, g_lnx_name_pool[i], 64);
+            slog(msg);
+        }
     }
     slog("linux apps registered");
 }
@@ -1759,7 +1769,8 @@ static void register_apps(void) {
     };
     g_app_count++;
 
-    /* Linux 兼容层应用（服务不可用时内部直接返回，不注册图标） */
+    /* Linux 兼容层应用：无论服务是否可用都注册图标（不可用时置灰，
+     * 双击仍开终端窗口提示原因，见 register_linux_apps / lnx_on_create） */
     register_linux_apps();
 }
 
@@ -1791,6 +1802,24 @@ static void setup_desktop_icons(void) {
         g_icons[g_icon_count].selected = 0;
         g_shortcuts[i].x = x;  /* 记录位置用于点击检测 */
         g_shortcuts[i].y = y;
+        g_icon_count++;
+        x += KATE_ICON_W + KATE_ICON_GAP;
+    }
+
+    /* 再追加 Linux 应用图标（register_linux_apps 已登记进 g_apps，带 linux_cmd）。
+     * 服务不可用时图标仍上架但置灰（draw_app_icon 查 g_lnx_svc_up），
+     * 双击开终端窗口提示原因，与可用时同一入口。 */
+    for (int a = 0; a < g_app_count && g_icon_count < MAX_ICONS; a++) {
+        if (!g_apps[a].linux_cmd) continue;
+        if (x > pad && x + KATE_ICON_W > max_x) {
+            x = pad;
+            y += KATE_ICON_H + KATE_ICON_GAP;
+        }
+        g_icons[g_icon_count].app_id = a;
+        g_icons[g_icon_count].x = x;
+        g_icons[g_icon_count].y = y;
+        g_icons[g_icon_count].label = g_apps[a].display_name;
+        g_icons[g_icon_count].selected = 0;
         g_icon_count++;
         x += KATE_ICON_W + KATE_ICON_GAP;
     }

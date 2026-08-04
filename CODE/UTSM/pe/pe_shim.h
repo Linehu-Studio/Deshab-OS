@@ -49,9 +49,22 @@ void pe_shim_init(const char *cmdline);
  * 64位和32位共用。exit_code = 进程退出码。 */
 void pe_shim_exit_process(u64 exit_code);
 
-/* pe_run 调用：保存上下文（__builtin_setjmp）。
- * 返回 0 = 首次（继续执行 PE），1 = ExitProcess 触发（longjmp 回来）。 */
-int pe_shim_setup_exit(void);
+/* 获取 ExitProcess longjmp 目标 jmpbuf，并重置退出状态。
+ *
+ * BUG-20260801-006：__builtin_setjmp 必须出现在 PE 执行全程存活的
+ * 栈帧内（pe_service_run 本体）。此前由 pe_shim_setup_exit() 包装
+ * 调用——该函数调用 setjmp 后即返回，C 标准明确规定"含 setjmp 的
+ * 函数已返回后再 longjmp"为未定义行为（实测 longjmp 尾声从脏栈
+ * pop 出 log_hex64 缓冲区 ASCII 残片充当 R12-R15/RBP → 野指针
+ * call → 三重故障）。
+ *
+ * 调用方标准写法（setjmp 直接出现在调用方函数本体内）：
+ *   if (__builtin_setjmp(pe_shim_exit_jmpbuf()) == 0) {
+ *       ... 执行 PE ...
+ *   } else {
+ *       code = pe_shim_get_exit_code();
+ *   } */
+void **pe_shim_exit_jmpbuf(void);
 
 /* 获取上次 ExitProcess 的退出码 */
 u64 pe_shim_get_exit_code(void);
@@ -61,5 +74,12 @@ int pe_shim_is_exit_call(u64 target);
 
 /* 获取 cmdline（shim 内部用） */
 const char *pe_shim_get_cmdline(void);
+
+/* BUG-20260801-007：设置 PE32 解释器内存基址（guest→host 指针转换）。
+ * PE32 解释器路径下，fn64 回退 shim 收到的指针参数是 32 位 guest VA
+ * （相对解释器 mem 基址的偏移），直接当 host 指针解引用 → 低地址 #PF
+ * → 三重故障。执行 PE32 前设置 base=mem，shim 内部 gp() 在指针解引用点
+ * 完成转换；base=0 表示非解释器上下文（原生 PE32+ 路径），gp() 恒等映射。 */
+void pe_shim_set_emu_base(u64 base);
 
 #endif /* PE_SHIM_H */

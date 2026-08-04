@@ -56,7 +56,8 @@ static dkm_kernel_api g_kernel_api = {
     .block = 0,
     .mmio = 0,
     .mm_map_mmio = 0,
-    .mm_unmap_mmio = 0
+    .mm_unmap_mmio = 0,
+    .register_apic_eoi = 0
 };
 
 const dkm_kernel_api *dkm_get_kernel_api(void) {
@@ -94,4 +95,9 @@ void dkm_fill_platform_info(void) {
     }
     g_kernel_api.mm_map_mmio = mm_map_mmio;
     g_kernel_api.mm_unmap_mmio = mm_unmap_mmio;
+    /* B7 阶段2: 暴露 LAPIC EOI 钩子注册入口（apic.drv LAPIC 接管时调用） */
+    g_kernel_api.register_apic_eoi = idt_register_apic_eoi;
+    /* B7 阶段3: 暴露动态向量分配器（MSI/MSI-X 设备驱动使用） */
+    g_kernel_api.irq_vector_alloc = irq_vector_alloc;
+    g_kernel_api.irq_vector_free = irq_vector_free;
 }

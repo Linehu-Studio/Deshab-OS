@@ -1,0 +1,44 @@
+# Makefile.linux — Deshab 桌面 Linux SDL2 宿主构建
+#
+# 用法（在 Linux 下，CODE/desktop/ 目录）：
+#   make -f Makefile.linux            # 编译 desktop_host
+#   make -f Makefile.linux run        # 编译并运行（默认读 ../../ISO/deshab.img）
+#   make -f Makefile.linux clean
+#
+# 依赖：gcc/clang、libsdl2-dev（apt install libsdl2-dev）
+# 产物：desktop_host（普通 Linux 可执行文件）
+#
+# 与裸机 MAKEFILE 完全独立：不带 -ffreestanding/-mno-sse/-target，
+# 不使用 linker.ld；通过 -DDESHAB_HOST 启用 host_main.c + main.c 中的宿主分支。
+
+CC      ?= gcc
+SDL_CFLAGS := $(shell sdl2-config --cflags 2>/dev/null)
+SDL_LIBS   := $(shell sdl2-config --libs 2>/dev/null)
+
+ROOT    := ../..
+IMG     := $(ROOT)/ISO/deshab.img
+
+CFLAGS  := -DDESHAB_HOST -O2 -Wall -Wextra -g \
+           -I. -I../UTSM/include -I../tools -I../firstInit \
+           $(SDL_CFLAGS)
+LDFLAGS := $(SDL_LIBS) -lm
+
+TARGET  := desktop_host
+SRCS    := main.c host_main.c
+OBJS    := $(SRCS:.c=.o)
+
+.PHONY: all run clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+%.o: %.c host_main.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+run: $(TARGET)
+	./$(TARGET) --img $(IMG)
+
+clean:
+	rm -f $(OBJS) $(TARGET)

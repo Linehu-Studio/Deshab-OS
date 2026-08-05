@@ -19,8 +19,6 @@
  */
 
 #include "../UTSM/include/utsm/dsk.h"
-/* Linux 兼容层服务接口（reserved[5]，exec/file_list/file_read） */
-#include "../UTSM/include/utsm/linux_compat.h"
 
 /* block 设备函数类型（从 kernel_api + 0xA8 获取 block_api，read @ +0x10, write @ +0x18） */
 typedef int (*desktop_block_read_fn)(u32 index, u64 lba, u32 count, void *buffer);
@@ -43,11 +41,6 @@ typedef long long          i64;
 
 static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
 static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
-
-/* Linux 桌面应用配置契约（da_linuxapp_parse / DA_LINUXAPP_* 常量）。
- * DA_NO_PORTIO：本文件已自带 outb/inb，跳过头文件内同名定义。 */
-#define DA_NO_PORTIO
-#include "../tools/desktop_app.h"
 
 static void sputc(char c) {
     for (unsigned int i=0; i<100000; i++) { if (inb(COM1+5)&0x20) break; }
@@ -78,7 +71,6 @@ static void redraw_all(void);
 static int  ps2_mouse_poll(void);
 static void draw_statusbar_full(void);
 static void files_refresh(void);
-static void shortcuts_refresh(void);
 
 /* ============================================================
  *  常量（Winux-Kate 布局）
@@ -172,10 +164,6 @@ typedef struct {
     app_draw_fn    on_draw;
     app_destroy_fn on_destroy;
     const char *elf_name;
-    /* Linux 兼容层命令（Phase 5，如 "/usr/bin/neofetch"）。与 elf_name 互斥：
-     * 两者同时设置时 elf_name 优先（走外部 ELF 全屏宿主），linux_cmd 被忽略；
-     * 仅设置 linux_cmd 时必须提供 on_create（内置终端窗口承载执行）。 */
-    const char *linux_cmd;
 } app_descriptor;
 
 /* 桌面图标 */
@@ -186,16 +174,7 @@ typedef struct {
     int    selected;
 } desktop_icon;
 
-/* 桌面快捷方式（从 SYSTEM/user/desktop 目录加载 .lnk 文件） */
-typedef struct {
-    char display_name[24];  /* 显示名称（UTF-8） */
-    char elf_name[11];      /* ELF 文件名（FAT32 8.3） */
-    char icon_type[12];     /* 图标类型：editor/folder/browser/terminal */
-    int  x, y;              /* 桌面位置 */
-    int  selected;          /* 选中状态 */
-} desktop_shortcut;
-
-#define MAX_ICONS 24        /* 桌面图标槽（内置应用 + 用户快捷方式） */
+#define MAX_ICONS 8
 
 /* 工作区 */
 typedef struct {
@@ -260,21 +239,13 @@ static int g_dragging = 0;
 static int g_drag_win = -1;
 static int g_drag_off_x, g_drag_off_y;
 
-/* 应用表（16 = 6 内置 + DA_LINUXAPP_MAX 8 个 Linux 应用 + 余量） */
-#define MAX_APPS 16
+/* 应用表 */
+#define MAX_APPS 8
 static app_descriptor g_apps[MAX_APPS];
 static int g_app_count = 0;
 
-/* Linux 兼容层服务运行态（register_linux_apps 设置）：0 时 Linux 图标置灰，
- * 双击仍开终端窗口并提示不可用原因（lnx_on_create 运行时复查）。 */
-static int g_lnx_svc_up = 0;
-
 static desktop_icon g_icons[MAX_ICONS];
 static int g_icon_count = 0;
-
-/* 用户快捷方式（从 SYSTEM/user/desktop 加载） */
-static desktop_shortcut g_shortcuts[MAX_ICONS];
-static int g_shortcut_count = 0;
 
 /* ---- Kate 外壳状态 ---- */
 static int g_booted = 0;
@@ -549,27 +520,7 @@ static void draw_icon_browser(du_context *ctx, int cx, int cy) {
     du_pixel(ctx, ccx, ccy, KS_ACCENT2);
 }
 
-/* Linux 应用图标：暗底终端 + 霓虹绿 >_ 提示符（与 bash 终端同色板）。
- * 服务不可用时 accent 传 KS_TEXT_DIM（置灰，点击仍给原因提示）。 */
-static void draw_icon_linux(du_context *ctx, int cx, int cy, u32 accent) {
-    du_fill_rect(ctx, cx, cy, 40, 40, KS_BG_PRIMARY);
-    du_rect_outline(ctx, cx, cy, 40, 40, accent, 2);
-    /* '>' 折线 */
-    du_fill_rect(ctx, cx + 8,  cy + 12, 2, 2, accent);
-    du_fill_rect(ctx, cx + 10, cy + 14, 2, 2, accent);
-    du_fill_rect(ctx, cx + 12, cy + 16, 2, 2, accent);
-    du_fill_rect(ctx, cx + 10, cy + 18, 2, 2, accent);
-    du_fill_rect(ctx, cx + 8,  cy + 20, 2, 2, accent);
-    /* '_' 光标块 */
-    du_fill_rect(ctx, cx + 16, cy + 22, 8, 2, accent);
-}
-
 static void draw_app_icon(du_context *ctx, int app_id, int cx, int cy) {
-    /* Linux 应用走专属图标（暗底绿提示符），其余保持原有映射 */
-    if (app_id >= 0 && app_id < g_app_count && g_apps[app_id].linux_cmd) {
-        draw_icon_linux(ctx, cx, cy, g_lnx_svc_up ? KS_ACCENT2 : KS_TEXT_DIM);
-        return;
-    }
     switch (app_id) {
     case 0: draw_icon_terminal(ctx, cx, cy); break;
     case 1: draw_icon_editor(ctx, cx, cy);   break;
@@ -1155,269 +1106,6 @@ __attribute__((unused))
 static void bash_on_destroy(void *state) { (void)state; }
 
 /* ============================================================
- *  Linux 兼容层应用 (Phase 5)
- *  图标 → 终端风格窗口 → linux_compat_service.exec 同步执行。
- *  exec 是同步阻塞调用（park-and-resume 到 Linux guest 完成才返回），
- *  无 out_cb 流式回调：先绘制 running 状态再阻塞，返回后一次性
- *  把 stdout 缓冲追加进终端并显示 [exit N]。
- * ============================================================ */
-
-static const linux_compat_service *g_lxc_svc = 0;
-
-#define LNX_MAX_WINS 8          /* 与 MAX_WINDOWS 对齐：任何窗口都可能是 Linux 终端 */
-#define LNX_OUT_CAP  16384      /* exec stdout 收集缓冲 */
-
-typedef struct {
-    bash_state term;            /* 复用 bash 终端字符网格（无输入行） */
-    int        finished;        /* 0=running 1=已返回 */
-    int        rc;              /* exec 返回值（0 成功，负值失败） */
-    u64        exit_code;       /* guest 进程退出码 */
-} lnx_state;
-
-static lnx_state g_lnx_states[LNX_MAX_WINS];
-static int       g_lnx_used[LNX_MAX_WINS];
-static char      g_lnx_out[LNX_OUT_CAP];   /* 同步单发，可全窗口共享 */
-
-/* Linux 应用注册名/命令持久池（f32_data 会被后续文件操作复用，必须拷出） */
-static char g_lnx_name_pool[DA_LINUXAPP_MAX][12];
-static char g_lnx_cmd_pool[DA_LINUXAPP_MAX][64];
-static char g_lnx_id_pool[DA_LINUXAPP_MAX][8];
-
-/* 追加无符号十进制到终端 */
-static void lnx_put_u64(bash_state *t, u64 v, u32 color) {
-    char tmp[20];
-    int n = 0;
-    if (v == 0) tmp[n++] = '0';
-    while (v && n < 20) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
-    while (n > 0) bash_putc(t, tmp[--n], color);
-}
-
-static void lnx_put_i64(bash_state *t, i64 v, u32 color) {
-    if (v < 0) { bash_putc(t, '-', color); lnx_put_u64(t, (u64)(-v), color); }
-    else lnx_put_u64(t, (u64)v, color);
-}
-
-/* 追加 exec 输出到终端：剥离 ANSI CSI 转义序列，忽略 \r，\t 展开为 2 空格，
- * 其余控制字符丢弃（终端字体仅 ASCII，非 ASCII 字节由 du_draw_char 钳为空格）。 */
-static void lnx_append(bash_state *t, const char *buf, u64 len, u32 color) {
-    int esc = 0;
-    for (u64 i = 0; i < len; i++) {
-        char c = buf[i];
-        if (esc) {
-            /* CSI: ESC [ 参数... 结束字节(0x40-0x7E)；其它 ESC 序列同理吞掉 */
-            if (c >= 0x40 && c <= 0x7E) esc = 0;
-            continue;
-        }
-        if (c == 0x1B) { esc = 1; continue; }
-        if (c == '\r') continue;
-        if (c == '\t') { bash_putc(t, ' ', color); bash_putc(t, ' ', color); continue; }
-        if ((u8)c < 32 && c != '\n') continue;
-        bash_putc(t, c, color);
-    }
-}
-
-/* 终端内容绘制：全量重绘（与 editor_draw_to 同策略），无输入行 */
-static void lnx_draw_to(lnx_state *s, int cx, int cy, int cw, int ch) {
-    bash_state *t = &s->term;
-    du_fill_rect(&g_fb, cx, cy, cw, ch, KS_BG_PRIMARY);
-    for (int r = 0; r < t->rows; r++) {
-        for (int c = 0; c < t->cols; c++) {
-            int idx = r * TERM_MAX_COLS + c;
-            if (t->ch[idx] == ' ') continue;
-            int px = cx + (int)DU_SPACE_SM + c * (int)DU_ASCII_STEP;
-            int py = cy + (int)DU_SPACE_SM + r * (int)DU_ASCII_LINE_H;
-            if (px + (int)DU_ASCII_CELL_W > cx + cw) continue;
-            if (py + (int)DU_ASCII_CELL_H > cy + ch) continue;
-            du_draw_char(&g_fb, (char)t->ch[idx], px, py, t->fg[idx], KS_BG_PRIMARY);
-        }
-    }
-}
-
-/* ---- 窗口适配 ---- */
-static void *lnx_on_create(app_ctx *ctx) {
-    int slot = -1;
-    for (int i = 0; i < LNX_MAX_WINS; i++) {
-        if (!g_lnx_used[i]) { slot = i; break; }
-    }
-    if (slot < 0) return 0;
-    g_lnx_used[slot] = 1;
-
-    lnx_state *s = &g_lnx_states[slot];
-    app_descriptor *app = &g_apps[ctx->win->app_id];
-
-    bash_reset(&s->term, ctx->client_w, ctx->client_h);
-    s->finished = 0;
-    s->rc = 0;
-    s->exit_code = 0;
-
-    /* 标题：显示名 + Linux 标记 */
-    {
-        for (int i = 0; i < 48; i++) ctx->win->title[i] = 0;
-        char t[48];
-        int ti = 0;
-        const char *d = app->display_name;
-        while (d[ti] && ti < 38) { t[ti] = d[ti]; ti++; }
-        const char *suf = " . Linux";
-        int j = 0;
-        while (suf[j] && ti < 47) { t[ti++] = suf[j++]; }
-        t[ti] = 0;
-        kstrcpy(ctx->win->title, t, 48);
-    }
-
-    /* 命令回显 */
-    bash_puts(&s->term, "$ ", KS_ACCENT2);
-    bash_puts(&s->term, app->linux_cmd, KS_TEXT_PRIMARY);
-    bash_putc(&s->term, '\n', 0);
-
-    /* 服务运行时复查（注册后 guest 仍可能不可用） */
-    if (!g_lxc_svc || !g_lxc_svc->is_available()) {
-        bash_puts(&s->term, "linux: compat service unavailable\n", KS_DANGER);
-        bash_puts(&s->term, "[exit -1]\n", KS_DANGER);
-        s->finished = 1;
-        s->rc = -1;
-        return s;
-    }
-
-    /* running 状态提示：先呈现窗口再进入同步阻塞 exec */
-    bash_puts(&s->term, "running... (sync exec, UI will freeze)\n", KS_TEXT_DIM);
-    ctx->win->app_state = s;   /* 让 redraw_all 能看到本窗口内容 */
-    redraw_all();
-    flip_buffer();
-
-    /* 分词：linux_cmd → path + argv（就地切分副本） */
-    char cmdline[96];
-    kstrcpy(cmdline, app->linux_cmd, 96);
-    const char *argv[8];
-    int argc = 0;
-    char *p = cmdline;
-    while (*p && argc < 8) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        argv[argc++] = p;
-        while (*p && *p != ' ') p++;
-        if (*p) *p++ = 0;
-    }
-    if (argc == 0) {
-        bash_puts(&s->term, "linux: empty command\n", KS_DANGER);
-        s->finished = 1;
-        s->rc = -1;
-        return s;
-    }
-
-    /* 绝对路径直接使用；裸命令补 /bin/ 前缀（与 shell linux 命令一致） */
-    char path[96];
-    if (argv[0][0] == '/') {
-        kstrcpy(path, argv[0], 96);
-    } else {
-        kstrcpy(path, "/bin/", 96);
-        kstrcat(path, argv[0], 96);
-    }
-
-    u64 out_len = 0, exit_code = 0;
-    slog("linux exec");
-    int rc = g_lxc_svc->exec(path, argc, argv,
-                             g_lnx_out, LNX_OUT_CAP - 1,
-                             &out_len, &exit_code);
-
-    s->rc = rc;
-    s->exit_code = exit_code;
-    s->finished = 1;
-
-    if (rc != 0) {
-        bash_puts(&s->term, "linux: exec failed (rc=", KS_DANGER);
-        lnx_put_i64(&s->term, rc, KS_DANGER);
-        bash_puts(&s->term, ")\n", KS_DANGER);
-        bash_puts(&s->term, "[exit -1]\n", KS_DANGER);
-        return s;
-    }
-
-    /* 输出回显（一次性追加；exec 无流式回调） */
-    if (out_len > 0) {
-        lnx_append(&s->term, g_lnx_out, out_len, KS_TEXT_PRIMARY);
-        if (g_lnx_out[out_len - 1] != '\n') bash_putc(&s->term, '\n', 0);
-        if (out_len >= LNX_OUT_CAP - 1)
-            bash_puts(&s->term, "[output truncated]\n", KS_TEXT_DIM);
-    }
-
-    /* 退出码：0 绿 / 非 0 琥珀 */
-    u32 ec_color = (exit_code == 0) ? KS_ACCENT2 : KS_WARN;
-    bash_puts(&s->term, "[exit ", ec_color);
-    lnx_put_u64(&s->term, exit_code, ec_color);
-    bash_puts(&s->term, "]\n", ec_color);
-    return s;
-}
-
-static void lnx_on_draw(void *state, app_ctx *ctx) {
-    lnx_draw_to((lnx_state *)state, ctx->client_x, ctx->client_y,
-                ctx->client_w, ctx->client_h);
-}
-
-static void lnx_on_destroy(void *state) {
-    lnx_state *s = (lnx_state *)state;
-    for (int i = 0; i < LNX_MAX_WINS; i++) {
-        if (&g_lnx_states[i] == s) { g_lnx_used[i] = 0; break; }
-    }
-}
-
-/* ---- Linux 应用注册 ----
- * 无论服务是否可用都注册图标：可用时双击即同步 exec；不可用（VMX 缺失/
- * guest 未驻留）时图标置灰（g_lnx_svc_up=0），双击由 lnx_on_create 运行时
- * 复查并显示 "linux: compat service unavailable [exit -1]"，绝不 panic。
- * 配置：FAT32 根目录 LINUXAPP.CNF（8.3 名 LINUXAPPCNF），每行 显示名|linux命令；
- * 文件缺失或无有效行时回退内置默认列表（echo hello / uname -a / ls -l /，
- * 三条均为 Arch rootfs 与 initramfs busybox 环境共有的可执行命令）。 */
-static void register_linux_apps(void) {
-    g_lnx_svc_up = (g_lxc_svc && g_lxc_svc->is_available()) ? 1 : 0;
-    if (!g_lxc_svc) slog("linux apps: service absent (icons greyed)");
-    else if (!g_lnx_svc_up) slog("linux apps: service unavailable (icons greyed)");
-
-    da_linux_app ents[DA_LINUXAPP_MAX];
-    int n = 0;
-
-    u8 *data = 0;
-    u32 size = 0;
-    if (f32_read_root_file(DA_LINUXAPP_CNF_83, &data, &size) == 0 && size > 0) {
-        n = da_linuxapp_parse((const char *)data, size, ents, DA_LINUXAPP_MAX);
-    }
-
-    if (n <= 0) {
-        /* 内置默认保底（guest 中确定存在的命令） */
-        kstrcpy(g_lnx_name_pool[0], "HELLO", 12);
-        kstrcpy(g_lnx_cmd_pool[0], "/bin/echo hello from deshab linux", 64);
-        kstrcpy(g_lnx_name_pool[1], "UNAME", 12);
-        kstrcpy(g_lnx_cmd_pool[1], "/bin/uname -a", 64);
-        kstrcpy(g_lnx_name_pool[2], "LS", 12);
-        kstrcpy(g_lnx_cmd_pool[2], "/bin/ls -l /", 64);
-        n = 3;
-        slog("linux apps: builtin defaults");
-    } else {
-        for (int i = 0; i < n; i++) {
-            kstrcpy(g_lnx_name_pool[i], ents[i].name, 12);
-            kstrcpy(g_lnx_cmd_pool[i], ents[i].cmd, 64);
-        }
-        slog("linux apps: loaded LINUXAPP.CNF");
-    }
-
-    for (int i = 0; i < n && g_app_count < MAX_APPS; i++) {
-        char *id = g_lnx_id_pool[i];
-        id[0] = 'l'; id[1] = 'n'; id[2] = 'x'; id[3] = (char)('0' + i); id[4] = 0;
-        g_apps[g_app_count] = (app_descriptor){
-            id, g_lnx_name_pool[i], 720, 480,
-            lnx_on_create, 0, lnx_on_draw, lnx_on_destroy,
-            0, g_lnx_cmd_pool[i]
-        };
-        g_app_count++;
-        {
-            char msg[64];
-            kstrcpy(msg, "linux app registered: ", 64);
-            kstrcat(msg, g_lnx_name_pool[i], 64);
-            slog(msg);
-        }
-    }
-    slog("linux apps registered");
-}
-
-/* ============================================================
  *  文本编辑器 (Editor) — 面板/IDE/窗口共用核心
  * ============================================================ */
 
@@ -1739,86 +1427,67 @@ static void register_apps(void) {
     /* 命令行1：shell.elf（原生命令行 + 可运行 Linux 程序）*/
     g_apps[0] = (app_descriptor){
         "shell", "Terminal", 720, 480,
-        0, 0, 0, 0, "SHELL   ELF", 0
+        0, 0, 0, 0, "SHELL   ELF"
     };
     g_app_count++;
     /* 命令行2：cmd.elf（Windows 风格命令行 + PE/EXE 执行）*/
     g_apps[1] = (app_descriptor){
         "cmd", "CMD", 720, 480,
-        0, 0, 0, 0, "CMD     ELF", 0
+        0, 0, 0, 0, "CMD     ELF"
     };
     g_app_count++;
     g_apps[2] = (app_descriptor){
         "editor", "Editor", 600, 450,
-        editor_on_create, editor_on_event, editor_on_draw, editor_on_destroy, 0, 0
+        editor_on_create, editor_on_event, editor_on_draw, editor_on_destroy, 0
     };
     g_app_count++;
     g_apps[3] = (app_descriptor){
         "fileman", "Files", 500, 400,
-        0, 0, 0, 0, "FILEMAN ELF", 0
+        0, 0, 0, 0, "FILEMAN ELF"
     };
     g_app_count++;
     g_apps[4] = (app_descriptor){
         "calc", "Calculator", 280, 400,
-        calc_on_create, calc_on_event, calc_on_draw, calc_on_destroy, 0, 0
+        calc_on_create, calc_on_event, calc_on_draw, calc_on_destroy, 0
     };
     g_app_count++;
     g_apps[5] = (app_descriptor){
         "browser", "Browser", 700, 500,
-        0, 0, 0, 0, "BROWSER ELF", 0
+        0, 0, 0, 0, "BROWSER ELF"
     };
     g_app_count++;
-
-    /* Linux 兼容层应用：无论服务是否可用都注册图标（不可用时置灰，
-     * 双击仍开终端窗口提示原因，见 register_linux_apps / lnx_on_create） */
-    register_linux_apps();
+    /* ProEdit — 增强版文本编辑器（语法高亮、设置、目录浏览）*/
+    g_apps[6] = (app_descriptor){
+        "proedit", "ProEdit", 750, 550,
+        0, 0, 0, 0, "PROEDIT ELF"
+    };
+    g_app_count++;
 }
 
 /* Winux-Kate .desktop-grid：canvas padding 24px，列宽 104px，gap 18px，
  * 左→右排列，超出画布宽度则换行（align-content: start）
  *
- * 桌面图标来源：
- * 1. 用户快捷方式（SYSTEM/user/desktop 目录）
- * 2. 内置应用（editor, browser 等）
+ * 注意：Terminal 和 CMD 已在第一页 Dashboard（TERM-01 / TERM-02），
+ * 桌面不再重复显示其图标。
  */
 static void setup_desktop_icons(void) {
     int pad = KATE_ICON_PAD;                        /* 24 */
     int x = pad;
     int y = KATE_TOPBAR_H + KATE_PAGE_PAD + pad;
     int max_x = (int)g_fb_w - pad;                  /* canvas 右缘 */
-    
-    /* 先加载用户快捷方式 */
-    shortcuts_refresh();
-    for (int i = 0; i < g_shortcut_count && g_icon_count < MAX_ICONS; i++) {
+    for (int i = 0; i < g_app_count; i++) {
+        if (!g_apps[i].on_create && !g_apps[i].elf_name) continue;
+        /* 跳过 Terminal 和 CMD（已在 Dashboard 第一页） */
+        if (g_apps[i].name[0] == 's' && g_apps[i].name[1] == 'h' && g_apps[i].name[2] == 'e') continue;
+        if (g_apps[i].name[0] == 'c' && g_apps[i].name[1] == 'm' && g_apps[i].name[2] == 'd') continue;
         if (x > pad && x + KATE_ICON_W > max_x) {
             x = pad;
             y += KATE_ICON_H + KATE_ICON_GAP;
         }
-        /* 将快捷方式转换为桌面图标（app_id = -1 表示快捷方式） */
-        g_icons[g_icon_count].app_id = -1;  /* 标记为快捷方式 */
+        g_icons[g_icon_count].app_id = i;
         g_icons[g_icon_count].x = x;
         g_icons[g_icon_count].y = y;
-        g_icons[g_icon_count].label = g_shortcuts[i].display_name;
-        g_icons[g_icon_count].selected = 0;
-        g_shortcuts[i].x = x;  /* 记录位置用于点击检测 */
-        g_shortcuts[i].y = y;
-        g_icon_count++;
-        x += KATE_ICON_W + KATE_ICON_GAP;
-    }
-
-    /* 再追加 Linux 应用图标（register_linux_apps 已登记进 g_apps，带 linux_cmd）。
-     * 服务不可用时图标仍上架但置灰（draw_app_icon 查 g_lnx_svc_up），
-     * 双击开终端窗口提示原因，与可用时同一入口。 */
-    for (int a = 0; a < g_app_count && g_icon_count < MAX_ICONS; a++) {
-        if (!g_apps[a].linux_cmd) continue;
-        if (x > pad && x + KATE_ICON_W > max_x) {
-            x = pad;
-            y += KATE_ICON_H + KATE_ICON_GAP;
-        }
-        g_icons[g_icon_count].app_id = a;
-        g_icons[g_icon_count].x = x;
-        g_icons[g_icon_count].y = y;
-        g_icons[g_icon_count].label = g_apps[a].display_name;
+        g_icons[g_icon_count].label = g_apps[i].display_name;
         g_icons[g_icon_count].selected = 0;
         g_icon_count++;
         x += KATE_ICON_W + KATE_ICON_GAP;
@@ -1842,10 +1511,7 @@ typedef struct { u32 type,flags; u64 offset,vaddr,paddr,filesz,memsz,align; } dt
 typedef struct { i64 tag; u64 val; } dt_elf64_dyn;
 typedef struct { u64 offset; u64 info; i64 addend; } dt_elf64_rela;
 
-/* 外部工具 ELF 加载缓冲。fileman/editor 等工具 include fat32_io.h
- * 带 ~388KB BSS（f32_disk+f32_data），其 .elf 的 memsz 可达 ~470KB。
- * 1MB 容量覆盖当前所有工具 ELF 并留余量。BSS 是 NOBITS 不占 desktop.elf 文件空间。 */
-static u8 g_elf_image[1048576];
+static u8 g_elf_image[262144];
 
 static int dt_load_elf(u8 *data, u32 data_size, void **entry_out) {
     const dt_elf64_ehdr *eh = (const dt_elf64_ehdr *)data;
@@ -2021,43 +1687,6 @@ static void files_refresh(void) {
     if (!g_block_read) { g_files_loaded = 0; return; }
     if (f32_list_root(files_list_cb, 0) == 0) g_files_loaded = 1;
     else g_files_loaded = 0;
-}
-
-/* 加载桌面快捷方式（从 SYSTEM/user/desktop 目录读取 .lnk 文件）
- * 快捷方式文件格式（纯文本，UTF-8）：
- *   第1行：显示名称（如 "编辑器"）
- *   第2行：ELF文件名（FAT32 8.3，如 "EDITOR  ELF"）
- *   第3行：图标类型（如 "editor"）
- */
-static void shortcuts_refresh(void) {
-    g_shortcut_count = 0;
-    if (!g_block_read) return;
-    
-    /* 读取 desktop 目录下的 .lnk 文件 */
-    /* 简化实现：直接读取预定义的快捷方式 */
-    
-    /* 内置快捷方式列表（暂时硬编码，后续可改为读取.lnk文件） */
-    static const struct {
-        const char *name;
-        const char *elf;
-        const char *icon;
-    } builtin_shortcuts[] = {
-        { "编辑器",      "EDITOR  ELF", "editor" },
-        { "文件管理",    "FILEMAN ELF", "folder" },
-        { "浏览器",      "BROWSER ELF", "browser" },
-        { "终端",        "SHELL   ELF", "terminal" },
-    };
-    
-    int count = sizeof(builtin_shortcuts) / sizeof(builtin_shortcuts[0]);
-    for (int i = 0; i < count && g_shortcut_count < MAX_ICONS; i++) {
-        desktop_shortcut *s = &g_shortcuts[g_shortcut_count];
-        kstrcpy(s->display_name, builtin_shortcuts[i].name, 24);
-        kstrcpy(s->elf_name, builtin_shortcuts[i].elf, 11);
-        kstrcpy(s->icon_type, builtin_shortcuts[i].icon, 12);
-        s->x = 0; s->y = 0;
-        s->selected = 0;
-        g_shortcut_count++;
-    }
 }
 
 /* 双击打开文件 → 载入 DASHBOARD EDITOR */
@@ -2474,20 +2103,7 @@ static void draw_desktop_icons(void) {
         du_kate_desktop_icon(&g_fb, ic->x, ic->y, ic->label, ic->selected);
         int ix = ic->x + (KATE_ICON_W - KATE_ICON_IMG) / 2;
         int iy = ic->y + 10;
-        
-        /* 根据图标来源绘制不同图标 */
-        if (ic->app_id >= 0) {
-            /* 内置应用图标 */
-            draw_app_icon(&g_fb, ic->app_id, ix, iy);
-        } else if (i < g_shortcut_count) {
-            /* 快捷方式图标（根据 icon_type 选择） */
-            const char *icon = g_shortcuts[i].icon_type;
-            if (icon[0] == 'e' && icon[1] == 'd') draw_icon_editor(&g_fb, ix, iy);
-            else if (icon[0] == 'f') draw_icon_folder(&g_fb, ix, iy);
-            else if (icon[0] == 'b') draw_icon_browser(&g_fb, ix, iy);
-            else if (icon[0] == 't') draw_icon_terminal(&g_fb, ix, iy);
-            else draw_icon_editor(&g_fb, ix, iy);  /* 默认 */
-        }
+        draw_app_icon(&g_fb, ic->app_id, ix, iy);
     }
 }
 
@@ -3291,15 +2907,7 @@ static int desktop_click(int mx, int my, int dbl) {
         int ix = g_icons[i].x, iy = g_icons[i].y;
         if (mx >= ix && mx < ix + ICON_W && my >= iy && my < iy + ICON_H) {
             if (dbl && g_icons[i].selected) {
-                /* 根据图标来源选择启动方式 */
-                if (g_icons[i].app_id >= 0) {
-                    /* 内置应用 */
-                    launch_app(g_icons[i].app_id);
-                } else if (i < g_shortcut_count) {
-                    /* 快捷方式：加载外部 ELF */
-                    slog("launching shortcut");
-                    launch_external_elf(g_shortcuts[i].elf_name);
-                }
+                launch_app(g_icons[i].app_id);
             } else {
                 for (int j = 0; j < g_icon_count; j++) g_icons[j].selected = 0;
                 g_icons[i].selected = 1;
@@ -3543,22 +3151,6 @@ void dsk_entry(const dsk_boot_context *ctx) {
     g_real_fb = (u8 *)g_fb_addr;
     g_fb.fb = (du_u32 *)SPRITE_BUF_ADDR;
     f32_init(g_block_read, g_block_write);
-
-    /* Linux 兼容层服务（reserved[5]，magic 校验）—— 需在 register_apps 前就绪 */
-    {
-        u64 lxc_addr = ctx->reserved[5];
-        if (lxc_addr) {
-            const linux_compat_service *lxc = (const linux_compat_service *)lxc_addr;
-            if (lxc->magic == LINUX_COMPAT_MAGIC) {
-                g_lxc_svc = lxc;
-                slog("linux_compat service ok");
-            } else {
-                slog("linux_compat magic mismatch");
-            }
-        } else {
-            slog("linux_compat service absent");
-        }
-    }
 
     tsc_calibrate();
     g_rtc_boot_sec = rtc_day_sec();

@@ -15,7 +15,7 @@ OBJECTS := $(C_SOURCES:.c=.o)
 all: $(OUT)
 
 $(OUT): $(OBJECTS) linker.ld
-	@if not exist "$(ROOT)\SYSTEM\system\user\use" mkdir "$(ROOT)\SYSTEM\system\user\use"
+	@mkdir -p "$(ROOT)/SYSTEM/system/user/use"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 %.o: %.c

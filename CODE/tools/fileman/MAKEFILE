@@ -15,7 +15,7 @@ OBJECTS := $(C_SOURCES:.c=.o)
 all: $(OUT)
 
 $(OUT): $(OBJECTS) linker.ld
-	@if not exist "$(ROOT)\SYSTEM\system\deshab64\tools" mkdir "$(ROOT)\SYSTEM\system\deshab64\tools"
+	@mkdir -p "$(ROOT)/SYSTEM/system/deshab64/tools"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 %.o: %.c

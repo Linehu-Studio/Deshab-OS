@@ -17,7 +17,7 @@ all: $(OUT)
 
 # 构建后用 patch_login_hash.ps1 计算 .text SHA256 并写入 .hashseg
 $(OUT): $(OBJECTS) linker.ld
-	@if not exist "$(ROOT)\SYSTEM\system\user\use" mkdir "$(ROOT)\SYSTEM\system\user\use"
+	@mkdir -p "$(ROOT)/SYSTEM/system/user/use"
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 	@echo [login] patching .text SHA256 into .hashseg...
 	powershell -NoProfile -ExecutionPolicy Bypass -File $(PATCHER) $@

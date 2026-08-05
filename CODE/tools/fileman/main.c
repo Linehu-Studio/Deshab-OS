@@ -254,6 +254,9 @@ static void redraw_all(void) {
     else redraw_list();
 }
 
+/* ---- 返回上级目录（前向声明） ---- */
+static void go_up(void);
+
 /* ---- 打开文件/目录 ---- */
 static void go_up(void);  /* 前向声明：open_selected 调用 go_up */
 static void open_selected(void) {

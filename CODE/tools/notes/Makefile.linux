@@ -1,0 +1,30 @@
+# Makefile.linux — Deshab-OS 应用 Linux 预览编译
+#
+# 用法：
+#   make -f Makefile.linux          # 编译预览版
+#   make -f Makefile.linux run      # 编译并运行预览版
+#   make -f Makefile.linux clean    # 清理
+
+CC = gcc
+CFLAGS = -Wall -O2 -D DA_LINUX_PREVIEW -I..
+LDFLAGS = -lSDL2
+
+SRC = notes_preview.c ../../firstInit/ascii_bitmaps.c
+TARGET = notes_preview
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+	@echo "✓ 编译完成: $(TARGET)"
+	@echo "  运行: ./$(TARGET)"
+	@echo "  按 ESC 退出"
+
+run: $(TARGET)
+	./$(TARGET)
+
+clean:
+	rm -f $(TARGET)
+	@echo "✓ 已清理"
+
+.PHONY: all run clean

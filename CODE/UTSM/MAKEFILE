@@ -26,7 +26,7 @@ all: $(OUT)
 -include $(DEPS)
 
 $(OUT): $(OBJECTS) linker.ld
-	@if not exist "$(ROOT)\SYSTEM\boot" mkdir "$(ROOT)\SYSTEM\boot"
+	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 %.o: %.c

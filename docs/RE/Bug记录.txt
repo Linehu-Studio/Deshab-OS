@@ -62,10 +62,10 @@
   2. x86emu32.c try_iat_call() 拦截 CALL IAT（合成地址 0x0001xxxx）后 fn32 为空 → 走 fn64 回退 `f(a0,a1,a2,a3)`，a0..a3 是从模拟栈读出的**原始 32 位 guest 值**：hello32 的 `push 0x401017`（msg guest VA = image_base 0x400000 + 0x1017）→ a0=0x401017。
   3. shim_printf（pe_shim.c L219）`const char *f = (const char *)fmt;` 把 guest VA 直接当 host 指针解引用，**无 guest→host 转换**（解释器映像驻留在 emu->mem 大缓冲区，正确地址应为 emu->mem + 0x401017）→ host 低地址 0x401017 未映射 → #PF → BUG-20260801-005 放大为三重故障。
   拦截前链路均正确：0x68 push imm32、FF /2 `call [disp32]` ModRM 解码、read_rm32 读 IAT 合成地址、try_iat_call 参数读取——解释器覆盖率不记倒退。
-- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ①为每个含指针参数的 shim 实现 fn32（接收 esp_ptr=&emu->mem[esp]，guest VA 经 emu->mem 基址转换为 host 指针）；②或 fn64 回退前设置全局 g_emu_mem_base，shim 内对 <0x10000000 的指针统一加基址转换；③kernel32 WriteFile/ReadFile 等指针参数函数同理。
-- 状态: [OPEN]
-- 修复提交: 待提交
-- 验证: 修复后 x86emu32-coverage.ps1 应见 "Hello from PE32!" → "[cmd] PE run end" → "[DSK] cmd.elf returned"；pe-compat.ps1 会话 B 同步验证（两处均已留自动升级断言：日志出现即升 PASS）。
+- 修复方案: 引入 g_emu_mem_base 全局基址 + pe_shim_set_emu_base() 设置 + gp() 转换函数（va < 0x10000000 且 g_emu_mem_base 非零时返回 g_emu_mem_base+va）；x86emu32 解释执行 PE32 前设基址，shim 内指针参数经 gp() 转换；原生 PE32+ 路径 g_emu_mem_base 恒为 0，gp() 恒等映射零影响。
+- 状态: [FIXED]
+- 修复提交: a26866e（CODE/UTSM/pe/pe_shim.c g_emu_mem_base + pe_shim_set_emu_base + gp()）
+- 验证: x86emu32-coverage.ps1 PASS——HELLO32.EXE 解释执行输出 "Hello from PE32!"；pe-compat.ps1 会话 B 同步验证通过。
 
 ### BUG-20260801-006 [P1] [UTSM/pe] pe_shim setjmp/longjmp 跨已返回函数 UB：longjmp 恢复脏栈寄存器 → 野指针 call → 三重故障
 - 现象: `pe HELLO64.EXE` 原生执行成功打印 "Hello from PE32+!"（BUG-004 修复后），随后在 ExitProcess 阶段 guest 三重故障，QEMU（-no-reboot）静默退出；后续 AUTOEXEC 命令（HELLO32/NONEXIST/exit）全部不再执行。TCG 与 WHPX 表现一致。
@@ -76,10 +76,10 @@
   反汇编定案（utsm.elf）：fault RIP `pe_service_run+0x226` = `call *%r15`（pe_call_on_stack 内联汇编调 PE 入口那条）；但 R15=0xffffffff8055b260 并非 PE 入口 0xffffffff80d22000、RSP=0xffffffff80003030 并非 PE 栈顶 0xffffffff80e23000——**这是 longjmp 用脏栈"恢复"出来的假现场**，不是正常调用路径。
   pe_shim_setup_exit（0xffffffff80014d60）反汇编：clang 把 __builtin_setjmp 实现为 `g_exit_jmp={RBP,RSP,resume=0x80014d94}`，恢复后从 0x80014d94 起执行函数尾声 `pop rbx;pop r12;pop r13;pop r14;pop r15;pop rbp;ret`——**从恢复的栈上弹 7 个槽**。
 - 根因分析: pe_shim_setup_exit() 内调 __builtin_setjmp 后**即返回**（C 标准：含 setjmp 的函数已返回时再 longjmp 为未定义行为）。setjmp→longjmp 之间 pe_service_run 又调用 log_hex64×2（"[PE] entry="/"[PE] stack_top="），其栈帧**精确复用** pe_shim_setup_exit 尾声要弹的那片栈区 → longjmp 尾声 pop 出的 rbx/r12-r15/rbp 全是 log_hex64 帧残片（R12/R13 即十六进制字符串残片），最后 `ret` 弹到 [X-8] 槽位的残留返回地址 0x8001478c（log_hex64 调用点返回地址）→ 落到 pe_call_on_stack 内联汇编正中间（`mov %rsp,g_pe_saved_rsp; mov %r14,%rsp; call *%r15`）→ 以脏 R14 为栈、脏 R15 为入口野调用 → 写返回地址到只读页 0xffffffff80003028 → #PF(保护违例) → BUG-005 放大为三重故障。PE32 解释器路径同一 setjmp/longjmp 机制，同样暴露在 UB 下（只是中间无 log 调用、脏数据不同，崩溃形态可能不同）。
-- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ①把 setjmp 下沉到 pe_service_run 本体内（含 PE 调用全程存活的作用域），不要用"setjmp 包装函数"；②或弃用 __builtin_setjmp/longjmp，改用显式上下文保存结构（保存 callee-saved + RSP/RIP 到 pe_service_run 帧内，ExitProcess 经受控 trampoline 返航）；③PE32 路径同理。
-- 状态: [OPEN]
-- 修复提交: 待提交
-- 验证: 修复后 pe-compat.ps1 应见 "[PE] ExitProcess code=" → "[cmd] PE run end" → "[DSK] cmd.elf returned" 完整链路；x86emu32-coverage.ps1 动态链路同步验证。
+- 修复方案: 把 setjmp 下沉到 pe_service_run 本体内执行（含 PE 调用全程存活的作用域）；g_exit_jmp[24] 缓冲区，pe_shim_setup_exit 只提供缓冲区并重置退出状态，__builtin_setjmp 由 pe_service_run 本体直接调用，确保 setjmp 帧不再跨已返回函数。
+- 状态: [FIXED]
+- 修复提交: a26866e（CODE/UTSM/pe/pe_shim.c g_exit_jmp 重构 + pe_shim_setup_exit 语义调整）
+- 验证: pe-compat.ps1 4 会话全绿——HELLO64.EXE 打印 "Hello from PE32+!" 后 `[PE] ExitProcess code=` → `[cmd] PE run end` 干净返回；Deaicup GUI 长时间运行后 Esc→WM_CLOSE→ExitProcess(0) 退出链回归确认。
 
 ### BUG-20260801-004 [P1] [tools/pe-samples] gen_pe.py PE32+ 二进制双重构造缺陷 → 原生执行三重故障
 - 现象: `pe HELLO64.EXE` 原生执行时 guest 直接三重故障，QEMU（-no-reboot）进程退出；串口最后一行为 `[PE] stack_top=...`，无 "Hello from PE32+!"。WHPX 下表现为 "Unexpected VP exit code 4"，TCG 下同样退出（此前误判为 WHPX 平台限制）。
@@ -99,10 +99,10 @@
 - 复现步骤: 运行含缺陷的 HELLO64.EXE（BUG-004，call 到未映射地址 0x300）→ QEMU 直接退出；或任何 DSK 阶段空指针解引用。
 - 串口/日志证据: QEMU `-d int` 追踪（`.build_tmp/pe-dbg-qemu.log`）：`check_exception old: 0xffffffff new 0xe`（#PF at RIP=0x300, CR2=0x300, RSP=0xffffffff80e22ff0 栈有效）→ `old: 0xe new: 0xd`（**投递 #PF 时即 #GP**）→ `old: 0x8 new 0xd`（投递 DF 时再 #GP）→ Triple fault。现场：IDT=ffffffff8002b000 lim=0xfff，GDT=ffff80007fe3d000 lim=0x47，CS=0028/SS=0030，TR=0038 且 TSS base=0。
 - 根因分析: BUG-20260729-013 的 `idt_halt_all()` 把 256 个 IDT 条目换成 halt stub，意图 cli;hlt 安全停机；但实测异常**投递本身**就 #GP——halt 门描述符的选择子/IST 与 DSK 阶段 GDT/TSS（TSS base=0）不匹配，异常帧无法压栈。净效果：DSK 阶段是无异常容错的裸奔环境，任何 guest bug 都表现为"QEMU 静默退出"，测试侧只能开 `-d int` 才能定位。
-- 修复方案（系统侧，本轮测试任务约束不改系统代码，仅登记）: ① halt IDT 门用 DSK 阶段 GDT 内有效选择子重建、IST=0；② 或 DSK 入口自建最小 IDT（#PF/#GP/#DF 打印向量+CR2+RIP 后 cli;hlt）；③ 恢复 TSS 有效基址。
-- 状态: [OPEN]
-- 修复提交: 待提交
-- 验证: 修复后重跑含缺陷 PE：串口应输出异常诊断而非 QEMU 静默退出。
+- 修复方案: DSK 交接时装配最小诊断 IDT（idt_install_dsk_diag）：#PF/#GP/#DF 等 0-31 号异常走 idt_handler 打印向量+err+RIP+CR2+RAX 后 cli;hlt，门用 DSK 阶段有效 CS 选择子、IST=0。
+- 状态: [FIXED]
+- 修复提交: a26866e（CODE/UTSM/arch/x86_64/idt.c idt_install_dsk_diag）
+- 验证: pe-compat.ps1 fault64 会话 PASS——故意 #PF（mov [0x4000000000],1）串口打出 `[IDT] vector=0xe err=0x2 rip=... cr2=0x4000000000` 完整现场后安全停机，修复前静默三重故障。
 
 ### BUG-20260801-003 [P1] [tools/desktop_app.h] da_mouse_poll 吞键盘扫描码导致应用键盘全灭
 - 现象: fileman/browser/editor（所有 #include desktop_app.h 的全屏应用）内键盘输入完全无效：Esc 无法退出、方向键/回车无响应；应用只能由宿主动作（关机/会话终止）结束。

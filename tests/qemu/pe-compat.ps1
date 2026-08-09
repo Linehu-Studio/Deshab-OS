@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     pe-compat — PE/EXE 兼容层测试（docs/RE/test-cases/pe-compat.md）
@@ -63,8 +63,11 @@ function Invoke-PeSession {
     Set-DeshabFirstInit -First 1 -DevMode 0
     Set-DeshabAutoexec -Lines $Autoexec
 
-    $timeout = 150
-    if ($AccelMode -eq 'tcg') { $timeout = 360 }   # TCG 全模拟显著更慢
+    $timeout = 300
+    if ($AccelMode -eq 'tcg') { $timeout = 600 }   # TCG 全模拟显著更慢
+    # 注：2GB ESP + Linux bzImage/initrd/512MB rootfs boot module 使 Limine
+    # 加载 + UTSM/DSK 启动到 cmd.elf 需要 ~150s（WHPX），AUTOEXEC/PE 执行
+    # 还需额外时间，故 whpx 300s / tcg 600s。
     $s = Start-QemuSession -Name "$Name-$AccelMode" -Accel $AccelMode -MonitorPort 45504
     try {
         $hit = Wait-QemuLog -Session $s -Patterns $Anchors -TimeoutSeconds $timeout
@@ -193,6 +196,42 @@ try {
     } else {
         Add-TestCheck $result '链路: cmd exit 正常返回 DSK' 'FAIL' "hit=$hitC（missing [DSK] cmd.elf returned）"
     }
+
+    # ================================================================
+    # 会话 E：真实 DLL 链（pe_dll_manager → SATA /lib 真实 DLL）
+    #   RDLL64.EXE 静态导入 msvcrt!strcat/strstr/atoi（shim 表外函数）
+    #   → resolve_imports 落 pe_dll_resolve → fat32_read_path("lib/msvcrt.dll")
+    #   → pe_load_image 真实 DLL（DllMain ATTACH）→ 导出表解析
+    #   （Win10 msvcrt 转发 ucrtbase → 验证转发导出跟随）。
+    #   另 LoadLibraryA("ucrtbase.dll") + GetProcAddress(strlen/memcpy)
+    #   → 按真实镜像基址解析并直接调用真实代码。
+    # ================================================================
+    $hitE = Invoke-PeSessionWithFallback -Name 'realdll' -Autoexec @('pe RDLL64.EXE') -Anchors @('[REALDLL] end', '[PANIC]')
+    $logE = $script:RunLog
+
+    Assert-QemuLog $result $logE -Ordered @(
+        '[cmd] cmdline: RDLL64.EXE',
+        '[REALDLL] begin',
+        '[REALDLL] A1 strcat: OK',
+        '[REALDLL] A2 strstr: OK',
+        '[REALDLL] A3 atoi: OK',
+        '[REALDLL] B1 LoadLibraryA(ucrtbase.dll): OK',
+        '[REALDLL] B2 GetProcAddress(strlen): OK',
+        '[REALDLL] B2 strlen call: OK',
+        '[REALDLL] B3 GetProcAddress(memcpy): OK',
+        '[REALDLL] B3 memcpy call: OK',
+        '[REALDLL] end fails=0'
+    ) -MustContain @(
+        '[PE] DLL manager initialized',
+        '[PE] loaded DLL:',
+        '[PE] DllMain ATTACH ok'
+    ) -MustNotContain @(
+        '[PANIC]',
+        '[PE] unimplemented import',
+        '[PE] ordinal forward target not found',
+        '[PE] malformed forwarder string',
+        '[PE] DllMain returned FALSE'
+    )
 
     Add-TestNote $result "加速方案: $script:UsedAccel"
     Add-TestNote $result 'BUG-006/007 已修复，返回链断言已转硬断言；会话仍按故障域拆分（单会话全序列合并留作后续优化）'

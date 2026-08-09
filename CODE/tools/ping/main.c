@@ -294,6 +294,7 @@ void dsk_entry(const da_boot_context *ctx) {
     }
 
     da_init(&g_ac, ctx);
+    ns_apply_lease_from_ctx((u64)(const void *)ctx);  /* netman 租约覆盖默认 slirp IP */
     term_init_layout();
     term_clear();
 

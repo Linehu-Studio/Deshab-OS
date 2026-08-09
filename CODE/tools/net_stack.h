@@ -28,6 +28,34 @@
 #define NS_DNS_IP     NS_IP4(10,0,2,3)
 #define NS_NETMASK    NS_IP4(255,255,255,0)
 
+/* 当前生效 IP 配置：默认 slirp 硬编码；netman 租约经 ns_apply_lease 覆盖。
+ * 租约约定：dsk_boot_context.reserved[7] 存放指向 net_lease_info（dsk.h）的
+ * 指针，结构由 DSK 常驻持有，netman 在 DHCP/静态配置成功后写入。 */
+static u32 ns_guest_ip   = NS_GUEST_IP;
+static u32 ns_gateway_ip = NS_GATEWAY_IP;
+static u32 ns_dns_ip     = NS_DNS_IP;
+
+static inline void ns_apply_lease(u32 ip, u32 gw, u32 dns) {
+    if (ip) ns_guest_ip = ip;
+    if (gw) ns_gateway_ip = gw;
+    if (dns) ns_dns_ip = dns;
+}
+
+/* 从 boot context 读取 netman 租约（存在且 valid 则应用）。
+ * ctx_u64 为 dsk_boot_context 指针值。reserved[8] 位于偏移 160
+ * （第 20 个 u64 起），reserved[7] = 第 27 个 u64，存 net_lease_info 指针：
+ *   +0 magic("NETL" 0x4E45544C)  +4 flags(bit0 valid)  +8 ip  +12 gw  +16 dns */
+static inline void ns_apply_lease_from_ctx(u64 ctx_u64) {
+    if (!ctx_u64) return;
+    const u64 *ctx = (const u64 *)ctx_u64;
+    u64 lease_ptr = ctx[27];            /* reserved[7] */
+    if (!lease_ptr) return;
+    const u32 *li = (const u32 *)lease_ptr;
+    if (li[0] != 0x4E45544Cu) return;   /* NET_LEASE_MAGIC */
+    if (!(li[1] & 1u)) return;          /* NET_LEASE_F_VALID */
+    ns_apply_lease(li[2], li[3], li[4]);
+}
+
 #define NS_ETH_ARP   0x0806
 #define NS_ETH_IPV4  0x0800
 #define NS_IP_ICMP   1
@@ -272,10 +300,10 @@ static inline void ns_arp_handle(const u8 *pkt, u32 len) {
     u16 oper = ns_r16(pkt + 6);
     u32 spa = ns_r32(pkt + 14);
     u32 tpa = ns_r32(pkt + 24);
-    if (oper == 1 && tpa == NS_GUEST_IP) {
+    if (oper == 1 && tpa == ns_guest_ip) {
         /* 请求我们的 IP → 回复 */
         u8 reply[28];
-        ns_arp_build(reply, 2, ns_mac, NS_GUEST_IP, pkt + 8, spa);
+        ns_arp_build(reply, 2, ns_mac, ns_guest_ip, pkt + 8, spa);
         ns_send_eth(pkt + 8, NS_ETH_ARP, reply, 28);
     } else if (oper == 2) {
         ns_arp_cache_put(spa, pkt + 8);
@@ -314,7 +342,7 @@ static inline int ns_arp_resolve(u32 ip, u8 out_mac[6]) {
     static const u8 zero_mac[6] = {0,0,0,0,0,0};
     for (int attempt = 0; attempt < 3; attempt++) {
         u8 req[28];
-        ns_arp_build(req, 1, ns_mac, NS_GUEST_IP, zero_mac, ip);
+        ns_arp_build(req, 1, ns_mac, ns_guest_ip, zero_mac, ip);
         ns_arp_reply_valid = 0;
         if (ns_send_eth(bcast, NS_ETH_ARP, req, 28) != 0) continue;
         u64 deadline = ns_rdtsc() + ns_tsc_per_ms * 1000;
@@ -341,7 +369,7 @@ static inline int ns_arp_resolve(u32 ip, u8 out_mac[6]) {
 /* 目标 IP 的下一跳 MAC（同子网直连，否则走网关）。返回 0 成功。 */
 static inline int ns_route_mac(u32 dst_ip, u8 out_mac[6]) {
     u32 next = dst_ip;
-    if ((dst_ip & NS_NETMASK) != (NS_GUEST_IP & NS_NETMASK)) next = NS_GATEWAY_IP;
+    if ((dst_ip & NS_NETMASK) != (ns_guest_ip & NS_NETMASK)) next = ns_gateway_ip;
     return ns_arp_resolve(next, out_mac);
 }
 
@@ -367,7 +395,7 @@ static inline int ns_ping(u32 dst_ip, u16 seq, u32 timeout_ms, u32 *out_rtt_ms, 
     if (ns_route_mac(dst_ip, dst_mac) != 0) return -1;
 
     u8 pkt[20 + 8 + 32];
-    ns_ipv4_build(pkt, NS_IP_ICMP, NS_GUEST_IP, dst_ip, 8 + 32);
+    ns_ipv4_build(pkt, NS_IP_ICMP, ns_guest_ip, dst_ip, 8 + 32);
     u8 *icmp = pkt + 20;
     icmp[0] = 8;  /* echo request */
     icmp[1] = 0;
@@ -415,7 +443,7 @@ static inline int ns_dns_resolve(const char *host, u32 *out_ip) {
     if (ns_parse_ip(host, out_ip) == 0) return 0;
 
     u8 dst_mac[6];
-    if (ns_route_mac(NS_DNS_IP, dst_mac) != 0) return -1;
+    if (ns_route_mac(ns_dns_ip, dst_mac) != 0) return -1;
 
     /* 构造查询：header + qname + qtype/qclass */
     u8 q[512];
@@ -443,7 +471,7 @@ static inline int ns_dns_resolve(const char *host, u32 *out_ip) {
     u32 qlen = p;
 
     u8 pkt[20 + 8 + 512];
-    ns_ipv4_build(pkt, NS_IP_UDP, NS_GUEST_IP, NS_DNS_IP, 8 + qlen);
+    ns_ipv4_build(pkt, NS_IP_UDP, ns_guest_ip, ns_dns_ip, 8 + qlen);
     u8 *udp = pkt + 20;
     ns_w16(udp + 0, 49153);
     ns_w16(udp + 2, 53);
@@ -540,7 +568,7 @@ static inline int ns_tcp_emit(u8 flags, const u8 *data, u32 len, u32 seq) {
     u8 pkt[20 + 20 + 1460];
     if (len > 1460) return -1;
     u32 tcp_len = 20 + len;
-    ns_ipv4_build(pkt, NS_IP_TCP, NS_GUEST_IP, ns_tc.dst_ip, tcp_len);
+    ns_ipv4_build(pkt, NS_IP_TCP, ns_guest_ip, ns_tc.dst_ip, tcp_len);
     u8 *t = pkt + 20;
     ns_w16(t + 0, ns_tc.src_port);
     ns_w16(t + 2, ns_tc.dst_port);
@@ -554,7 +582,7 @@ static inline int ns_tcp_emit(u8 flags, const u8 *data, u32 len, u32 seq) {
     if (len) ns_memcpy(t + 20, data, len);
     /* 伪头部校验和 */
     u8 ph[12];
-    ns_w32(ph + 0, NS_GUEST_IP);
+    ns_w32(ph + 0, ns_guest_ip);
     ns_w32(ph + 4, ns_tc.dst_ip);
     ph[8] = 0; ph[9] = NS_IP_TCP;
     ns_w16(ph + 10, (u16)tcp_len);

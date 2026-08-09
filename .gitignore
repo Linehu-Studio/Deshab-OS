@@ -1,4 +1,7 @@
 ISO/deshab.img
+ISO/deshab-dev.img
+ISO/deshab-realtest.img
+ISO/deshab-release.img
 *.o
 .build_tmp/
 .trae/

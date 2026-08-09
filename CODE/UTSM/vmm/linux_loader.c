@@ -49,6 +49,11 @@ static u64 str_len(const char *s) {
 static struct linux_guest_info g_guest;
 static const char *g_default_cmdline = LINUX_DEFAULT_CMDLINE;
 
+/* VSCode Phase 3: host virtual address of the graphics surface pool.
+ * The virtio-gpu 2D backend composites the scanout into this buffer; the
+ * desktop reads it to blit guest graphics onto the IDE host area. 0 = unused. */
+static void *g_surface_vaddr = 0;
+
 /* ===== Guest page table helpers =====
  *
  * Build identity-mapped 4-level page tables for the guest.
@@ -220,9 +225,19 @@ static int setup_e820(void *bootparams_virt) {
     table[n].type = E820_TYPE_RESERVED;
     n++;
 
-    /* Entry 5: 0x04100000-0x0FFFFFFF: usable RAM (general RAM, ~188MB) */
-    table[n].addr = 0x04100000;
-    table[n].size = 0x0BF00000;  /* 191MB */
+    /* Entry 5: 0x04100000-0x04FFFFFF: reserved (Graphics surface pool, 16MB)
+     * VSCode integration Phase 1: separate DMA region EPT-mapped into the
+     * guest; Linux user-space mmaps it via /dev/utsm as the scanout buffer. */
+    table[n].addr = LINUX_GUEST_SURFACE_GPA;
+    table[n].size = LINUX_GUEST_SURFACE_SIZE;  /* 16MB */
+    table[n].type = E820_TYPE_RESERVED;
+    n++;
+
+    /* Entry 6: 0x05000000-0x5FFFFFFF: usable RAM (general RAM, ~1.4GB)
+     * VSCode integration Phase 1: expanded from 191MB to 1.4GB to fit
+     * VSCode + Electron + GUI stack (Xorg/modesetting + GTK + mesa). */
+    table[n].addr = LINUX_GUEST_RAM_GPA;
+    table[n].size = LINUX_GUEST_RAM_SIZE;  /* 1.4GB */
     table[n].type = E820_TYPE_RAM;
     n++;
 
@@ -346,6 +361,86 @@ void *linux_find_rootfs_module(u64 *size_out) {
     }
 
     log_warn("[LINUX] no rootfs module found");
+    return (void *)0;
+}
+
+/* ===== extra rootfs module finder =====
+ *
+ * VSCode Phase 4：在 Limine boot module 中查找持久 rw 卷镜像
+ * （路径含 "extra"，如 linux-extra-rootfs.img）。
+ * 通过 virtio-blk slot6（可写）暴露给 Linux guest 作为 /dev/vdc。 */
+void *linux_find_extra_rootfs_module(u64 *size_out) {
+    if (!g_module_request.response) return (void *)0;
+
+    struct limine_module_response *resp = g_module_request.response;
+    for (u64 i = 0; i < resp->module_count; i++) {
+        struct limine_file *file = resp->modules[i];
+        if (!file || !file->path) continue;
+
+        const char *p = file->path;
+        int match = 0;
+        for (const char *s = p; *s; s++) {
+            /* 匹配 "extra"（如 linux-extra-rootfs.img） */
+            if ((s[0] == 'e' || s[0] == 'E') &&
+                (s[1] == 'x' || s[1] == 'X') &&
+                (s[2] == 't' || s[2] == 'T') &&
+                (s[3] == 'r' || s[3] == 'R') &&
+                (s[4] == 'a' || s[4] == 'A')) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        if (size_out) *size_out = file->size;
+        log_info("[LINUX] found extra-rootfs module:");
+        log_info(file->path);
+        log_hex64("[LINUX] extra-rootfs size=", file->size);
+        return file->address;
+    }
+
+    log_warn("[LINUX] no extra-rootfs module found");
+    return (void *)0;
+}
+
+/* ===== VSCode tarball module finder =====
+ *
+ * VSCode Phase 5：在 Limine boot module 中查找 VSCode tarball
+ * （路径含 "vscode"，如 linux-vscode.tar.gz）。
+ * 由 lxc_vscode_install() 流式推入 guest 并解压到 /opt/vscode。
+ * 模块缺失属正常情况（未投放 tarball），返回 NULL 由调用方跳过。 */
+void *linux_find_vscode_module(u64 *size_out) {
+    if (!g_module_request.response) return (void *)0;
+
+    struct limine_module_response *resp = g_module_request.response;
+    for (u64 i = 0; i < resp->module_count; i++) {
+        struct limine_file *file = resp->modules[i];
+        if (!file || !file->path) continue;
+
+        const char *p = file->path;
+        int match = 0;
+        for (const char *s = p; *s; s++) {
+            /* 匹配 "vscode"（如 linux-vscode.tar.gz） */
+            if ((s[0] == 'v' || s[0] == 'V') &&
+                (s[1] == 's' || s[1] == 'S') &&
+                (s[2] == 'c' || s[2] == 'C') &&
+                (s[3] == 'o' || s[3] == 'O') &&
+                (s[4] == 'd' || s[4] == 'D') &&
+                (s[5] == 'e' || s[5] == 'E')) {
+                match = 1;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        if (size_out) *size_out = file->size;
+        log_info("[LINUX] found vscode tarball module:");
+        log_info(file->path);
+        log_hex64("[LINUX] vscode tarball size=", file->size);
+        return file->address;
+    }
+
+    log_info("[LINUX] no vscode tarball module (install skipped)");
     return (void *)0;
 }
 
@@ -552,16 +647,23 @@ int linux_loader_init(void) {
         return -8;
     }
 
-    /* General RAM: 64MB for Linux, mapped at GPA 0x05000000 (after IPC region) */
-    u64 ram_size = 64 * 1024 * 1024;
+    /* General RAM: VSCode integration Phase 1 expansion.
+     * 1.4GB (LINUX_GUEST_RAM_SIZE) accommodates VSCode + Electron + GUI stack
+     * (Xorg/modesetting + GTK + mesa softpipe). Falls back to 1GB / 512MB if
+     * the host cannot allocate the full amount; 512MB is the floor for the
+     * Xfbdev + xterm MVP (Phase 3). Original allocation was 64MB. */
+    u64 ram_size = LINUX_GUEST_RAM_SIZE;  /* 1.4GB */
     dkm_dma_buffer ram_buf;
     if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
-        log_error("[LINUX] failed to alloc guest RAM (64MB)");
-        /* Try smaller: 32MB */
-        ram_size = 32 * 1024 * 1024;
+        log_warn("[LINUX] failed to alloc guest RAM (1.4GB), trying 1GB");
+        ram_size = 1ULL * 1024 * 1024 * 1024;  /* 1GB */
         if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
-            log_error("[LINUX] failed to alloc guest RAM (32MB)");
-            return -9;
+            log_warn("[LINUX] failed to alloc guest RAM (1GB), trying 512MB");
+            ram_size = 512 * 1024 * 1024;  /* 512MB floor for Phase 3 MVP */
+            if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
+                log_error("[LINUX] failed to alloc guest RAM (512MB minimum)");
+                return -9;
+            }
         }
     }
     log_hex64("[LINUX] guest RAM HPA=", ram_buf.phys);
@@ -680,13 +782,14 @@ int linux_loader_init(void) {
         return -15;
     }
 
-    /* General RAM: map the allocated RAM at GPA 0x05000000 (after IPC region).
-     * GPA layout (matches e820):
+    /* General RAM: map the allocated RAM at GPA 0x05000000 (after surface pool).
+     * GPA layout (matches e820, VSCode integration Phase 1):
      *   0x00400000-0x009FFFFF: fixed regions (boot_params, GDT, pgt, stack, cmdline)
      *   0x01000000-0x02FFFFFF: kernel
      *   0x03000000-0x03FFFFFF: initrd (if any)
      *   0x04000000-0x040FFFFF: IPC shared memory (mapped by ipc_shm_init)
-     *   0x05000000-0x08FFFFFF: general RAM (64MB)
+     *   0x04100000-0x04FFFFFF: Graphics surface pool (mapped below)
+     *   0x05000000-0x5FFFFFFF: general RAM (~1.4GB, expanded Phase 1)
      * Linux sees this as usable RAM in e820. */
     u64 ram_gpa = LINUX_GUEST_RAM_GPA;
     if (ept_map_range(ram_gpa, ram_buf.phys, ram_size, EPT_RWX) != 0) {
@@ -694,6 +797,41 @@ int linux_loader_init(void) {
         return -16;
     }
     log_hex64("[LINUX] guest RAM mapped GPA=", ram_gpa);
+
+    /* VSCode integration Phase 1: allocate graphics surface pool and EPT-map
+     * it into the Linux guest at LINUX_GUEST_SURFACE_GPA. Linux user-space
+     * obtains a writable pointer to this region via UTSM_HCALL_SURFACE_INFO +
+     * /dev/utsm mmap; UTSM reads it to blit guest graphics to the Deshab
+     * framebuffer (Phase 3 virtio-gpu shadow scanout). Non-fatal on failure:
+     * Linux guest still runs, VSCode integration phases 2+ will degrade. */
+    {
+        dkm_dma_buffer surface_buf;
+        u64 surface_size = LINUX_GUEST_SURFACE_SIZE;  /* 16MB */
+        if (dma_alloc_pages(surface_size / 4096, 2 * 1024 * 1024, 0, &surface_buf) != 0) {
+            log_warn("[LINUX] failed to alloc surface pool (16MB) — VSCode integration degraded");
+            g_guest.surface_hpa = 0;
+            g_guest.surface_gpa = 0;
+            g_guest.surface_size = 0;
+        } else if (ept_map_range(LINUX_GUEST_SURFACE_GPA, surface_buf.phys,
+                                  surface_size, EPT_READ | EPT_WRITE) != 0) {
+            log_warn("[LINUX] EPT map surface pool failed — VSCode integration degraded");
+            g_guest.surface_hpa = 0;
+            g_guest.surface_gpa = 0;
+            g_guest.surface_size = 0;
+        } else {
+            /* Zero the surface pool so guest reads deterministic data before
+             * the X server writes a real scanout. */
+            u8 *surface_virt = (u8 *)surface_buf.virt;
+            for (u64 i = 0; i < surface_size; i++) surface_virt[i] = 0;
+            g_guest.surface_hpa = surface_buf.phys;
+            g_guest.surface_gpa = LINUX_GUEST_SURFACE_GPA;
+            g_guest.surface_size = surface_size;
+            g_surface_vaddr = surface_buf.virt;   /* VSCode Phase 3: for virtio-gpu + desktop blit */
+            log_hex64("[LINUX] surface pool HPA=", surface_buf.phys);
+            log_hex64("[LINUX] surface pool GPA=", g_guest.surface_gpa);
+            log_hex64("[LINUX] surface pool size=", surface_size);
+        }
+    }
 
     /* Identity-map the first 1MB (BIOS area, needed by some Linux code paths) */
     if (ept_identity_map(0, 0x100000, EPT_RWX) != 0) {
@@ -714,4 +852,24 @@ int linux_loader_init(void) {
 
 const struct linux_guest_info *linux_get_guest_info(void) {
     return g_guest.loaded ? &g_guest : (struct linux_guest_info *)0;
+}
+
+/* VSCode integration Phase 1: query graphics surface pool.
+ * Returns 0 on success (surface pool allocated and mapped), -1 if not
+ * initialized. Caller may pass NULL for any output it doesn't need. */
+int linux_get_surface_info(u64 *hpa_out, u64 *gpa_out, u64 *size_out) {
+    if (!g_guest.loaded || g_guest.surface_hpa == 0) {
+        return -1;
+    }
+    if (hpa_out)  *hpa_out  = g_guest.surface_hpa;
+    if (gpa_out)  *gpa_out  = g_guest.surface_gpa;
+    if (size_out) *size_out = g_guest.surface_size;
+    return 0;
+}
+
+/* VSCode Phase 3: return host virtual address of the surface pool.
+ * The virtio-gpu 2D backend composites the scanout here; the desktop reads it
+ * for blitting to the framebuffer. Returns NULL if the pool is not allocated. */
+void *linux_get_surface_vaddr(void) {
+    return g_surface_vaddr;
 }

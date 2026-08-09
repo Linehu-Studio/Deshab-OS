@@ -19,6 +19,8 @@
  */
 
 #include "../UTSM/include/utsm/dsk.h"
+#include "../UTSM/include/utsm/linux_compat.h"   /* VSCode Phase 2: input_forward_* */
+#include "../UTSM/include/utsm/pe.h"            /* P5d: PE 窗口模式 run_windowed/inject_* */
 
 /* block 设备函数类型（从 kernel_api + 0xA8 获取 block_api，read @ +0x10, write @ +0x18） */
 typedef int (*desktop_block_read_fn)(u32 index, u64 lba, u32 count, void *buffer);
@@ -27,7 +29,8 @@ typedef int (*desktop_block_write_fn)(u32 index, u64 lba, u32 count, const void 
 /* 先包含 ascii_bitmaps.c（定义 g_ascii），再包含 deshab_ui.h（引用 g_ascii） */
 #include "../firstInit/ascii_bitmaps.c"
 #include "../UTSM/include/utsm/deshab_ui.h"
-/* 用户态 FAT32 读写 */
+/* 用户态 FAT32 读写。P5d：PE exe 可达数 MB，数据缓冲同 cmd.elf 提到 4MB。 */
+#define F32_DATA_BYTES (4u * 1024u * 1024u)
 #include "../tools/fat32_io.h"
 
 typedef unsigned char      u8;
@@ -58,6 +61,17 @@ static void kstrcpy(char *d, const char *s, int cap) {
 static void kstrcat(char *d, const char *s, int cap) {
     int n = kstrlen(d);
     if (n < cap) kstrcpy(d + n, s, cap - n);
+}
+
+/* P7.9: u32 -> decimal string（返回长度） */
+static int u32dec(u32 v, char *out) {
+    char tmp[10];
+    int n = 0;
+    if (v == 0) { out[0] = '0'; out[1] = 0; return 1; }
+    while (v > 0) { tmp[n++] = '0' + (char)(v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+    return n;
 }
 
 static u64 rdtsc(void) {
@@ -164,6 +178,14 @@ typedef struct {
     app_draw_fn    on_draw;
     app_destroy_fn on_destroy;
     const char *elf_name;
+    /* VSCode Phase 5: Linux guest 应用（来自 LINUXAPP.CNF）。
+     * linux_path 非 0 时 launch_app 走 launch_linux_app → exec_async。 */
+    const char *linux_path;
+    const char *linux_args;
+    /* P5d: Windows PE 应用（来自 PEAPPS.CNF）。
+     * pe_file 非 0 时 launch_app 走 launch_pe_app → run_windowed 桌面嵌入。 */
+    const char *pe_file;
+    const char *pe_args;
 } app_descriptor;
 
 /* 桌面图标 */
@@ -174,7 +196,7 @@ typedef struct {
     int    selected;
 } desktop_icon;
 
-#define MAX_ICONS 8
+#define MAX_ICONS 16   /* P7.4: 与 MAX_APPS 对齐（多实例 VSCODE2 等占位） */
 
 /* 工作区 */
 typedef struct {
@@ -211,6 +233,29 @@ static desktop_block_read_fn  g_block_read;
 static desktop_block_write_fn g_block_write;
 static const dsk_boot_context *g_boot_ctx = 0;
 
+/* VSCode Phase 2: Linux guest 输入转发。
+ * g_lxc_svc 由 dsk_entry() 从 boot context reserved[5] 读取；
+ * g_input_forward_enabled 在 IDE 标签 attach/detach 时联动置位，
+ * 开启后 PS/2 鼠标键盘事件经 virtio-input 注入 Linux guest（VSCode 运行其中）。 */
+static const linux_compat_service *g_lxc_svc = 0;
+static int g_input_forward_enabled = 0;
+
+/* P5d: PE 窗口桌面嵌入状态。
+ * g_pe_svc 由 dsk_entry() 从 boot context reserved[4] 读取（magic 校验）。
+ * launch_pe_app 创建受管窗口后阻塞在 pe_service.run_windowed；
+ * PE 消息空转时 shim 回调 pe_pump_cb 驱动 desktop 一帧。
+ * 单实例：run_windowed 阻塞期间拒绝启动第二个 PE 窗口（pump 重入安全）。 */
+static const pe_service *g_pe_svc = 0;
+static int   g_pe_running = 0;
+static int   g_pe_win_id = -1;
+static u8   *g_pe_surf = 0;
+static int   g_pe_surf_w = 0, g_pe_surf_h = 0;
+static int   g_pe_state_dummy = 0;     /* draw_desktop_page 要求 app_state 非空 */
+
+#define PE_SURFACE_ADDR  0x7800000ULL  /* 120MB：sprite buf(112MB, ≤8.3MB) 之上 */
+#define PE_SURFACE_MAX   (8u * 1024u * 1024u)
+#define PE_WM_CLOSE      0x0010u       /* shim Win32 WM_CLOSE */
+
 /* 鼠标状态 */
 static int g_mouse_x = 400, g_mouse_y = 300;
 static int g_mouse_btn = 0;      /* bit0=左 bit1=右 */
@@ -240,7 +285,7 @@ static int g_drag_win = -1;
 static int g_drag_off_x, g_drag_off_y;
 
 /* 应用表 */
-#define MAX_APPS 8
+#define MAX_APPS 16
 static app_descriptor g_apps[MAX_APPS];
 static int g_app_count = 0;
 
@@ -719,6 +764,17 @@ static int win_hit_titlebar(desktop_window *w, int mx, int my) {
            my >= w->y && my < w->y + KATE_TITLEBAR_H;
 }
 
+/* P5d: 关闭请求。运行中的 PE 窗口不能直接 win_destroy（run_windowed 阻塞中，
+ * pump 持有窗口 id）——按 pe_window_host 协作契约 inject WM_CLOSE，
+ * PE 自愿退出后由 launch_pe_app 收尾销毁。 */
+static void win_close_request(desktop_window *w) {
+    if (g_pe_running && w->id == g_pe_win_id && g_pe_svc && g_pe_svc->inject_input) {
+        g_pe_svc->inject_input(PE_WM_CLOSE, 0, 0, 0, 0);
+        return;
+    }
+    win_destroy(w);
+}
+
 static int win_hit_close_btn(desktop_window *w, int mx, int my) {
     int bx = w->x + w->w - CLOSE_BTN_OFFSET;
     int by = w->y + (KATE_TITLEBAR_H - CLOSE_BTN_SIZE) / 2;
@@ -869,6 +925,15 @@ static int ps2_mouse_poll(void) {
     if (!(g_mouse_btn & 1) && (old_btn & 1)) g_left_released = 1;
     if ((g_mouse_btn & 2) && !(old_btn & 2)) g_right_pressed = 1;
     if (dx == 0 && dy == 0 && g_mouse_btn == old_btn) return 0;
+
+    /* VSCode Phase 2: IDE attached 时把相对位移 + 按钮状态镜像到 Linux guest。
+     * dy 已在上方取反为屏幕坐标系（正=下），与 Linux REL_Y 约定一致；
+     * input_forward_mouse 内部与上次状态比较，仅产生变化按钮事件 + SYN。
+     * 即使宿主光标已抵边界被钳位，原始 dx/dy 仍转发，guest 光标自由移动。 */
+    if (g_input_forward_enabled && g_lxc_svc && g_lxc_svc->input_forward_mouse) {
+        g_lxc_svc->input_forward_mouse(dx, dy, (u8)g_mouse_btn);
+    }
+
     g_mouse_has_pkt = 1;
     return 1;
 }
@@ -892,6 +957,36 @@ static char scan_to_ascii(u8 sc, int shift) {
     };
     if (sc >= 58) return 0;
     return shift ? shifted[sc] : normal[sc];
+}
+
+/* VSCode Phase 2: PS/2 set-1 扫描码 → Linux keycode（linux/input-event-codes.h）。
+ *   base : 已去除 0x80 release 位的基础扫描码（0x01..0x39 主键区 + 少数扩展）
+ *   e0   : 上一字节为 0xE0 前缀时置 1，选取扩展键变体
+ * 返回 0 表示该扫描码无映射（调用方应丢弃）。
+ *
+ * 巧合：主键区 0x01..0x39 的 Linux keycode 与扫描码数值完全一致
+ * （IBM XT 布局历史遗留），故直接透传；仅 E0 扩展键需单独查表。 */
+static u16 scancode_to_linux_keycode(u8 base, int e0) {
+    if (e0) {
+        switch (base) {
+        case 0x1D: return 97;   /* KEY_RIGHTCTRL */
+        case 0x38: return 100; /* KEY_RIGHTALT */
+        case 0x48: return 103; /* KEY_UP */
+        case 0x4B: return 105; /* KEY_LEFT */
+        case 0x4D: return 106; /* KEY_RIGHT */
+        case 0x50: return 108; /* KEY_DOWN */
+        case 0x52: return 110; /* KEY_INSERT */
+        case 0x53: return 111; /* KEY_DELETE */
+        case 0x47: return 102; /* KEY_HOME */
+        case 0x4F: return 107; /* KEY_END */
+        case 0x49: return 104; /* KEY_PAGEUP */
+        case 0x51: return 109; /* KEY_PAGEDOWN */
+        default:   return 0;
+        }
+    }
+    /* 主键区：0x01..0x39 透传，超出范围无映射 */
+    if (base >= 0x01 && base <= 0x39) return (u16)base;
+    return 0;
 }
 
 /* ============================================================
@@ -1423,6 +1518,161 @@ static void calc_on_destroy(void *state) { (void)state; }
  *  应用注册
  * ============================================================ */
 
+/* ---- VSCode Phase 5: LINUXAPP.CNF Linux 应用注册表 ----
+ * FAT32 根目录 LINUXAPP.CNF（8.3: LINUXAPPCNF），每行一个 Linux guest 应用：
+ *   NAME|DISPLAY|/guest/path|args（args 可含空格，可省略）
+ * '#' 开头为注释。解析结果存静态池，app_descriptor.linux_path 指入。 */
+#define LINUXAPP_MAX 4
+static char g_lapp_name[LINUXAPP_MAX][12];
+static char g_lapp_disp[LINUXAPP_MAX][16];
+static char g_lapp_path[LINUXAPP_MAX][96];
+static char g_lapp_args[LINUXAPP_MAX][96];
+static int  g_vscode_app_id = -1;   /* 第一个名为 "vscode" 的注册项 */
+
+/* 字段拷贝：src[0..n) → dst（NUL 结尾），返回拷贝长度 */
+static int lapp_field_copy(char *dst, int dst_cap, const char *src, int n) {
+    if (n >= dst_cap) n = dst_cap - 1;
+    for (int i = 0; i < n; i++) dst[i] = src[i];
+    dst[n] = 0;
+    return n;
+}
+
+static void register_linux_apps(void) {
+    u8 *data = 0;
+    u32 size = 0;
+    char n11[11];
+    if (f32_name_to_83("LINUXAPP.CNF", n11) != 0) return;
+    if (f32_read_root_file(n11, &data, &size) != 0) return;  /* 无配置文件：跳过 */
+
+    int li = 0;                 /* 已注册数量 */
+    u32 pos = 0;
+    while (pos < size && li < LINUXAPP_MAX && g_app_count < MAX_APPS) {
+        /* 取一行 */
+        u32 eol = pos;
+        while (eol < size && data[eol] != '\n' && data[eol] != '\r') eol++;
+        u32 line_len = eol - pos;
+        /* 跳过到下一行 */
+        u32 next = eol;
+        while (next < size && (data[next] == '\n' || data[next] == '\r')) next++;
+
+        if (line_len == 0 || data[pos] == '#') { pos = next; continue; }
+
+        /* 按 '|' 切 4 段：NAME|DISPLAY|PATH|ARGS */
+        const char *line = (const char *)data + pos;
+        int f0 = -1, f1 = -1, f2 = -1;   /* 三个分隔符位置 */
+        for (u32 i = 0; i < line_len; i++) {
+            if (line[i] == '|') {
+                if (f0 < 0) f0 = (int)i;
+                else if (f1 < 0) f1 = (int)i;
+                else if (f2 < 0) { f2 = (int)i; break; }
+            }
+        }
+        if (f0 > 0 && f1 > f0) {
+            int path_beg = f1 + 1;
+            int path_end = (f2 > path_beg) ? f2 : (int)line_len;
+            int args_beg = (f2 > path_beg) ? f2 + 1 : (int)line_len;
+
+            lapp_field_copy(g_lapp_name[li], 12, line, f0);
+            lapp_field_copy(g_lapp_disp[li], 16, line + f0 + 1, f1 - f0 - 1);
+            lapp_field_copy(g_lapp_path[li], 96, line + path_beg, path_end - path_beg);
+            if (args_beg < (int)line_len)
+                lapp_field_copy(g_lapp_args[li], 96, line + args_beg, (int)line_len - args_beg);
+            else
+                g_lapp_args[li][0] = 0;
+
+            if (g_lapp_path[li][0] == '/') {
+                g_apps[g_app_count] = (app_descriptor){
+                    g_lapp_name[li], g_lapp_disp[li], 1024, 768,
+                    0, 0, 0, 0, 0,
+                    g_lapp_path[li], g_lapp_args[li]
+                };
+                /* 记录 VSCode app id（IDE attach 共享启动路径用）。
+                 * P7.4 匹配收紧：精确匹配 "VSCODE"（第 7 字符须为 NUL），
+                 * VSCODE2 等多实例条目不占用共享启动入口。 */
+                if (g_vscode_app_id < 0 &&
+                    g_lapp_name[li][0] == 'V' && g_lapp_name[li][1] == 'S' &&
+                    g_lapp_name[li][2] == 'C' && g_lapp_name[li][3] == 'O' &&
+                    g_lapp_name[li][4] == 'D' && g_lapp_name[li][5] == 'E' &&
+                    g_lapp_name[li][6] == 0)
+                    g_vscode_app_id = g_app_count;
+                g_app_count++;
+                li++;
+            }
+        }
+        pos = next;
+    }
+}
+
+/* ---- P5d: PEAPPS.CNF Windows PE 应用注册表 ----
+ * FAT32 根目录 PEAPPS.CNF（8.3: PEAPPS CNF），每行一个 Windows PE 应用：
+ *   NAME|DISPLAY|path/file.exe|args（'/' 分隔长路径，args 可含空格可省略）
+ * '#' 开头为注释。解析结果存静态池，app_descriptor.pe_file 指入。
+ * 仅适用于 GUI PE（消息循环驱动 pump）；纯控制台 PE 不会触发消息空转，
+ * 窗口模式下桌面将无响应直到进程退出——控制台程序请走 CMD。 */
+#define PEAPP_MAX 4
+static char g_papp_name[PEAPP_MAX][12];
+static char g_papp_disp[PEAPP_MAX][16];
+static char g_papp_file[PEAPP_MAX][96];
+static char g_papp_args[PEAPP_MAX][96];
+
+static void pe_win_on_draw(void *state, app_ctx *ctx);   /* 定义于 P5d 运行时段 */
+static void launch_pe_app(int app_id);
+
+static void register_pe_apps(void) {
+    u8 *data = 0;
+    u32 size = 0;
+    char n11[11];
+    if (f32_name_to_83("PEAPPS.CNF", n11) != 0) return;
+    if (f32_read_root_file(n11, &data, &size) != 0) return;  /* 无配置文件：跳过 */
+
+    int pi = 0;
+    u32 pos = 0;
+    while (pos < size && pi < PEAPP_MAX && g_app_count < MAX_APPS) {
+        u32 eol = pos;
+        while (eol < size && data[eol] != '\n' && data[eol] != '\r') eol++;
+        u32 line_len = eol - pos;
+        u32 next = eol;
+        while (next < size && (data[next] == '\n' || data[next] == '\r')) next++;
+
+        if (line_len == 0 || data[pos] == '#') { pos = next; continue; }
+
+        /* 按 '|' 切 4 段：NAME|DISPLAY|FILE|ARGS */
+        const char *line = (const char *)data + pos;
+        int f0 = -1, f1 = -1, f2 = -1;
+        for (u32 i = 0; i < line_len; i++) {
+            if (line[i] == '|') {
+                if (f0 < 0) f0 = (int)i;
+                else if (f1 < 0) f1 = (int)i;
+                else if (f2 < 0) { f2 = (int)i; break; }
+            }
+        }
+        if (f0 > 0 && f1 > f0) {
+            int file_beg = f1 + 1;
+            int file_end = (f2 > file_beg) ? f2 : (int)line_len;
+            int args_beg = (f2 > file_beg) ? f2 + 1 : (int)line_len;
+
+            lapp_field_copy(g_papp_name[pi], 12, line, f0);
+            lapp_field_copy(g_papp_disp[pi], 16, line + f0 + 1, f1 - f0 - 1);
+            lapp_field_copy(g_papp_file[pi], 96, line + file_beg, file_end - file_beg);
+            if (args_beg < (int)line_len)
+                lapp_field_copy(g_papp_args[pi], 96, line + args_beg, (int)line_len - args_beg);
+            else
+                g_papp_args[pi][0] = 0;
+
+            if (g_papp_file[pi][0]) {
+                g_apps[g_app_count] = (app_descriptor){
+                    g_papp_name[pi], g_papp_disp[pi], 720, 540,
+                    0, 0, pe_win_on_draw, 0, 0, 0, 0,
+                    g_papp_file[pi], g_papp_args[pi]
+                };
+                g_app_count++;
+                pi++;
+            }
+        }
+        pos = next;
+    }
+}
+
 static void register_apps(void) {
     /* 命令行1：shell.elf（原生命令行 + 可运行 Linux 程序）*/
     g_apps[0] = (app_descriptor){
@@ -1462,6 +1712,16 @@ static void register_apps(void) {
         0, 0, 0, 0, "PROEDIT ELF"
     };
     g_app_count++;
+    /* Settings — 系统设置（内核 FUCK 配置 + 网络 NETCONF 配置）*/
+    g_apps[7] = (app_descriptor){
+        "settings", "Settings", 760, 540,
+        0, 0, 0, 0, "SETTINGSELF"
+    };
+    g_app_count++;
+    /* VSCode Phase 5: Linux guest 应用（VSCode 等），来自 LINUXAPP.CNF */
+    register_linux_apps();
+    /* P5d: Windows PE 应用，来自 PEAPPS.CNF */
+    register_pe_apps();
 }
 
 /* Winux-Kate .desktop-grid：canvas padding 24px，列宽 104px，gap 18px，
@@ -1476,7 +1736,10 @@ static void setup_desktop_icons(void) {
     int y = KATE_TOPBAR_H + KATE_PAGE_PAD + pad;
     int max_x = (int)g_fb_w - pad;                  /* canvas 右缘 */
     for (int i = 0; i < g_app_count; i++) {
-        if (!g_apps[i].on_create && !g_apps[i].elf_name) continue;
+        if (g_icon_count >= MAX_ICONS) break;
+        /* P7.4: Linux 应用（linux_path）也要出图标——否则 VSCODE 不可见 */
+        if (!g_apps[i].on_create && !g_apps[i].elf_name &&
+            !g_apps[i].linux_path && !g_apps[i].pe_file) continue;
         /* 跳过 Terminal 和 CMD（已在 Dashboard 第一页） */
         if (g_apps[i].name[0] == 's' && g_apps[i].name[1] == 'h' && g_apps[i].name[2] == 'e') continue;
         if (g_apps[i].name[0] == 'c' && g_apps[i].name[1] == 'm' && g_apps[i].name[2] == 'd') continue;
@@ -1511,7 +1774,7 @@ typedef struct { u32 type,flags; u64 offset,vaddr,paddr,filesz,memsz,align; } dt
 typedef struct { i64 tag; u64 val; } dt_elf64_dyn;
 typedef struct { u64 offset; u64 info; i64 addend; } dt_elf64_rela;
 
-static u8 g_elf_image[262144];
+static u8 g_elf_image[1048576];   /* 1 MiB：settings.elf 内存映像 ~493KB（中文字体位图 BSS），256KB 不够 */
 
 static int dt_load_elf(u8 *data, u32 data_size, void **entry_out) {
     const dt_elf64_ehdr *eh = (const dt_elf64_ehdr *)data;
@@ -1553,11 +1816,15 @@ static int dt_load_elf(u8 *data, u32 data_size, void **entry_out) {
         if (rela_off && rela_sz) {
             const dt_elf64_rela *r = (const dt_elf64_rela *)(data + rela_off);
             u32 rn = (u32)(rela_sz / sizeof(dt_elf64_rela));
+            u64 load_bias = (u64)image - min_vaddr;   /* 与 DSK loader 一致 */
             for (u32 j = 0; j < rn; j++) {
                 u32 type = (u32)(r[j].info & 0xFFFFFFFF);
                 if (type == DT_R_X86_64_RELATIVE) {
+                    /* 原 BUG: val = min_vaddr + addend，指针被写成低地址绝对值，
+                     * 导致 settings.elf 等模块内 .data 中的字符串指针全部失效 */
+                    if (r[j].offset < min_vaddr || r[j].offset >= min_vaddr + isize) continue;
                     u64 target = r[j].offset - min_vaddr;
-                    u64 val = min_vaddr + (u64)r[j].addend;
+                    u64 val = load_bias + (u64)r[j].addend;
                     *(u64 *)(image + target) = val;
                 }
             }
@@ -1605,9 +1872,23 @@ static void fill_app_ctx(app_ctx *ctx, desktop_window *win) {
     ctx->kernel_api = g_kernel_api;
 }
 
+static void launch_linux_app(int app_id);   /* VSCode Phase 5（定义于 IDE 区） */
+
 static void launch_app(int app_id) {
     if (app_id < 0 || app_id >= g_app_count) return;
     app_descriptor *app = &g_apps[app_id];
+
+    /* VSCode Phase 5: Linux guest 应用走 exec_async 共享启动路径 */
+    if (app->linux_path) {
+        launch_linux_app(app_id);
+        return;
+    }
+
+    /* P5d: Windows PE 应用走 run_windowed 桌面嵌入路径 */
+    if (app->pe_file) {
+        launch_pe_app(app_id);
+        return;
+    }
 
     if (app->elf_name) {
         launch_external_elf(app->elf_name);
@@ -2228,6 +2509,383 @@ static void draw_dashboard(void) {
 
 /* ---- 2·IDE ---- */
 static int g_ide_attached = 0;
+static void page_switch(int p);   /* 定义于工作区段，launch_linux_app 前向引用 */
+
+/* VSCode Phase 6: guest GUI 状态机。
+ * 0 = 未运行（IDE host 显示启动提示）
+ * 1 = 启动中（X server/VSCode spawn 已发出，等 scanout 上线）
+ * 2 = 运行中（scanout enabled，blit guest 帧） */
+static int g_vscode_state = 0;
+
+/* P8.1: VSCode 启动插桩--分阶段状态跟踪 + 串口日志 + 屏幕显示。
+ * g_launch_phase: 0=idle 1=X启动 2=X socket等待 3=app spawn 4=pgrep验证 5=等scanout 6=running 7=失败
+ * g_launch_status: 屏幕显示的状态字符串（IDE host 区域） */
+static int g_launch_phase = 0;
+static char g_launch_status[64] = "";
+static u64 g_launch_tsc = 0;        /* 启动开始 TSC（测各阶段耗时） */
+static int g_launch_exec_rc = 0;    /* exec_async 返回码 */
+static int g_launch_pgrep_rc = -1;  /* pgrep 验证结果（0=找到, 1=未找到）*/
+
+/* P7.4 多实例：IDE tab 动态标签——显示最近启动实例的 DISPLAY 名
+ * （单 X :0 共享 scanout，多 VSCode 进程同屏；标签指示最后 attach 者）。 */
+static char g_ide_tab_label[16] = "VSCODE";
+
+/* P7.9: 性能 profiling（TSC 计时，每秒更新 FPS 显示）。
+ * 在 IDE 页面叠加显示 FPS / blit 耗时 / dirty 跳过率。 */
+static u64 g_prof_frames = 0;        /* 自上次 FPS 更新以来的帧数 */
+static u64 g_prof_fps_tsc = 0;       /* 上次 FPS 计算的 TSC */
+static int g_prof_fps = 0;           /* 当前 FPS（每秒更新） */
+static u64 g_prof_blit_total = 0;    /* 累计 blit TSC */
+static u64 g_prof_blit_count = 0;    /* blit 调用次数 */
+static u64 g_prof_blit_skip = 0;     /* dirty=0 跳过的次数 */
+static u64 g_prof_blit_full = 0;     /* full repaint 次数 */
+static int g_prof_last_blit_us = 0;  /* 上次 blit 耗时（微秒） */
+
+/* P7.3: attach/detach 时使 scanout 缓存失效并请求全量重绘（定义于 blit 区） */
+static void ide_attach_invalidate(void);
+
+/* VSCode Phase 3: IDE attach 时在 Linux guest 中启动 X server（Xfbdev）。
+ * Xfbdev 通过 virtio-gpu 2D 设备合成帧到 surface pool scanout 影子缓冲，
+ * desktop 每帧 blit 到 IDE host 区域。exec 用 sh -c "... &" 后台启动，
+ * shell 立即退出被 daemon 回收，Xfbdev 由 init 收养继续运行。
+ * Phase 6: pgrep 守卫保证幂等（多实例/重复 attach 不重起 X）。 */
+/* P8.1: slog + 数字（用于 rc/ec 日志，负数正确显示前导 -） */
+static void slog_num(const char *prefix, int rc) {
+    char buf[48];
+    kstrcpy(buf, prefix, 48);
+    int n = kstrlen(buf);
+    if (rc < 0) { buf[n++] = '-'; rc = -rc; }
+    u32dec((u32)rc, buf + n);
+    slog(buf);
+}
+
+static void ide_launch_guest_x(void) {
+    if (!g_lxc_svc || !g_lxc_svc->exec) { slog("ide: lxc exec unavailable"); return; }
+    slog("[launch] phase 1: launching Xfbdev");
+    g_launch_phase = 1;
+    kstrcpy(g_launch_status, "LAUNCHING X SERVER . . .", 64);
+    const char *argv[] = {
+        "sh", "-c",
+        "pgrep -x Xfbdev >/dev/null 2>&1 || "
+        "Xfbdev :0 -geometry 1024x768 -depth 32 >/dev/null 2>&1 &"
+    };
+    u64 exit_code = 0;
+    int rc = g_lxc_svc->exec("/bin/sh", 3, argv, 0, 0, 0, &exit_code);
+    slog_num("[launch] Xfbdev exec rc=", rc);
+    if (rc != 0) {
+        slog("[launch] WARNING: Xfbdev launch rc!=0 (may still be OK if already running)");
+    }
+}
+
+/* P8.1 Fix: lxc guest ping -- exec "echo OK" 快速检测 Linux guest 是否运行。
+ * 返回 0=guest 可用，非 0=不可用（VMX 未启用/guest 未 park/IPC 不通）。 */
+static int lxc_guest_ping(void) {
+    if (!g_lxc_svc || !g_lxc_svc->exec) return -1;
+    const char *pargv[] = { "sh", "-c", "echo OK" };
+    char out[8] = {0};
+    u64 ec = 0;
+    int rc = g_lxc_svc->exec("/bin/sh", 3, pargv, out, 7, 0, &ec);
+    if (rc != 0) return rc;
+    if (out[0] == 'O' && out[1] == 'K') return 0;
+    return -1;
+}
+
+/* VSCode Phase 6: 共享 guest GUI 启动路径（IDE +NEW/双击 host 与桌面图标共用）。
+ * 首次调用确保 X server 在线（幂等启动 + 有界等待 X socket），然后
+ * exec_async 目标程序（daemon fork+setsid+detach，立即返回）。
+ * 后续调用（多实例）跳过 X 准备直接 spawn。path 为 NULL 时仅确保 X 在线。
+ * P8.1 Fix: 启动前 ping 检测 guest 可用性；失败时快速短路，不浪费 5s X socket 等待。 */
+static void guest_gui_launch(const char *path, int argc, const char *const *argv) {
+    if (!g_lxc_svc) {
+        slog("[launch] lxc service null");
+        g_launch_phase = 7;
+        kstrcpy(g_launch_status, "LXC SERVICE UNAVAILABLE", 64);
+        return;
+    }
+    if (g_vscode_state == 0) {
+        g_vscode_state = 1;   /* 启动中 */
+        g_launch_tsc = rdtsc();
+        slog("[launch] === guest GUI launch sequence start ===");
+
+        /* P8.1 Fix: Phase 0 - ping guest 检测可用性 */
+        g_launch_phase = 0;
+        kstrcpy(g_launch_status, "CHECKING GUEST . . .", 64);
+        int prc = lxc_guest_ping();
+        slog_num("[launch] guest ping rc=", prc);
+        if (prc != 0) {
+            slog("[launch] FAIL: Linux guest not running (VMX/guest unavailable)");
+            g_vscode_state = 0;   /* 回到未启动状态 */
+            g_launch_phase = 7;
+            kstrcpy(g_launch_status, "GUEST NOT RUNNING - NEED KVM/VMX", 64);
+            return;
+        }
+        slog("[launch] guest ping OK - Linux guest is running");
+
+        /* Phase 1: launch X server */
+        ide_launch_guest_x();
+
+        /* Phase 2: wait for X socket (bounded ~5s) */
+        g_launch_phase = 2;
+        kstrcpy(g_launch_status, "WAITING FOR X SOCKET . . .", 64);
+        slog("[launch] phase 2: waiting for X socket");
+        if (g_lxc_svc->exec) {
+            const char *wargv[] = {
+                "sh", "-c",
+                "i=0; while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 25 ]; "
+                "do sleep 0.2; i=$((i+1)); done; [ -S /tmp/.X11-unix/X0 ] && echo OK || echo FAIL"
+            };
+            /* 用 exec + stdout 捕获验证 X socket 是否就绪 */
+            char xout[16] = {0};
+            u64 ec = 0;
+            int rc = g_lxc_svc->exec("/bin/sh", 3, wargv, xout, 15, 0, &ec);
+            slog_num("[launch] X socket wait rc=", rc);
+            if (xout[0] == 'O' && xout[1] == 'K') {
+                slog("[launch] X socket READY (/tmp/.X11-unix/X0 exists)");
+            } else {
+                slog("[launch] WARNING: X socket NOT ready after ~5s timeout");
+                kstrcpy(g_launch_status, "X SOCKET TIMEOUT - RETRYING SPAWN", 64);
+            }
+        }
+    }
+
+    /* Phase 3: exec_async spawn the app */
+    if (path && g_lxc_svc->exec_async) {
+        g_launch_phase = 3;
+        kstrcpy(g_launch_status, "SPAWNING APPLICATION . . .", 64);
+        slog("[launch] phase 3: exec_async spawn");
+        slog(path);
+        int rc = g_lxc_svc->exec_async(path, argc, argv);
+        g_launch_exec_rc = rc;
+        slog_num("[launch] exec_async rc=", rc);
+        if (rc == 0) {
+            slog("[launch] exec_async OK - process spawned");
+        } else {
+            slog("[launch] exec_async FAILED - process not spawned");
+            g_vscode_state = 0;   /* P8.1 Fix: 回到未启动，UI 显示错误而非永远 STARTING */
+            g_launch_phase = 7;
+            kstrcpy(g_launch_status, "SPAWN FAILED - CHECK SERIAL LOG", 64);
+            return;
+        }
+
+        /* Phase 4: pgrep verify process exists (bounded wait ~1s) */
+        g_launch_phase = 4;
+        kstrcpy(g_launch_status, "VERIFYING PROCESS . . .", 64);
+        slog("[launch] phase 4: pgrep verify");
+        if (g_lxc_svc->exec) {
+            /* 用 basename 做 pgrep（code -> pgrep code） */
+            const char *pargv[] = {
+                "sh", "-c",
+                "sleep 0.5; pgrep -x code >/dev/null 2>&1 && echo FOUND || echo NOPE"
+            };
+            char pout[16] = {0};
+            u64 pec = 0;
+            int prc = g_lxc_svc->exec("/bin/sh", 3, pargv, pout, 15, 0, &pec);
+            if (pout[0] == 'F') {
+                g_launch_pgrep_rc = 0;
+                slog("[launch] pgrep: VSCode process FOUND");
+            } else if (pout[0] == 'N') {
+                g_launch_pgrep_rc = 1;
+                slog("[launch] pgrep: VSCode process NOT found (may still be starting)");
+            } else {
+                g_launch_pgrep_rc = -1;
+                slog_num("[launch] pgrep: no output, exec rc=", prc);
+            }
+        }
+
+        /* Phase 5: wait for scanout */
+        g_launch_phase = 5;
+        kstrcpy(g_launch_status, "WAITING FOR SCANOUT . . .", 64);
+        slog("[launch] phase 5: waiting for scanout to come online");
+    } else if (path && !g_lxc_svc->exec_async) {
+        slog("[launch] exec_async unavailable - cannot spawn app");
+        g_launch_phase = 7;
+        kstrcpy(g_launch_status, "EXEC_ASYNC UNAVAILABLE", 64);
+    }
+}
+
+/* VSCode Phase 5/6: 桌面图标启动 Linux 应用（LINUXAPP.CNF 注册项）。
+ * 解析 args（空格分隔）后经共享路径 exec_async，并切到 IDE 页 attach。 */
+static void launch_linux_app(int app_id) {
+    if (app_id < 0 || app_id >= g_app_count) return;
+    app_descriptor *app = &g_apps[app_id];
+    if (!app->linux_path) return;
+    if (!g_lxc_svc || !g_lxc_svc->exec_async) {
+        slog("linuxapp: lxc service unavailable");
+        return;
+    }
+
+    /* argv: [name, ...args]（args 在本地缓冲内原地切分） */
+    const char *argv[16];
+    int argc = 0;
+    argv[argc++] = app->name;
+    char abuf[96];
+    if (app->linux_args && app->linux_args[0]) {
+        int n = kstrlen(app->linux_args);
+        if (n > (int)sizeof(abuf) - 1) n = (int)sizeof(abuf) - 1;
+        for (int i = 0; i < n; i++) abuf[i] = app->linux_args[i];
+        abuf[n] = 0;
+        char *p = abuf;
+        while (*p && argc < 15) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            argv[argc++] = p;
+            while (*p && *p != ' ') p++;
+            if (*p) *p++ = 0;
+        }
+    }
+
+    guest_gui_launch(app->linux_path, argc, argv);
+
+    /* P7.4: tab 标签跟随最近启动实例（DISPLAY 名，≤15 字符） */
+    {
+        int i = 0;
+        const char *dn = app->display_name;
+        while (dn && dn[i] && i + 1 < (int)sizeof(g_ide_tab_label)) {
+            g_ide_tab_label[i] = dn[i];
+            i++;
+        }
+        g_ide_tab_label[i] = 0;
+    }
+
+    /* 切到 IDE 页并 attach（VSCode 窗口出现在 IDE host 区域） */
+    g_ide_attached = 1;
+    g_input_forward_enabled = 1;
+    ide_attach_invalidate();   /* P7.3: attach 首帧全量重绘 */
+    page_switch(2);
+    slog("linuxapp launched -> ide attached");
+}
+
+/* VSCode Phase 6: IDE attach 共享入口——启动（或复用）VSCode。 */
+static void vscode_launch(void) {
+    if (g_vscode_app_id >= 0) {
+        launch_linux_app(g_vscode_app_id);
+        return;
+    }
+    /* 未注册 VSCode（CNF 缺失）：仅确保 X server 在线，保持 Phase 3 行为 */
+    guest_gui_launch(0, 0, 0);
+}
+
+/* VSCode Phase 3/7: 把 virtio-gpu scanout 影子缓冲 blit 到 IDE host 区域。
+ * scanout 为 1024×768 XRGB8888（stride=4096），与 framebuffer 同为 32bpp。
+ * Phase 7 dirty rect 优化：主循环每帧把 scanout 状态缓存进 g_so（查询会
+ * 清零 UTSM 侧 dirty），blit 只拷贝累积 dirty rect（scanout 坐标系并集），
+ * sprite 双缓冲持久保留未变区域；attach/首帧/状态切换经 g_so_full_repaint
+ * 全量重绘一次。 */
+static struct linux_compat_scanout_info g_so;
+static int g_so_valid = 0;          /* 1 = g_so 为本帧主循环 poll 的缓存 */
+static int g_so_full_repaint = 1;   /* 1 = 下次 blit 全量拷贝（初始/attach/上线） */
+
+/* attach/detach 时使 scanout 缓存失效并请求全量重绘 */
+static void ide_attach_invalidate(void) {
+    g_so_full_repaint = 1;
+    g_so_valid = 0;
+}
+
+/* 获取 scanout 状态：优先本帧缓存；缓存无效时查询并缓存。 */
+static const struct linux_compat_scanout_info *ide_scanout_state(void) {
+    if (g_so_valid) return &g_so;
+    if (g_lxc_svc && g_lxc_svc->gpu_get_scanout_info &&
+        g_lxc_svc->gpu_get_scanout_info(&g_so) == 0) {
+        g_so_valid = 1;
+        return &g_so;
+    }
+    return 0;
+}
+
+static void blit_scanout_to_ide(int hx, int hy, int hw, int hh) {
+    const struct linux_compat_scanout_info *si = ide_scanout_state();
+    if (!si || !si->enabled || !si->host_vaddr) {
+        /* scanout 未就绪：X server 尚未 SET_SCANOUT，显示等待提示 */
+        du_fill_rect(&g_fb, hx, hy, hw, hh, 0xFF051828u);
+        draw_centered("WAITING FOR GUEST X SERVER . . .",
+                      hx + hw / 2, hy + hh / 2 - 8, KS_TEXT_DIM, 0);
+        return;
+    }
+
+    int sw = (int)si->width, sh = (int)si->height;
+    int sstride = (int)si->stride;   /* bytes/row */
+    int dstride = (int)g_fb_pitch;   /* bytes/row */
+    u8 *src = (u8 *)si->host_vaddr;
+    u8 *dst_base = (u8 *)g_fb.fb;
+
+    /* 拷贝区域：默认仅累积 dirty rect；full repaint 时整帧 */
+    int full = g_so_full_repaint;
+    int cx = 0, cy = 0, cw = sw, ch = sh;
+    if (!full) {
+        if (!si->dirty || si->dirty_w == 0 || si->dirty_h == 0) {
+            g_prof_blit_skip++;   /* P7.9: dirty=0 零拷贝跳过 */
+            return;
+        }
+        cx = (int)si->dirty_x; cy = (int)si->dirty_y;
+        cw = (int)si->dirty_w; ch = (int)si->dirty_h;
+    }
+    g_so_full_repaint = 0;
+
+    /* P7.9: TSC 计时 blit */
+    u64 _tsc0 = rdtsc();
+    if (full) g_prof_blit_full++;
+
+    /* clamp 到 host 区域与 scanout 边界 */
+    if (cx + cw > hw) cw = hw - cx;
+    if (cy + ch > hh) ch = hh - cy;
+    if (cw > sw - cx) cw = sw - cx;
+    if (ch > sh - cy) ch = sh - cy;
+    if (cw <= 0 || ch <= 0) return;
+
+    for (int row = 0; row < ch; row++) {
+        u32 *s = (u32 *)(src + (u64)(cy + row) * sstride + (u64)cx * 4);
+        u32 *d = (u32 *)(dst_base + (u64)(hy + cy + row) * dstride
+                       + (u64)(hx + cx) * 4);
+        for (int col = 0; col < cw; col++) d[col] = s[col];
+    }
+
+    /* 全量重绘时，scanout 未覆盖的 host 剩余区域填深色背景 */
+    if (full) {
+        int cov_w = (hw < sw) ? hw : sw;
+        int cov_h = (hh < sh) ? hh : sh;
+        if (cov_w < hw)
+            du_fill_rect(&g_fb, hx + cov_w, hy, hw - cov_w, cov_h, 0xFF051828u);
+        if (cov_h < hh)
+            du_fill_rect(&g_fb, hx, hy + cov_h, hw, hh - cov_h, 0xFF051828u);
+    }
+
+    /* P7.6: 叠加 guest 硬件光标（ARGB alpha-blend 到 framebuffer）。
+     * 光标位图 row stride = 64（virtio-gpu 规范 cursor max 64x64）。
+     * 坐标从 scanout 坐标系映射到 framebuffer：(hx + cursor_x - hot_x, ...) */
+    if (si->cursor_visible && si->cursor_bitmap) {
+        int cw = (int)si->cursor_w, ch = (int)si->cursor_h;
+        if (cw > 0 && ch > 0) {
+            int fx = hx + (int)si->cursor_x - (int)si->cursor_hot_x;
+            int fy = hy + (int)si->cursor_y - (int)si->cursor_hot_y;
+            u32 *cbmp = (u32 *)si->cursor_bitmap;
+            for (int row = 0; row < ch; row++) {
+                int dy = fy + row;
+                if (dy < 0 || (u64)dy >= g_fb_h) continue;
+                u32 *d = (u32 *)((u8 *)g_fb.fb + (u64)dy * (u64)g_fb_pitch);
+                const u32 *s = &cbmp[row * 64];   /* row stride = VGPU_CURSOR_MAX */
+                for (int col = 0; col < cw; col++) {
+                    int dx = fx + col;
+                    if (dx < 0 || (u64)dx >= g_fb_w) continue;
+                    u32 src = s[col];
+                    u32 a = (src >> 24) & 0xFF;
+                    if (a == 0) continue;
+                    if (a == 255) { d[dx] = src; continue; }
+                    u32 dst = d[dx];
+                    u32 rr = (((src >> 16) & 0xFF) * a + ((dst >> 16) & 0xFF) * (255 - a)) / 255;
+                    u32 gg = (((src >>  8) & 0xFF) * a + ((dst >>  8) & 0xFF) * (255 - a)) / 255;
+                    u32 bb = ( (src        & 0xFF) * a + ( dst        & 0xFF) * (255 - a)) / 255;
+                    d[dx] = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+                }
+            }
+        }
+    }
+
+    /* P7.9: 记录 blit 耗时 */
+    g_prof_blit_total += rdtsc() - _tsc0;
+    g_prof_blit_count++;
+    if (g_tsc_per_sec)
+        g_prof_last_blit_us = (int)((rdtsc() - _tsc0) * 1000000 / g_tsc_per_sec);
+}
 
 static void draw_ide(void) {
     int W = (int)g_fb_w;
@@ -2243,9 +2901,9 @@ static void draw_ide(void) {
     du_fill_rect(&g_fb, x, top + 14, 8, 8, KS_ACCENT2);
     x += 16;
 
-    /* 实例标签 EDITOR ×（Kate .ide-tab） */
+    /* 实例标签（Kate .ide-tab）：P7.4 动态标签 = 最近启动实例 DISPLAY 名 */
     {
-        const char *label = "EDITOR";
+        const char *label = g_ide_tab_label;
         int bw = kstrlen(label) * (int)DU_ASCII_STEP + 32;
         if (g_ide_attached) {
             du_fill_rect(&g_fb, x, top + 5, bw, 26, KS_ACCENT);
@@ -2292,11 +2950,89 @@ static void draw_ide(void) {
     draw_dashed_rect(hx, hy, hw, hh, KS_BORDER);
 
     if (g_ide_attached) {
-        editor_draw_to((editor_state *)ADDR_EDDASH, hx + 2, hy + 2, hw - 4, hh - 4);
+        if (g_input_forward_enabled) {
+            /* VSCode Phase 6 状态机：启动中探测 scanout 上线 → 运行中 */
+            if (g_vscode_state == 1) {
+                const struct linux_compat_scanout_info *si = ide_scanout_state();
+                if (si && si->enabled) {
+                    g_vscode_state = 2;
+                    g_launch_phase = 6;
+                    g_so_full_repaint = 1;   /* 上线首帧全量重绘 */
+                    /* P8.1: scanout 上线日志 + 耗时 */
+                    slog("[launch] phase 6: SCANOUT ONLINE");
+                    if (g_tsc_per_sec && g_launch_tsc) {
+                        u64 ms = (rdtsc() - g_launch_tsc) * 1000 / g_tsc_per_sec;
+                        slog_num("[launch] total launch time ms=", (int)ms);
+                    }
+                    {
+                        char sbuf[48];
+                        kstrcpy(sbuf, "scanout: ", 48);
+                        u32dec(si->width, sbuf + kstrlen(sbuf));
+                        kstrcat(sbuf, "x", 48);
+                        u32dec(si->height, sbuf + kstrlen(sbuf));
+                        slog(sbuf);
+                    }
+                }
+            }
+            if (g_vscode_state == 2) {
+                /* 运行中：blit guest 合成帧 */
+                blit_scanout_to_ide(hx + 2, hy + 2, hw - 4, hh - 4);
+            } else {
+                /* P8.1: 启动中--显示分阶段状态 + 详细信息 */
+                du_fill_rect(&g_fb, hx + 2, hy + 2, hw - 4, hh - 4, 0xFF051828u);
+                draw_centered(g_launch_status[0] ? g_launch_status :
+                              "STARTING VSCODE . . .",
+                              W / 2, hy + hh / 2 - 20, KS_TEXT_DIM, 0);
+                /* 详细信息行（phase/exec_rc/pgrep/耗时） */
+                {
+                    char dbuf[80];
+                    int dp = 0;
+                    kstrcpy(dbuf + dp, "PHASE:", 80); dp = kstrlen(dbuf);
+                    dp += u32dec((u32)g_launch_phase, dbuf + dp);
+                    if (g_launch_exec_rc != 0) {
+                        kstrcpy(dbuf + dp, " RC:", 80); dp = kstrlen(dbuf);
+                        dp += u32dec((u32)(g_launch_exec_rc < 0 ?
+                                    (u32)(-g_launch_exec_rc) : (u32)g_launch_exec_rc),
+                                    dbuf + dp);
+                    }
+                    if (g_launch_pgrep_rc >= 0) {
+                        kstrcpy(dbuf + dp, " PGREP:", 80); dp = kstrlen(dbuf);
+                        kstrcpy(dbuf + dp, g_launch_pgrep_rc == 0 ? "FOUND" : "MISSING",
+                                80);
+                        dp = kstrlen(dbuf);
+                    }
+                    if (g_tsc_per_sec && g_launch_tsc) {
+                        u64 ms = (rdtsc() - g_launch_tsc) * 1000 / g_tsc_per_sec;
+                        kstrcpy(dbuf + dp, " T:", 80); dp = kstrlen(dbuf);
+                        dp += u32dec((u32)ms, dbuf + dp);
+                        kstrcpy(dbuf + dp, "ms", 80);
+                    }
+                    draw_centered(dbuf, W / 2, hy + hh / 2 + 4, KS_TEXT_DIM, 0);
+                }
+            }
+        } else {
+            editor_draw_to((editor_state *)ADDR_EDDASH, hx + 2, hy + 2, hw - 4, hh - 4);
+        }
     } else {
         /* embed-empty（Kate：未启动 VSCode 提示） */
-        draw_centered("EDITOR NOT ATTACHED . DOUBLE-CLICK OR + NEW IDE",
+        draw_centered("VSCODE NOT RUNNING . DOUBLE-CLICK OR + NEW IDE TO START",
                       W / 2, hy + hh / 2 - 8, KS_TEXT_DIM, 0);
+    }
+
+    /* P7.9: 性能 profiling 叠加（IDE 页面左下角） */
+    if (g_ide_attached && g_input_forward_enabled) {
+        char buf[80];
+        int p = 0;
+        kstrcpy(buf + p, "FPS:", 80 - p); p = kstrlen(buf);
+        p += u32dec((u32)g_prof_fps, buf + p);
+        kstrcpy(buf + p, " BLT:", 80 - p); p = kstrlen(buf);
+        p += u32dec((u32)g_prof_last_blit_us, buf + p);
+        kstrcpy(buf + p, "us SKP:", 80 - p); p = kstrlen(buf);
+        p += u32dec((u32)g_prof_blit_skip, buf + p);
+        kstrcpy(buf + p, " FUL:", 80 - p); p = kstrlen(buf);
+        p += u32dec((u32)g_prof_blit_full, buf + p);
+        du_draw_string(&g_fb, buf, hx + 6, hy + hh - 16,
+                       KS_TEXT_DIM, 0, DU_ASCII_STEP);
     }
 }
 
@@ -2836,10 +3572,33 @@ static int dash_click(int mx, int my, int dbl) {
 
 /* ---- 2·IDE 点击 ---- */
 static int ide_click(int mx, int my, int dbl) {
-    if (g_ide_attached && rect_hit(g_ide_tabx, mx, my)) { g_ide_attached = 0; return 1; }
-    if (!g_ide_attached && rect_hit(g_ide_new_rect, mx, my)) { g_ide_attached = 1; return 1; }
+    if (g_ide_attached && rect_hit(g_ide_tabx, mx, my)) {
+        g_ide_attached = 0;
+        /* VSCode Phase 2: detach 时停止向 guest 转发输入 */
+        g_input_forward_enabled = 0;
+        ide_attach_invalidate();   /* P7.3: detach 后下次 attach 全量重绘 */
+        slog("ide detached, input forwarding off");
+        return 1;
+    }
+    if (!g_ide_attached && rect_hit(g_ide_new_rect, mx, my)) {
+        g_ide_attached = 1;
+        ide_attach_invalidate();   /* P7.3: attach 首帧全量重绘 */
+        /* attach 时仅当 Linux guest 服务可用才开启转发；否则降级为本地 editor */
+        g_input_forward_enabled = (g_lxc_svc != 0);
+        slog(g_input_forward_enabled ? "ide attached, forwarding to guest"
+                                    : "ide attached, lxc unavailable (local editor)");
+        /* VSCode Phase 6: 共享启动路径（X server + VSCode） */
+        if (g_input_forward_enabled) vscode_launch();
+        return 1;
+    }
     if (!g_ide_attached && dbl && rect_hit(g_ide_host, mx, my)) {
         g_ide_attached = 1;
+        ide_attach_invalidate();   /* P7.3: attach 首帧全量重绘 */
+        g_input_forward_enabled = (g_lxc_svc != 0);
+        slog(g_input_forward_enabled ? "ide attached (dbl), forwarding to guest"
+                                    : "ide attached (dbl), lxc unavailable (local editor)");
+        /* VSCode Phase 6: 共享启动路径（X server + VSCode） */
+        if (g_input_forward_enabled) vscode_launch();
         return 1;
     }
     return 0;
@@ -2863,7 +3622,7 @@ static int desktop_click(int mx, int my, int dbl) {
         for (int i = 0; i < g_win_count; i++) {
             if (!g_tb_rect[i][2] || !rect_hit(g_tb_rect[i], mx, my)) continue;
             if (rect_hit(g_tb_close_rect[i], mx, my)) {
-                win_destroy(&g_windows[i]);
+                win_close_request(&g_windows[i]);
             } else {
                 win_focus(&g_windows[i]);
             }
@@ -2879,7 +3638,7 @@ static int desktop_click(int mx, int my, int dbl) {
         win_focus(w);
         w = win_find(wid);   /* focus 重排后重新定位 */
         if (!w) return 1;
-        if (win_hit_close_btn(w, mx, my)) { win_destroy(w); return 1; }
+        if (win_hit_close_btn(w, mx, my)) { win_close_request(w); return 1; }
         if (win_hit_titlebar(w, mx, my)) {
             g_dragging = 1;
             g_drag_win = w->id;
@@ -3038,6 +3797,21 @@ static int on_right_press(void) {
 
 /* ---- 键盘 ---- */
 static int handle_key(u8 sc) {
+    /* VSCode Phase 2: IDE attached 且在 IDE 页时，把按键序列转发到 Linux guest。
+     * 0xE0 前缀字节本身不转发（无对应 keycode），仅靠 g_e0 标志让下一字节选取扩展键变体。
+     * 转发在修饰键跟踪与页面路由之前完成，保证 VSCode 收到完整 press/release
+     * 序列（含 Shift/Ctrl/Alt/方向键）。宿主修饰键跟踪继续运行，Ctrl+Tab 切页、
+     * Ctrl+S 等热键仍可在宿主侧生效，便于用户随时切离 IDE 页。 */
+    if (g_input_forward_enabled && g_lxc_svc && g_lxc_svc->input_forward_keyboard &&
+        sc != 0xE0 && g_page == 2) {
+        u8 base = (u8)(sc & 0x7F);
+        u16 code = scancode_to_linux_keycode(base, g_e0);
+        if (code) {
+            u32 value = (sc & 0x80) ? 0 : 1;   /* 0x80 位 = release */
+            g_lxc_svc->input_forward_keyboard(code, value);
+        }
+    }
+
     if (sc == 0xE0) { g_e0 = 1; return 0; }
     if (sc == 0x2A || sc == 0x36) { g_shift = 1; return 0; }
     if (sc == 0xAA || sc == 0xB6) { g_shift = 0; return 0; }
@@ -3094,6 +3868,11 @@ static int handle_key(u8 sc) {
     }
     if (g_page == 2) {
         if (g_ide_attached) {
+            if (g_input_forward_enabled) {
+                /* VSCode Phase 2: 键盘已转发到 guest 中的 VSCode，
+                 * 本地 editor 不再重复处理，避免双输入。 */
+                return 1;
+            }
             editor_key((editor_state *)ADDR_EDDASH, sc, g_shift);
             return 1;
         }
@@ -3116,6 +3895,210 @@ static int handle_key(u8 sc) {
         }
     }
     return 0;
+}
+
+/* ============================================================
+ *  P5d: PE 窗口运行时（run_windowed 桌面嵌入）
+ *
+ *  协作模型（契约见 utsm/pe.h pe_window_host）：
+ *    launch_pe_app 创建受管窗口并把客户区大小的内存 surface 交给 shim，
+ *    随后阻塞在 pe_service.run_windowed。PE 消息空转（GetMessage/
+ *    PeekMessage 无消息）时 shim 回调 pe_pump_cb，由它驱动 desktop 一帧：
+ *    采集 PS/2 输入（PE 窗口聚焦时经 inject_* 注入，否则走桌面正常路径）、
+ *    redraw_all + flip。关闭 = inject WM_CLOSE（win_close_request），
+ *    PE 自愿退出后 run_windowed 返回，launch_pe_app 收尾销毁窗口。
+ *
+ *  注意：pump 运行在 PE 的 1MB 大栈上，desktop 帧代码栈用量远小于此；
+ *  pump 内禁止再次调用 run/run_windowed（launch_pe_app 以 g_pe_running 拒绝）。
+ * ============================================================ */
+
+/* PE 窗口 on_draw：把 shim 渲染的 surface blit 到客户区（32bpp 行拷贝） */
+static void pe_win_on_draw(void *state, app_ctx *ctx) {
+    (void)state;
+    if (!g_pe_surf) return;
+    int w = (g_pe_surf_w < ctx->client_w) ? g_pe_surf_w : ctx->client_w;
+    int h = (g_pe_surf_h < ctx->client_h) ? g_pe_surf_h : ctx->client_h;
+    if (w <= 0 || h <= 0) return;
+    u8 *dst0 = (u8 *)g_fb.fb + (u64)ctx->client_y * g_fb_pitch
+             + (u64)ctx->client_x * 4;
+    u32 sp = (u32)g_pe_surf_w * 4;
+    for (int r = 0; r < h; r++) {
+        u32 *d = (u32 *)(dst0 + (u64)r * g_fb_pitch);
+        const u32 *s = (const u32 *)(g_pe_surf + (u64)r * sp);
+        for (int c = 0; c < w; c++) d[c] = s[c] | 0xFF000000u;
+    }
+}
+
+/* PE 消息空转让出点：驱动 desktop 一帧。返回 0 继续，非 0 请求 PE 退出。 */
+static int pe_pump_cb(void *ud) {
+    int win_id = (int)(u64)ud;
+    int moved = 0;
+    while (ps2_mouse_poll()) moved = 1;
+
+    desktop_window *pw = win_find(win_id);
+    if (!pw) return 1;                        /* 窗口已销毁：请求 PE 退出 */
+
+    int pe_focused = (g_page == 3 && pw->focused && pw->ws == g_ws_cur &&
+                      !g_taskview && !g_ctx_open);
+
+    /* 鼠标注入：PE 窗口聚焦且光标在客户区内 → surface 局部坐标 + 按钮位 */
+    int cx0 = pw->x + BORDER_W, cy0 = pw->y + KATE_TITLEBAR_H;
+    int ccw = pw->w - 2 * BORDER_W, cch = pw->h - KATE_TITLEBAR_H - BORDER_W;
+    if (pe_focused && g_pe_svc->inject_pointer &&
+        g_mouse_x >= cx0 && g_mouse_x < cx0 + ccw &&
+        g_mouse_y >= cy0 && g_mouse_y < cy0 + cch) {
+        g_pe_svc->inject_pointer(g_mouse_x - cx0, g_mouse_y - cy0,
+                                 (u32)(g_mouse_btn & 3));
+    }
+
+    /* 点击/释放走桌面正常路径（聚焦、标题栏拖拽、关闭按钮→win_close_request、
+     * 其他窗口/图标）。双击其他 PE 图标会被 launch_pe_app 的 g_pe_running 拒绝。 */
+    if (g_left_pressed)  { g_left_pressed = 0;  on_left_press(); }
+    if (g_right_pressed) { g_right_pressed = 0; on_right_press(); }
+    if (g_left_released) {
+        g_left_released = 0;
+        if (g_dragging || g_drag_slider) {
+            g_dragging = 0; g_drag_win = -1; g_drag_slider = 0;
+        }
+    }
+
+    pw = win_find(win_id);   /* 点击可能重排窗口数组 */
+    if (!pw) return 1;
+    pe_focused = (g_page == 3 && pw->focused && pw->ws == g_ws_cur &&
+                  !g_taskview && !g_ctx_open);
+
+    /* 窗口/滑块拖拽（与主循环相同的钳位） */
+    if (moved && g_dragging && g_drag_win == win_id) {
+        pw->x = g_mouse_x - g_drag_off_x;
+        pw->y = g_mouse_y - g_drag_off_y;
+        if (pw->y < KATE_TOPBAR_H) pw->y = KATE_TOPBAR_H;
+        if (pw->x < 0 - pw->w + 40) pw->x = 0 - pw->w + 40;
+        if (pw->x > (int)g_fb_w - 40) pw->x = (int)g_fb_w - 40;
+        if (pw->y > (int)g_fb_h - KATE_TASKBAR_H - 20)
+            pw->y = (int)g_fb_h - KATE_TASKBAR_H - 20;
+    }
+    if (moved && g_drag_slider == 1) slider_set(g_vol_rect, &g_vol, g_mouse_x);
+    if (moved && g_drag_slider == 2) slider_set(g_bri_rect, &g_bright, g_mouse_x);
+
+    /* 键盘：PE 聚焦时注入（shim 内部合成 KEYUP/CHAR/修饰键），
+     * Ctrl+Tab 保留给宿主切页；否则走桌面正常路径。 */
+    for (;;) {
+        u8 st = inb(0x64);
+        if (!(st & 1) || (st & 0x20)) break;
+        u8 sc = inb(0x60);
+        if (pe_focused && g_pe_svc->inject_scancode) {
+            if (sc == 0xE0) { g_e0 = 1; continue; }
+            /* 宿主侧同步跟踪修饰键（Ctrl+Tab 切页判定用） */
+            if (sc == 0x2A || sc == 0x36) g_shift = 1;
+            if (sc == 0xAA || sc == 0xB6) g_shift = 0;
+            if (sc == 0x1D) g_ctrl = 1;
+            if (sc == 0x9D) g_ctrl = 0;
+            if (g_ctrl && sc == 0x0F) {
+                /* 切页前补修饰键释放，防止 PE 侧卡键 */
+                g_pe_svc->inject_scancode(0x9D, 0);
+                g_pe_svc->inject_scancode(0xAA, 0);
+                g_pe_svc->inject_scancode(0xB8, 0);
+                g_e0 = 0;
+                handle_key(sc);
+                continue;
+            }
+            g_pe_svc->inject_scancode(sc, g_e0);
+            g_e0 = 0;
+        } else {
+            handle_key(sc);
+        }
+    }
+
+    if (g_quit) return 1;                     /* 任务栏 QUIT：请求 PE 退出 */
+
+    /* 驱动一帧（redraw_all 内含 PE surface blit 与光标绘制） */
+    redraw_all();
+    flip_buffer();
+    return 0;
+}
+
+/* 启动 PE 应用：读 exe → 建窗口 → run_windowed 阻塞运行 → 退出后销毁窗口 */
+static void launch_pe_app(int app_id) {
+    app_descriptor *app = &g_apps[app_id];
+    if (!g_pe_svc || !g_pe_svc->run_windowed) {
+        slog("pe: service unavailable");
+        return;
+    }
+    if (g_pe_running) {
+        slog("pe: another PE window is running");
+        return;
+    }
+
+    u8 *data = 0; u32 size = 0;
+    if (f32_read_path_lfn(app->pe_file, &data, &size) != 0) {
+        slog("pe: exe not found");
+        return;
+    }
+
+    /* 窗口布局：与 launch_app 相同的级联策略 */
+    int top = KATE_TOPBAR_H, bot = (int)g_fb_h - KATE_TASKBAR_H;
+    int wx = ICON_PAD + g_win_count * 30;
+    int wy = top + 8 + g_win_count * 30;
+    if (wx + (int)app->default_w > (int)g_fb_w - 20) wx = ICON_PAD;
+    if (wy + (int)app->default_h > bot - 20) wy = top + 8;
+
+    desktop_window *win = win_create(app_id, app->display_name,
+                                     wx, wy, (int)app->default_w, (int)app->default_h);
+    if (!win) return;
+    int win_id = win->id;
+
+    int cw = (int)app->default_w - 2 * BORDER_W;
+    int ch = (int)app->default_h - KATE_TITLEBAR_H - BORDER_W;
+    if (cw <= 0 || ch <= 0 || (u64)cw * (u64)ch * 4 > PE_SURFACE_MAX) {
+        win_destroy(win);
+        slog("pe: client area too large for surface");
+        return;
+    }
+    g_pe_surf = (u8 *)PE_SURFACE_ADDR;
+    g_pe_surf_w = cw; g_pe_surf_h = ch;
+    /* 初始化为深色底：PE 窗口未覆盖区域不残留脏数据 */
+    {
+        u32 *p = (u32 *)g_pe_surf;
+        u64 n = (u64)cw * (u64)ch;
+        for (u64 i = 0; i < n; i++) p[i] = 0xFF101418u;
+    }
+
+    win->app_state = &g_pe_state_dummy;   /* draw_desktop_page 要求非空才调 on_draw */
+    g_pe_win_id = win_id;
+    g_pe_running = 1;
+    slog("pe: run_windowed");
+
+    /* cmdline："file.exe args"（GetCommandLineA 返回值） */
+    static char cmdline[160];
+    kstrcpy(cmdline, app->pe_file, (int)sizeof(cmdline));
+    if (app->pe_args && app->pe_args[0]) {
+        kstrcat(cmdline, " ", (int)sizeof(cmdline));
+        kstrcat(cmdline, app->pe_args, (int)sizeof(cmdline));
+    }
+
+    pe_window_host host;
+    host.pump = pe_pump_cb;
+    host.ud = (void *)(u64)win_id;        /* 传 id：窗口数组重排不悬空 */
+    host.surface = g_pe_surf;
+    host.width = (u32)cw;
+    host.height = (u32)ch;
+    host.pitch = (u32)cw * 4;
+
+    u64 exit_code = 0;
+    g_pe_svc->run_windowed(data, size, cmdline, &exit_code, &host);
+
+    g_pe_running = 0;
+    g_pe_win_id = -1;
+    g_pe_surf = 0;
+
+    /* PE 已退出：销毁宿主窗口并全屏重绘 */
+    desktop_window *w2 = win_find(win_id);
+    if (w2) win_destroy(w2);
+    files_refresh();                      /* PE 可能改动了磁盘 */
+    g_full_redraw = 1;
+    redraw_all();
+    flip_buffer();
+    slog("pe: exited");
 }
 
 /* ============================================================
@@ -3144,6 +4127,26 @@ void dsk_entry(const dsk_boot_context *ctx) {
         u64 blk = *(u64 *)(ctx->dkm_kernel_api + 0xA8);
         g_block_read  = blk ? (desktop_block_read_fn)*(u64 *)(blk + 16) : 0;
         g_block_write = blk ? (desktop_block_write_fn)*(u64 *)(blk + 24) : 0;
+    }
+
+    /* VSCode Phase 2: Linux 兼容层服务指针（dsk_loader 在 reserved[5] 写入）。
+     * 为 NULL 表示 Linux guest 未启动 / IPC 未就绪，IDE attach 时降级为本地 editor。 */
+    g_lxc_svc = (const linux_compat_service *)ctx->reserved[5];
+    if (g_lxc_svc && g_lxc_svc->magic == LINUX_COMPAT_MAGIC) {
+        slog("lxc service available");
+    } else {
+        g_lxc_svc = 0;
+        slog("lxc service unavailable (IDE will use local editor)");
+    }
+
+    /* P5d: PE 兼容层服务指针（dsk_loader 在 reserved[4] 写入）。
+     * 为 NULL 表示 PE 服务未注册，PEAPPS.CNF 应用启动时降级报错。 */
+    g_pe_svc = (const pe_service *)ctx->reserved[4];
+    if (g_pe_svc && g_pe_svc->magic == PE_SERVICE_MAGIC) {
+        slog("pe service available");
+    } else {
+        g_pe_svc = 0;
+        slog("pe service unavailable");
     }
 
     du_context_init(&g_fb, g_fb_addr, g_fb_w, g_fb_h, g_fb_pitch);
@@ -3194,9 +4197,52 @@ void dsk_entry(const dsk_boot_context *ctx) {
     slog("desktop ready");
 
     /* 主事件循环 */
+    /* P8.1: dev 自动 VSCode 启动测试--无需 GUI 交互即可验证 launch 链路 */
+    static int g_autotest_state = 0;
+    static u64 g_autotest_tsc = 0;
+
     while (!g_quit) {
         int need_redraw = 0;
         int moved = 0;
+
+        /* P8.1: 自动启动测试（先 ping guest，不可用直接报告，不浪费 3s 等待） */
+        if (g_tsc_per_sec && g_autotest_state == 0) {
+            g_autotest_tsc = rdtsc();
+            g_autotest_state = 1;
+            /* P8.1 Fix: 先检测 guest 可用性 */
+            int prc = lxc_guest_ping();
+            if (prc != 0) {
+                slog("[autotest] SKIP: Linux guest not running (no VMX/KVM)");
+                slog("[autotest] To test VSCode: use WSL2+KVM or Linux host with KVM");
+                g_autotest_state = 3;  /* 跳过测试 */
+            } else {
+                slog("[autotest] guest OK, waiting 3s before vscode_launch");
+            }
+        }
+        if (g_autotest_state == 1 && g_tsc_per_sec) {
+            u64 elapsed = rdtsc() - g_autotest_tsc;
+            if (elapsed >= (u64)g_tsc_per_sec * 3) {
+                slog("[autotest] triggering vscode_launch");
+                g_autotest_state = 2;
+                vscode_launch();
+            }
+        }
+        if (g_autotest_state == 2 && g_tsc_per_sec) {
+            u64 elapsed = rdtsc() - g_autotest_tsc;
+            /* 15s 后报告结果 */
+            if (elapsed >= (u64)g_tsc_per_sec * 15) {
+                if (g_vscode_state == 2) {
+                    slog("[autotest] SUCCESS: scanout online, VSCode running");
+                } else if (g_vscode_state == 1) {
+                    slog("[autotest] TIMEOUT: still launching");
+                    slog_num("[autotest] phase=", g_launch_phase);
+                } else {
+                    slog("[autotest] FAIL: vscode_state=0");
+                    slog_num("[autotest] phase=", g_launch_phase);
+                }
+                g_autotest_state = 3;
+            }
+        }
 
         /* 鼠标：排空所有数据包 */
         while (ps2_mouse_poll()) moved = 1;
@@ -3254,6 +4300,31 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 if (g_page == 1 && !g_taskview) need_redraw = 1;
             }
         }
+
+        /* VSCode Phase 3/7: IDE attached 时轮询 guest scanout dirty，
+         * 有新帧则触发重绘以 blit 到 framebuffer。查询结果缓存进 g_so
+         * （查询清零 UTSM 侧 dirty + dirty rect），blit 据此局部拷贝。 */
+        if (g_page == 2 && g_ide_attached && g_input_forward_enabled &&
+            g_lxc_svc && g_lxc_svc->gpu_get_scanout_info) {
+            if (g_lxc_svc->gpu_get_scanout_info(&g_so) == 0) {
+                g_so_valid = 1;
+                if (g_so.dirty) need_redraw = 1;
+            }
+        }
+
+        /* P7.9: FPS 统计（每秒更新，基于 TSC） */
+        if (g_tsc_per_sec && g_prof_fps_tsc) {
+            u64 elapsed = rdtsc() - g_prof_fps_tsc;
+            if (elapsed >= g_tsc_per_sec) {
+                g_prof_fps = (int)(g_prof_frames * g_tsc_per_sec / elapsed);
+                g_prof_frames = 0;
+                g_prof_fps_tsc = rdtsc();
+                if (g_page == 2) need_redraw = 1;  /* 刷新叠加显示 */
+            }
+        } else if (g_tsc_per_sec) {
+            g_prof_fps_tsc = rdtsc();
+        }
+        if (need_redraw && g_page == 2) g_prof_frames++;
 
         if (need_redraw) {
             /* 脏矩形渲染：合并脏矩形，只 flip 变化区域 */

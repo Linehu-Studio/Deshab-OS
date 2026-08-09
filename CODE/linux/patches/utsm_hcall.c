@@ -56,6 +56,10 @@
 #define UTSM_IOCTL_READ_POOL  _IOWR('U', 6, struct utsm_ioctl_pool)
 #define UTSM_IOCTL_HOST_READ  _IOWR('U', 7, struct utsm_ioctl_hostfile)
 #define UTSM_IOCTL_HOST_WRITE _IOW('U', 8, struct utsm_ioctl_hostfile)
+/* VSCode integration Phase 1: query graphics surface pool GPA + size.
+ * Userspace then mmaps /dev/utsm (offset 0, len = size) to obtain a
+ * writable scanout buffer shared with the UTSM host. */
+#define UTSM_IOCTL_SURFACE_INFO _IOR('U', 9, struct utsm_ioctl_surface)
 
 /* Ioctl message wrapper: carries type + data in a single call */
 struct utsm_ioctl_msg {
@@ -87,6 +91,15 @@ struct utsm_ioctl_hostfile {
     u64 total;         /* out: total file size (HOST_READ) */
     u64 user_buf;      /* userspace buffer pointer */
     char name[64];     /* UTSM FAT32 root file name (NUL-terminated) */
+};
+
+/* VSCode integration Phase 1: graphics surface pool descriptor.
+ * Returned by UTSM_IOCTL_SURFACE_INFO. Userspace then mmaps /dev/utsm
+ * (offset 0, len = size) to obtain a writable scanout buffer that UTSM
+ * reads to blit guest graphics to the Deshab framebuffer. */
+struct utsm_ioctl_surface {
+    u64 gpa;           /* out: guest physical address of surface pool */
+    u64 size;          /* out: surface pool size in bytes */
 };
 
 /* ===== Hypercall ABI =====
@@ -143,6 +156,22 @@ static inline long utsm_hcall_shm_info(u64 *gpa_out, u64 *size_out)
 	return ret;
 }
 
+/* VSCode integration Phase 1: query graphics surface pool.
+ * Same GVA==GPA convention as utsm_hcall_shm_info. Returns 0 on success
+ * and fills *gpa_out + *size_out; negative UTSM_HCALL_* on error. */
+static inline long utsm_hcall_surface_info(u64 *gpa_out, u64 *size_out)
+{
+	u64 gpa = 0, size = 0;
+	long ret;
+
+	ret = utsm_hcall(UTSM_HCALL_SURFACE_INFO, (u64)&gpa, (u64)&size, 0);
+	if (ret == 0) {
+		*gpa_out = gpa;
+		*size_out = size;
+	}
+	return ret;
+}
+
 static inline long utsm_hcall_console_write(const char *buf, u64 len)
 {
 	return utsm_hcall(UTSM_HCALL_CONSOLE_WRITE, (u64)buf, len, 0);
@@ -172,6 +201,14 @@ static u64 g_shm_gpa;                      /* guest physical address of SHM */
 static u64 g_shm_size;                     /* size of SHM region */
 static int g_utsm_present;                 /* 1 = UTSM detected */
 static int g_shm_mapped;
+
+/* VSCode integration Phase 1: graphics surface pool state.
+ * Queried via UTSM_HCALL_SURFACE_INFO at init; exposed to userspace via
+ * UTSM_IOCTL_SURFACE_INFO + mmap(/dev/utsm). g_surface_kaddr is the kernel
+ * virtual mapping used internally by the mmap handler to validate requests. */
+static u64 g_surface_gpa;                  /* GPA of surface pool (0 = none) */
+static u64 g_surface_size;                 /* size in bytes */
+static int g_surface_present;              /* 1 = surface pool available */
 
 /* ===== /dev/utsm character device ===== */
 
@@ -433,6 +470,21 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return 0;
     }
 
+    case UTSM_IOCTL_SURFACE_INFO: {
+        /* VSCode integration Phase 1: return surface pool GPA + size.
+         * Userspace then mmaps /dev/utsm (offset 0, len = size) to obtain
+         * a writable scanout buffer. */
+        struct utsm_ioctl_surface su;
+
+        if (!g_surface_present)
+            return -ENODEV;
+        su.gpa = g_surface_gpa;
+        su.size = g_surface_size;
+        if (copy_to_user((void __user *)arg, &su, sizeof(su)))
+            return -EFAULT;
+        return 0;
+    }
+
     default:
         return -ENOTTY;
     }
@@ -450,9 +502,42 @@ static __poll_t utsm_dev_poll(struct file *f, struct poll_table_struct *wait)
         mask |= EPOLLIN | EPOLLRDNORM;
 
     /* Always writable (ring push may still fail with -EAGAIN) */
-    mask |= EPOLLOUT | EPOLLWRNORM;
+    mask |= EPOLLOUT | EPOLLRDNORM;
 
     return mask;
+}
+
+/* VSCode integration Phase 1: mmap the graphics surface pool into userspace.
+ *
+ * Userspace (e.g. the X server or a blit helper) calls:
+ *   void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+ * to obtain a writable scanout buffer whose contents UTSM reads and blits to
+ * the Deshab framebuffer. The surface pool is a separate DMA region EPT-mapped
+ * into the guest at LINUX_GUEST_SURFACE_GPA and marked E820_TYPE_RESERVED, so
+ * it has no struct page and we map it via remap_pfn_range.
+ *
+ * We allow mapping any sub-range of the pool (offset+size validated against
+ * g_surface_size). Cacheable access is used because the surface pool is
+ * regular RAM shared with the UTSM host over a coherent CPU cache domain;
+ * switch to pgprot_writecombine() if DMA coherency issues ever appear. */
+static int utsm_dev_mmap(struct file *f, struct vm_area_struct *vma)
+{
+    unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
+    unsigned long size = vma->vm_end - vma->vm_start;
+
+    if (!g_surface_present)
+        return -ENODEV;
+
+    /* The pool is a single contiguous region; allow any sub-range within it. */
+    if (off >= g_surface_size || size > g_surface_size - off)
+        return -EINVAL;
+
+    if (remap_pfn_range(vma, vma->vm_start,
+                        (g_surface_gpa + off) >> PAGE_SHIFT,
+                        size, vma->vm_page_prot))
+        return -EAGAIN;
+
+    return 0;
 }
 
 static const struct file_operations utsm_fops = {
@@ -461,6 +546,7 @@ static const struct file_operations utsm_fops = {
     .read           = utsm_dev_read,
     .unlocked_ioctl = utsm_dev_ioctl,
     .poll           = utsm_dev_poll,
+    .mmap           = utsm_dev_mmap,
 };
 
 static struct miscdevice utsm_miscdev = {
@@ -585,7 +671,28 @@ static int __init utsm_hcall_init(void)
 
 	pr_info("[utsm] /dev/%s registered (IPC ready)\n", UTSM_DEV_NAME);
 
-	/* 8. Send a HELLO message via the ring buffer */
+	/* 8. VSCode integration Phase 1: query graphics surface pool.
+	 * Non-fatal: if the surface pool is unavailable (older UTSM or alloc
+	 * failure), /dev/utsm still works for IPC — only mmap/SURFACE_INFO
+	 * ioctls return -ENODEV. On success, userspace can mmap(/dev/utsm)
+	 * to obtain a writable scanout buffer shared with the UTSM host. */
+	{
+		u64 surf_gpa = 0, surf_size = 0;
+		long sret = utsm_hcall_surface_info(&surf_gpa, &surf_size);
+
+		if (sret == 0 && surf_gpa != 0 && surf_size != 0) {
+			g_surface_gpa = surf_gpa;
+			g_surface_size = surf_size;
+			g_surface_present = 1;
+			pr_info("[utsm] surface pool: gpa=0x%llx size=%llu KB\n",
+				surf_gpa, surf_size / 1024);
+		} else {
+			pr_info("[utsm] surface pool not available (ret=%ld)\n",
+				sret);
+		}
+	}
+
+	/* 9. Send a HELLO message via the ring buffer */
 	{
 		const char *hello_msg = "Linux booted OK";
 		ipc_shm_send_to_utsm(UTSM_MSG_DATA, hello_msg, 15);
@@ -645,6 +752,14 @@ static void __exit utsm_hcall_exit(void)
 		g_shm = NULL;
 		g_shm_mapped = 0;
 	}
+
+	/* VSCode integration Phase 1: clear surface pool state.
+	 * No kernel resource to free — the pool is owned by UTSM and only ever
+	 * exposed via remap_pfn_range. Clearing the flag makes post-unload
+	 * ioctls deterministically return -ENODEV. */
+	g_surface_present = 0;
+	g_surface_gpa = 0;
+	g_surface_size = 0;
 
 	pr_info("[utsm] driver unloaded\n");
 }

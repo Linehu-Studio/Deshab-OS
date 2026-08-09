@@ -12,6 +12,7 @@
 
 #include "pe_loader.h"
 #include "pe_shim.h"
+#include "pe_dll_manager.h"
 #include "x86emu32.h"
 #include "../include/utsm/pe.h"
 #include <utsm/arena.h>
@@ -218,19 +219,53 @@ static void resolve_imports(u8 *image, u64 image_base_actual,
                 shim_idx = pe_shim_lookup(dll_name, func_name);
             }
 
+            /* 当 shim 未命中且需要尝试真实 DLL 时，先把 dll_name/func_name
+             * 复制到本地栈缓冲。原因：pe_dll_resolve 可能触发 fat32_read_path，
+             * 后者返回的 static 缓冲与外层 pe_data 可能指向同一区域，会被覆盖。 */
+            char dll_buf[256];
+            char func_buf[256];
+            int  have_local_names = 0;
+            if (shim_idx < 0 && is_pe32_plus && g_pe_dll_manager_ready &&
+                func_name && func_name[0] != '#') {
+                u32 dl = 0;
+                while (dll_name[dl] && dl + 1 < sizeof(dll_buf)) {
+                    dll_buf[dl] = dll_name[dl];
+                    dl++;
+                }
+                dll_buf[dl] = 0;
+                u32 fl = 0;
+                while (func_name[fl] && fl + 1 < sizeof(func_buf)) {
+                    func_buf[fl] = func_name[fl];
+                    fl++;
+                }
+                func_buf[fl] = 0;
+                have_local_names = 1;
+            }
+
             /* 填充 IAT（image 缓冲区内） */
             u8 *iat_ptr = image + iat_rva + (u32)fn_idx * (is_pe32_plus ? 8 : 4);
+            int resolved_by_real_dll = 0;
             if (is_pe32_plus) {
                 u64 fn_addr;
                 if (shim_idx >= 0) {
                     const pe_shim_entry *se = pe_shim_get(shim_idx);
                     fn_addr = (u64)se->fn64;
+                } else if (have_local_names) {
+                    /* PE32+ 尝试真实 DLL */
+                    u64 real = pe_dll_resolve(dll_buf, func_buf);
+                    if (real != 0) {
+                        fn_addr = real;
+                        resolved_by_real_dll = 1;
+                    } else {
+                        /* DLL 加载过但函数未找到：填 unimpl stub */
+                        fn_addr = pe_shim_unimpl_stub();
+                    }
                 } else {
                     fn_addr = pe_shim_unimpl_stub();
                 }
                 *(u64 *)iat_ptr = fn_addr;
             } else {
-                /* 32位：填合成地址，解释器拦截 */
+                /* 32位：填合成地址，解释器拦截（不调真实 DLL） */
                 u32 synth_addr;
                 if (shim_idx >= 0) {
                     synth_addr = PE_SHIM_ADDR_BASE | (u32)(shim_idx & 0xFFFF);
@@ -248,11 +283,26 @@ static void resolve_imports(u8 *image, u64 image_base_actual,
                 }
             }
 
-            if (shim_idx < 0 && func_name) {
+            /* shim 未命中且真实 DLL 也未解析：记未实现日志；
+             * 真实 DLL 解析成功则记来源日志（区分 shim/真实 DLL 路径）。
+             * 用本地副本（pe_data 可能已被 DLL 加载破坏） */
+            if (shim_idx < 0 && func_name && !resolved_by_real_dll) {
                 log_info("[PE] unimplemented import");
-                serial_write(dll_name);
+                if (have_local_names) {
+                    serial_write(dll_buf);
+                    serial_write("!");
+                    serial_write(func_buf);
+                } else {
+                    serial_write(dll_name);
+                    serial_write("!");
+                    serial_write(func_name);
+                }
+                serial_write("\n");
+            } else if (resolved_by_real_dll) {
+                log_info("[PE] import via real DLL");
+                serial_write(dll_buf);
                 serial_write("!");
-                serial_write(func_name);
+                serial_write(func_buf);
                 serial_write("\n");
             }
         }

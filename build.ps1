@@ -1,3 +1,7 @@
+param(
+    [ValidateSet('dev','release','realtest','both')][string]$Variant = 'both'
+)
+
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -5,10 +9,24 @@ $UtsmDir = Join-Path $Root 'CODE\UTSM'
 $DskDir = Join-Path $Root 'CODE\dsk'
 $SystemDir = Join-Path $Root 'SYSTEM'
 $IsoDir = Join-Path $Root 'ISO'
+$ConfigsDir = Join-Path $Root 'build\configs'
 $Output = Join-Path $SystemDir 'boot\utsm.elf'
 $DskOutput = Join-Path $SystemDir 'system\deshab64\deshab.elf'
-$ImagePath = Join-Path $IsoDir 'deshab.img'
+$DevImagePath = Join-Path $IsoDir 'deshab-dev.img'
+$ReleaseImagePath = Join-Path $IsoDir 'deshab-release.img'
+$RealtestImagePath = Join-Path $IsoDir 'deshab-realtest.img'
 $BuildTmp = Join-Path $Root '.build_tmp'
+
+# VSCode integration: ESP capacity must accommodate Linux GUI stack libs + VSCode
+# tarball + Electron (~300MB). Default 2048MB; can be overridden by setting
+# $EspSizeMB in the calling shell before invoking build.ps1.
+if (-not (Get-Variable EspSizeMB -ErrorAction SilentlyContinue)) {
+    $EspSizeMB = 2048
+}
+# Optional persistent rw volume for Linux guest (Phase 4: overlayfs upperdir).
+# When SYSTEM/boot/linux-extra-rootfs.img is present, build.ps1 prints a notice;
+# limine.conf is expected to declare it as a boot module (added in Phase 4).
+$ExtraRootfsPath = Join-Path $SystemDir 'boot\linux-extra-rootfs.img'
 
 function Find-Tool($Name, $ExtraNames = @()) {
     $names = @($Name) + $ExtraNames
@@ -254,7 +272,11 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
     $partSectors = [UInt64]($partEnd - $partStart + 1)
     $partitionOffset = [Int64]($partStart * $bytesPerSector)
 
-    $sectorsPerCluster = 1
+    # P7.7: 4KB clusters (8 sectors) for faster packaging.
+    # 512B clusters on a 595MB SYSTEM tree caused ~1M Seek/Write calls
+    # and 18-minute packaging. 4KB clusters reduce this to ~150K calls.
+    # (32KB clusters would fail FAT32 min 65525 cluster count on 2GB.)
+    $sectorsPerCluster = 8
     $reservedSectors = 32
     $numFats = 2
     $fatSectors = 1
@@ -324,6 +346,15 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
         }
 
         $items = Get-ChildItem -LiteralPath $Path -Force | Where-Object { $_.Name -notlike '*.tmp*' } | Sort-Object @{Expression={$_.PSIsContainer};Descending=$true}, Name
+
+        # 两遍策略：先收集所有目录项（含 LFN），同时为子目录/文件分配簇链。
+        # 子目录需要先分配簇，但目录项总数此时未知——先收集 entries，
+        # 再根据 entries 总字节数为本目录分配足够簇，最后回写 FAT 链。
+        # 注意：SelfCluster 已由调用方分配（根目录固定 cluster 2，子目录在调用前分配）。
+        # 对于子目录，调用方只分配了 1 个簇——如果目录项超过 1 簇，需要扩展链。
+        # 解决方案：先收集 entries + 分配子项簇，然后检查本目录需要的簇数，
+        # 如果超过已分配的，追加簇并更新 FAT 链。
+
         foreach ($item in $items) {
             if ($item.PSIsContainer) {
                 $childCluster = Allocate-Chain $clusterSize
@@ -337,15 +368,44 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
             }
         }
 
+        # 计算本目录需要的簇数（目录项可能跨多簇）
         $entryBytes = $entries.Count * 32
-        $neededBytes = [Math]::Max($clusterSize, [int](($entryBytes + $clusterSize - 1) / $clusterSize) * $clusterSize)
+        $neededClusters = [Math]::Max(1, [int](($entryBytes + $clusterSize - 1) / $clusterSize))
+        $neededBytes = $neededClusters * $clusterSize
+
+        # 如果本目录需要多簇，扩展 FAT 链（SelfCluster 是首簇）
+        if ($neededClusters -gt 1) {
+            $cur = $SelfCluster
+            for ($i = 1; $i -lt $neededClusters; $i++) {
+                $next = $script:fatNextCluster
+                $script:fatNextCluster++
+                if ($script:fatNextCluster -ge $fat.Length) { throw 'FAT32 image is too small' }
+                $fat[$cur] = [UInt32]$next
+                $cur = $next
+            }
+            $fat[$cur] = 0x0fffffff
+        }
+
         $dirBytes = [byte[]]::new($neededBytes)
         $offset = 0
         foreach ($entry in $entries) {
             [Array]::Copy($entry, 0, $dirBytes, $offset, 32)
             $offset += 32
         }
-        Write-At $Stream (Get-ClusterOffset $SelfCluster) $dirBytes
+
+        # 写入所有目录簇（按 FAT 链顺序）
+        $writeCluster = $SelfCluster
+        $bytesWritten = 0
+        while ($bytesWritten -lt $neededBytes) {
+            $chunk = [Math]::Min($clusterSize, $neededBytes - $bytesWritten)
+            $chunkBytes = [byte[]]::new($clusterSize)
+            [Array]::Copy($dirBytes, $bytesWritten, $chunkBytes, 0, $chunk)
+            Write-At $Stream (Get-ClusterOffset $writeCluster) $chunkBytes
+            $bytesWritten += $clusterSize
+            if ($bytesWritten -lt $neededBytes) {
+                $writeCluster = $fat[$writeCluster]
+            }
+        }
     }
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ImagePath) | Out-Null
@@ -441,7 +501,43 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
     Write-Host "[build] GPT + FAT32 ESP IMG: $ImagePath"
 }
 
+# Build a single image variant (dev/release): inject FUCK + firstInit.txt from
+# build/configs/<variant>/ into SYSTEM/, then package via New-GptFat32Image.
+# If $ImagePath is $null, only injects config without packaging (used to
+# restore SYSTEM dir to dev config after dual-image build).
+function Build-ImageVariant([string]$VariantName, [string]$ImagePath) {
+    $cfgDir = Join-Path $ConfigsDir $VariantName
+    if (-not (Test-Path $cfgDir)) {
+        throw "Config variant directory not found: $cfgDir"
+    }
+
+    $fuckSrc = Join-Path $cfgDir 'FUCK'
+    $fuckDst = Join-Path $SystemDir 'system\deshab64\FUCK'
+    $fiSrc   = Join-Path $cfgDir 'firstInit.txt'
+    $fiDst   = Join-Path $SystemDir 'system\user\use\firstInit.txt'
+
+    if (-not (Test-Path $fuckSrc)) { throw "Missing FUCK template: $fuckSrc" }
+    if (-not (Test-Path $fiSrc))   { throw "Missing firstInit.txt template: $fiSrc" }
+
+    Copy-Item -LiteralPath $fuckSrc -Destination $fuckDst -Force
+    Copy-Item -LiteralPath $fiSrc   -Destination $fiDst   -Force
+    Write-Host "[build] Injected config variant=$VariantName (FUCK + firstInit.txt)"
+
+    if ($ImagePath) {
+        # Phase 0: ESP enlarged from 768 to $EspSizeMB (default 2048) to fit
+        # VSCode + Electron + GUI stack libs (VSCode integration roadmap).
+        New-GptFat32Image $SystemDir $ImagePath $EspSizeMB
+    }
+}
+
 Write-Host '[build] Building UTSM kernel...'
+
+# VSCode integration Phase 0 hook: detect optional persistent rw volume for
+# Linux guest. The actual virtio-blk backend wiring is added in Phase 4.
+if (Test-Path $ExtraRootfsPath) {
+    Write-Host "[build] NOTE: linux-extra-rootfs.img present at $ExtraRootfsPath"
+    Write-Host '[build]       (Phase 4 will wire it as /dev/vdc for overlayfs upperdir)'
+}
 
 $clang = Find-Tool 'clang'
 $lld = Find-Tool 'ld.lld'
@@ -466,6 +562,17 @@ Write-Host "[build] make: $make"
 New-Item -ItemType Directory -Force -Path $BuildTmp | Out-Null
 $env:TMP = $BuildTmp
 $env:TEMP = $BuildTmp
+
+# Ensure make can find sh.exe + Unix tools (mkdir, etc.).
+# MAKEFILEs use `mkdir -p` which cmd.exe cannot run; mingw32-make needs sh.exe
+# in PATH. Git for Windows' usr/bin provides a complete sh + coreutils set.
+foreach ($shDir in @('C:\Program Files\Git\usr\bin', 'C:\msys64\usr\bin')) {
+    if ((Test-Path (Join-Path $shDir 'sh.exe')) -and ($env:PATH -notlike "*$shDir*")) {
+        $env:PATH = "$shDir;$env:PATH"
+        Write-Host "[build] Added Unix tools dir to PATH: $shDir"
+        break
+    }
+}
 
 Push-Location $UtsmDir
 try {
@@ -651,7 +758,7 @@ Write-Host "[build] cmd Output: $CmdOutput"
 $ToolsDir = Join-Path $Root 'CODE\tools'
 $ToolsOutDir = Join-Path $SystemDir 'system\deshab64\tools'
 
-$toolApps = @('editor', 'fileman', 'browser', 'curl', 'ping')
+$toolApps = @('editor', 'fileman', 'browser', 'curl', 'ping', 'settings')
 
 foreach ($tool in $toolApps) {
     $toolDir = Join-Path $ToolsDir $tool
@@ -687,9 +794,36 @@ Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir
 
 Write-Host "[build] Output: $Output"
 Write-Host "[build] DSK Output: $DskOutput"
-Write-Host '[build] Packaging SYSTEM to GPT + FAT32 IMG...'
-New-GptFat32Image $SystemDir $ImagePath 768
-Write-Host "[build] Done: $ImagePath"
+Write-Host "[build] Variant: $Variant"
+
+# Remove legacy single-image to avoid confusion
+$LegacyImg = Join-Path $IsoDir 'deshab.img'
+if (Test-Path $LegacyImg) {
+    Remove-Item -LiteralPath $LegacyImg -Force
+    Write-Host "[build] Removed legacy image: $LegacyImg"
+}
+
+Write-Host '[build] Packaging SYSTEM to GPT + FAT32 IMG (dual variant)...'
+if ($Variant -in @('dev','both')) {
+    Write-Host '[build] === Building DEV image (QEMU test, dev_mode=1, debug on) ==='
+    Build-ImageVariant 'dev' $DevImagePath
+    Write-Host "[build] DEV image done: $DevImagePath"
+}
+if ($Variant -in @('release','both')) {
+    Write-Host '[build] === Building RELEASE image (real hardware, dev_mode=0, debug off) ==='
+    Build-ImageVariant 'release' $ReleaseImagePath
+    Write-Host "[build] RELEASE image done: $ReleaseImagePath"
+}
+if ($Variant -in @('realtest','both')) {
+    Write-Host '[build] === Building REALTEST image (real hardware, disk_log=1, debug on) ==='
+    Build-ImageVariant 'realtest' $RealtestImagePath
+    Write-Host "[build] REALTEST image done: $RealtestImagePath"
+}
+# Restore SYSTEM to dev config (dev is the primary development target)
+if ($Variant -eq 'both') {
+    Write-Host '[build] Restoring SYSTEM to dev config for development...'
+    Build-ImageVariant 'dev' $null
+}
 
 # Rebuild SATA FAT32 disk image (DSK reads deshab.elf/FirstInit.elf/mouseInit.elf from here)
 Write-Host '[build] Rebuilding SATA FAT32 disk image...'

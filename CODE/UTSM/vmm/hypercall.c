@@ -22,6 +22,7 @@
 #include <utsm/vmm.h>
 #include <utsm/ipc_shm.h>
 #include <utsm/linux_compat.h>
+#include <utsm/linux_loader.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <ipc_proto.h>
@@ -119,6 +120,35 @@ static long hcall_shm_info(u64 a0, u64 a1, u64 a2) {
 
     log_hex64("[HCALL] SHM_INFO: gpa=", shm_gpa);
     log_hex64("[HCALL] SHM_INFO: size=", shm_size);
+    return UTSM_HCALL_OK;
+}
+
+/* VSCode integration Phase 1: query graphics surface pool.
+ * Mirrors hcall_shm_info: writes gpa + size into guest-provided out-pointers.
+ * Linux user-space then mmaps /dev/utsm at the returned GPA to obtain a
+ * writable scanout buffer (Phase 3 virtio-gpu shadow buffer). */
+static long hcall_surface_info(u64 a0, u64 a1, u64 a2) {
+    /* a0 = GPA of gpa_out (u64), a1 = GPA of size_out (u64) */
+    (void)a2;
+
+    u64 surface_gpa = 0, surface_size = 0;
+    if (linux_get_surface_info(0, &surface_gpa, &surface_size) != 0) {
+        /* Surface pool not initialized (Linux guest not loaded, or alloc failed) */
+        return UTSM_HCALL_NOMEM;
+    }
+
+    /* Write results to guest memory */
+    if (a0 != 0 && guest_write_u64(a0, surface_gpa) != 0) {
+        log_error("[HCALL] SURFACE_INFO: failed to write gpa to guest");
+        return UTSM_HCALL_INVAL;
+    }
+    if (a1 != 0 && guest_write_u64(a1, surface_size) != 0) {
+        log_error("[HCALL] SURFACE_INFO: failed to write size to guest");
+        return UTSM_HCALL_INVAL;
+    }
+
+    log_hex64("[HCALL] SURFACE_INFO: gpa=", surface_gpa);
+    log_hex64("[HCALL] SURFACE_INFO: size=", surface_size);
     return UTSM_HCALL_OK;
 }
 
@@ -283,6 +313,9 @@ int hypercall_handle(u64 guest_rax, u64 guest_rdi, u64 guest_rsi, u64 guest_rdx,
         break;
     case UTSM_HCALL_SHM_INFO:
         result = hcall_shm_info(guest_rdi, guest_rsi, guest_rdx);
+        break;
+    case UTSM_HCALL_SURFACE_INFO:
+        result = hcall_surface_info(guest_rdi, guest_rsi, guest_rdx);
         break;
     case UTSM_HCALL_CAP_VALIDATE:
         result = hcall_cap_validate(guest_rdi, guest_rsi, guest_rdx);

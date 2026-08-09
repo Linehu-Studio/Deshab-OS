@@ -1,0 +1,42 @@
+/* Deshab SDK 应用入口模板
+ *
+ * 由 scaffold/new-module.ps1 生成时自动替换:
+ *   {{MODULE_NAME}}  -> 模块名
+ *   {{BITMAPS}}      -> ascii_bitmaps.c 相对路径
+ *
+ * 展示最小应用框架: 初始化上下文 -> 清屏 -> 标题栏 -> Esc 退出。
+ */
+#include "{{BITMAPS}}"
+#include "deshab/deshab.h"
+#include "deshab/font.h"
+
+static dsb_app_context g_ac;
+
+void dsk_entry(const dsk_boot_context *ctx) {
+    if (ctx->magic != DSK_BOOT_MAGIC) return;
+    dsb_app_init(&g_ac, ctx);
+
+    /* 清屏 */
+    dsb_fill_bg(&g_ac, DSB_BG_PRIMARY);
+
+    /* 标题栏 + 状态栏 */
+    dsb_draw_titlebar(&g_ac, "{{MODULE_NAME}}", (i64)g_ac.fb_w);
+    dsb_draw_statusbar(&g_ac, "Esc to exit", (i64)g_ac.fb_w, (i64)g_ac.fb_h);
+
+    /* 居中欢迎文字 */
+    const char *msg = "Hello from {{MODULE_NAME}}!";
+    i64 msg_w = (i64)dsb_strlen(msg) * 12;
+    i64 x = ((i64)g_ac.fb_w - msg_w) / 2;
+    i64 y = ((i64)g_ac.fb_h) / 2;
+    dsb_draw_string(&g_ac, msg, x, y, DSB_TEXT_PRIMARY, DSB_BG_PRIMARY, 12);
+
+    /* 等待 Esc 键退出 */
+    for (;;) {
+        u8 st = dsb_inb(0x64);
+        if (st & 1) {
+            u8 sc = dsb_inb(0x60);
+            if (sc == 1) break;  /* Esc make code */
+        }
+        __asm__ volatile("pause");
+    }
+}

@@ -2,13 +2,14 @@
 setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "IMG=%SCRIPT_DIR%deshab.img"
+set "IMG=%SCRIPT_DIR%deshab-dev.img"
 set "SATA_IMG=%SCRIPT_DIR%..\.build_tmp\sata_fat32_dsk.img"
 set "NVME_IMG=%SCRIPT_DIR%..\.build_tmp\nvme_test.img"
 
 if not exist "%IMG%" (
     echo [qemu] Image not found: %IMG%
-    echo [qemu] Run ..\build.bat first.
+    echo [qemu] Run ..\build.bat first -- default builds both dev and release.
+    echo [qemu] Or build dev only: build.bat -Variant dev
     exit /b 1
 )
 
@@ -74,10 +75,14 @@ if "%LINUX_ENABLED%"=="1" (
     if "%QEMU_ACCEL%"=="whpx" (
         echo [qemu]   WARNING: WHPX does not support nested VMX
         echo [qemu]   Linux guest will NOT run under WHPX; VMX CPUID flag disabled
-        echo [qemu]   Use QEMU_ACCEL=tcg or run on real hardware for VMX support
+        echo [qemu]   For VSCode integration path ^(Linux guest + virtio-gpu + VSCode^):
+        echo [qemu]     Use WSL2 + KVM instead — run ISO\run_qemu_kvm.sh from WSL2 shell
+        echo [qemu]     Requires Windows 11 Pro/Enterprise ^(nested VMX^) or native Linux host
+        echo [qemu]   Or set QEMU_ACCEL=tcg for full software emulation ^(also no VMX^)
     ) else if "%QEMU_ACCEL%"=="tcg" (
         echo [qemu]   WARNING: TCG does not support VMX
         echo [qemu]   Linux guest will NOT run under TCG
+        echo [qemu]   For VSCode integration path, use WSL2 + KVM ^(run ISO\run_qemu_kvm.sh^)
     ) else (
         echo [qemu]   VMX may be available for Linux guest
     )
@@ -99,12 +104,21 @@ if exist "%USB_IMG%" (
     set "USB_OPTS=-device qemu-xhci,id=xhci0 -drive id=usb0,if=none,file=%USB_IMG%,format=raw -device usb-storage,bus=xhci0.0,drive=usb0"
 )
 
+REM ===== Boot disk attach =====
+REM Main disk must use explicit virtio-blk-pci + bootindex=1: with plain
+REM "-drive if=virtio", OVMF only auto-creates a boot entry when virtio-blk
+REM lands on PCI slot 0x3 (no other PCI devices). Adding NVMe/USB/e1000 moves
+REM it to 0x4/0x5 and OVMF boot enumeration silently drops the ESP, falling
+REM back to EFI Internal Shell even though BOOTX64.EFI is present and valid.
+REM bootindex=1 injects the fw_cfg bootorder entry so OVMF always picks it.
+set "OSDISK_OPTS=-drive if=none,id=osdisk,format=raw,file="%IMG%" -device virtio-blk-pci,drive=osdisk,bootindex=1"
+
 if exist "%SATA_IMG%" (
     echo [qemu] SATA:  %SATA_IMG%
-    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" -drive format=raw,file="%IMG%",if=virtio -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
 ) else (
     echo [qemu] SATA image not found, booting without block device
-    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" -drive format=raw,file="%IMG%",if=virtio %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on
 )
 
 endlocal

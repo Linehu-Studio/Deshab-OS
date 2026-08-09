@@ -14,6 +14,7 @@
 
 #include "pe_loader.h"
 #include "pe_shim.h"
+#include "pe_dll_manager.h"
 #include "x86emu32.h"
 #include "../include/utsm/pe.h"
 #include <utsm/arena.h>
@@ -34,13 +35,20 @@
 int  pe_service_load(const void *pe_data, u64 size, pe_image_info *out);
 int  pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit_code);
 void pe_service_unload(pe_image_info *info);
+int  pe_service_run_windowed(const void *pe_data, u64 size, const char *cmdline,
+                             u64 *exit_code, const pe_window_host *host);
 
-/* 全局服务表实例 */
+/* 全局服务表实例（P5：ABI 尾部追加 run_windowed/inject_*，同镜像一致性
+ * 假设见 pe.h；旧调用方按前 4 字段使用不受影响） */
 static const pe_service g_pe_service = {
     PE_SERVICE_MAGIC,
     pe_service_load,
     pe_service_run,
     pe_service_unload,
+    pe_service_run_windowed,
+    pe_shim_inject_scancode,
+    pe_shim_inject_pointer,
+    pe_shim_inject_input,
 };
 
 const pe_service *pe_get_service(void) {
@@ -248,6 +256,14 @@ static void pe_call_on_stack(pe_entry_fn fn, u64 stack_top) {
           "r8", "r9", "r10", "r11");
 }
 
+/* PE32+ 大栈引导入口：先执行加载期延迟登记的真实 DLL DllMain(ATTACH)，
+ * 再跳 PE 入口。此时 SSE 已启用且运行在 1MB PE 大栈上。 */
+static pe_entry_fn g_pe_boot_entry;
+static void pe_boot_with_dllmains(void) {
+    pe_dll_run_pending_dllmains();
+    g_pe_boot_entry();
+}
+
 /* ===== 运行 =====
  * 加载 + 执行 + 卸载.返回 0 成功,*exit_code 为进程退出码. */
 int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit_code) {
@@ -268,13 +284,18 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
     if (opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         /* ===== PE32+ : Ring0 原生执行 ===== */
         pe_image_info info;
+        /* SSE 必须在任何 PE/DLL 代码执行前启用：load 期会递归加载真实 DLL，
+         * MSVC CRT 代码含 SSE 指令，后置启用曾在 DllMain 内触发 #UD。 */
+        pe_enable_sse();
+        /* DllMain 延迟到 1MB PE 大栈上执行（16KB 内核栈跑不动 CRT init） */
+        pe_dll_defer_dllmain(1);
         int rc = pe_load_image(pe_data, size, &info);
         if (rc != 0) {
+            pe_dll_defer_dllmain(0);
             log_error("[PE] PE32+ load failed");
             return -5;
         }
         log_info("[PE] running PE32+ natively");
-        pe_enable_sse();
 
         /* 恢复异常可见性:UTSM 交权 DSK 时 idt_halt_all() 将 IDT 全部
          * 替换为静默 halt stub,PE 原生执行期间的 CPU 异常(PF/GP/UD)
@@ -297,10 +318,10 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
          * 残片充当 R12-R15/RBP → 野指针 call → 三重故障). */
         u64 code = 0;
         if (__builtin_setjmp(pe_shim_exit_jmpbuf()) == 0) {
-            pe_entry_fn entry = (pe_entry_fn)info.entry_point;
-            log_hex64("[PE] entry=", (u64)entry);
+            log_hex64("[PE] entry=", (u64)info.entry_point);
             log_hex64("[PE] stack_top=", stack_top);
-            pe_call_on_stack(entry, stack_top);
+            g_pe_boot_entry = (pe_entry_fn)info.entry_point;
+            pe_call_on_stack(pe_boot_with_dllmains, stack_top);
             code = 0;
         } else {
             code = pe_shim_get_exit_code();
@@ -364,4 +385,21 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
     }
 
     return -8;  /* 未知 PE magic */
+}
+
+/* ===== P5 窗口模式运行 =====
+ * 与 pe_service_run 相同的加载/执行路径，区别仅在 shim 行为：
+ * 渲染目标重定向到 host->surface，PS/2 轮询关闭，消息空转回调
+ * host->pump()（desktop 帧）。host==NULL/surface==NULL 时等价 run。 */
+int pe_service_run_windowed(const void *pe_data, u64 size, const char *cmdline,
+                            u64 *exit_code, const pe_window_host *host) {
+    if (host && host->surface) {
+        pe_shim_set_window_host(host);
+        log_info("[PE] run_windowed: surface mode");
+    } else {
+        pe_shim_set_window_host(0);
+    }
+    int rc = pe_service_run(pe_data, size, cmdline, exit_code);
+    pe_shim_set_window_host(0);  /* 防止残留配置串到下一次 run */
+    return rc;
 }

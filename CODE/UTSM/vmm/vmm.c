@@ -85,6 +85,7 @@ static u8 g_msr_bitmap[4096] __attribute__((aligned(4096)));
  * VMX 要求 guest TR 非空且引用 GDT 中的 TSS 描述符。 */
 static u8 g_guest_gdt[4096] __attribute__((aligned(4096)));
 static u8 g_guest_tss[4096] __attribute__((aligned(4096)));
+static u8 g_guest_idt[4096] __attribute__((aligned(4096)));  /* P8.4: IDT page for KVM nested VMX */
 
 /* 64-bit GDT entry */
 typedef struct __attribute__((packed)) {
@@ -234,10 +235,11 @@ static void vmcs_setup_host_state(void) {
 }
 
 static void vmcs_setup_guest_state_phase1(void) {
-    /* Guest CR0/CR3/CR4：启用 PE/NE/PG/PAE，复用 host 页表 */
+    /* Guest CR0/CR3/CR4：启用 PE/NE/PG/PAE，复用 host 页表。
+     * P8.4: CR4 must include VMXE (CR4_FIXED0 requires it under KVM). */
     vmx_vmcs_write(VMCS_GUEST_CR0, CR0_PE | CR0_NE | CR0_PG | CR0_WP);
     vmx_vmcs_write(VMCS_GUEST_CR3, read_cr3_local());
-    vmx_vmcs_write(VMCS_GUEST_CR4, CR4_PAE | CR4_PGE | CR4_PSE);
+    vmx_vmcs_write(VMCS_GUEST_CR4, CR4_VMXE | CR4_PAE | CR4_PGE | CR4_PSE);
 
     /* 段选择子：flat 模型。
      * CS=0x08 (GDT[1] code), DS/SS/ES=0x10 (GDT[2] data),
@@ -261,7 +263,9 @@ static void vmcs_setup_guest_state_phase1(void) {
     vmx_vmcs_write(VMCS_GUEST_LDTR_BASE, 0);
     vmx_vmcs_write(VMCS_GUEST_TR_BASE, 0x4000);
     vmx_vmcs_write(VMCS_GUEST_GDTR_BASE, 0x3000);
-    vmx_vmcs_write(VMCS_GUEST_IDTR_BASE, 0);
+    /* P8.4: IDTR base must be non-zero & page-aligned for KVM nested VMX.
+     * Guest won't use interrupts (RFLAGS.IF=0), but VMX still checks. */
+    vmx_vmcs_write(VMCS_GUEST_IDTR_BASE, 0x5000);
 
     /* 段 limit：代码/数据段 4GB，GDTR 覆盖 0x28 字节（3 个描述符 + TSS），
      * TR limit = 0x67（104 字节最小 TSS） */
@@ -278,16 +282,17 @@ static void vmcs_setup_guest_state_phase1(void) {
 
     /* 段 access rights：
      * CS: 0xA09B = present, DPL0, code, L=1 (64-bit), executed/read
-     * DS/SS/ES/FS/GS: 0xC093 = present, DPL0, data, writable
-     * LDTR: 0x82 = unusable (L=0 in high nibble)
+     * DS/SS/ES: 0xC093 = present, DPL0, data, writable
+     * P8.4: FS/GS/LDTR selector=0 -> must set bit 16 (unusable) per Intel SDM.
+     *   Without it, KVM nested VMX rejects VMLAUNCH (invalid guest state).
      * TR: 0x8B = present, DPL0, 64-bit busy TSS */
     vmx_vmcs_write(VMCS_GUEST_CS_ACCESS, 0xA09B);
     vmx_vmcs_write(VMCS_GUEST_SS_ACCESS, 0xC093);
     vmx_vmcs_write(VMCS_GUEST_DS_ACCESS, 0xC093);
     vmx_vmcs_write(VMCS_GUEST_ES_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_FS_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_GS_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_LDTR_ACCESS, 0x82);
+    vmx_vmcs_write(VMCS_GUEST_FS_ACCESS, 0x1C093);   /* unusable (selector=0) */
+    vmx_vmcs_write(VMCS_GUEST_GS_ACCESS, 0x1C093);   /* unusable (selector=0) */
+    vmx_vmcs_write(VMCS_GUEST_LDTR_ACCESS, 0x10082); /* unusable (selector=0) */
     vmx_vmcs_write(VMCS_GUEST_TR_ACCESS, 0x8B);
 
     /* Guest RIP/RSP/RFLAGS */
@@ -308,6 +313,10 @@ static void vmcs_setup_guest_state_phase1(void) {
      * NXE 允许 guest 使用 NX 位。 */
     vmx_vmcs_write(VMCS_GUEST_IA32_EFER, EFER_LME | EFER_LMA | EFER_NXE);
 
+    /* P8.4: VMCS link pointer must be 0xFFFFFFFFFFFFFFFF (Intel SDM Vol 3,
+     * VM-entry checks). KVM nested VMX enforces this strictly. */
+    vmx_vmcs_write(VMCS_GUEST_LINK_POINTER, 0xFFFFFFFFFFFFFFFFULL);
+
     /* Guest activity state = 0 (active) */
     vmx_vmcs_write(VMCS_GUEST_ACTIVITY_STATE, 0);
     /* Guest interruptibility = 0（无阻塞） */
@@ -325,14 +334,11 @@ static void vmcs_setup_controls(u64 eptp) {
             | CPU_BASED_INVLPG_EXITING;
     cpu = vmx_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
 
-    /* Secondary controls：启用 EPT + VPID */
-    u64 cpu2 = SEC_EXEC_ENABLE_EPT | SEC_EXEC_ENABLE_VPID;
-    {
-        u64 msr = vmx_read_msr(IA32_VMX_PROCBASED_CTLS2);
-        u32 allowed1 = (u32)(msr >> 32);
-        cpu2 &= allowed1;
-        cpu2 |= SEC_EXEC_ENABLE_EPT;
-    }
+    /* P8.4d: Try without EPT first to isolate nested VMX issue under KVM.
+     * If KVM requires EPT, vmx_adjust_control will OR it back in. */
+    u64 cpu2 = 0;  /* no EPT, no VPID */
+    cpu2 = vmx_adjust_control(cpu2, IA32_VMX_PROCBASED_CTLS2);
+    log_hex64("[VMM] IA32_VMX_PROCBASED_CTLS2 raw=", vmx_read_msr(IA32_VMX_PROCBASED_CTLS2));
 
     u64 exit_ctrl = VM_EXIT_SAVE_DEBUG_CONTROLS
                   | VM_EXIT_HOST_ADDR_SPACE_SIZE
@@ -357,8 +363,15 @@ static void vmcs_setup_controls(u64 eptp) {
         vmx_vmcs_write(VMCS_MSR_BITMAP, msr_bitmap_phys);
     }
 
-    vmx_vmcs_write(VMCS_EPT_POINTER, eptp);
-    vmx_vmcs_write(VMCS_VPID, 1);
+    if (cpu2 & SEC_EXEC_ENABLE_EPT) {
+        vmx_vmcs_write(VMCS_EPT_POINTER, eptp);
+        log_hex64("[VMM] EPT enabled, eptp=", eptp);
+    } else {
+        log_info("[VMM] EPT not available (shadow paging)");
+    }
+    if (cpu2 & SEC_EXEC_ENABLE_VPID) {
+        vmx_vmcs_write(VMCS_VPID, 1);
+    }
 
     /* Exception bitmap：捕获 #GP(13)/#PF(14)/#UD(6) */
     vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, (1ULL << 13) | (1ULL << 14) | (1ULL << 6));
@@ -418,6 +431,90 @@ void vmm_shutdown(void) {
 int vmm_is_ready(void) { return g_vmm_ready; }
 u64 vmm_get_eptp(void) { return ept_get_eptp(); }
 
+/* P8.4: Dump all guest-state VMCS fields for KVM nested VMX debugging.
+ * Called before VMLAUNCH to identify field encoding/value errors. */
+static void vmm_dump_guest_state(void) {
+    log_info("[VMM] === Guest State Validation ===");
+
+    /* ---- CR / EFER ---- */
+    u64 g_cr0 = vmx_vmcs_read(VMCS_GUEST_CR0);
+    u64 g_cr3 = vmx_vmcs_read(VMCS_GUEST_CR3);
+    u64 g_cr4 = vmx_vmcs_read(VMCS_GUEST_CR4);
+    u64 g_efer = vmx_vmcs_read(VMCS_GUEST_IA32_EFER);
+    log_hex64("[VMM] gCR0=", g_cr0);
+    log_hex64("[VMM] gCR3=", g_cr3);
+    log_hex64("[VMM] gCR4=", g_cr4);
+    log_hex64("[VMM] gEFER=", g_efer);
+
+    /* ---- RIP/RSP/RFLAGS ---- */
+    log_hex64("[VMM] gRIP=", vmx_vmcs_read(VMCS_GUEST_RIP));
+    log_hex64("[VMM] gRSP=", vmx_vmcs_read(VMCS_GUEST_RSP));
+    log_hex64("[VMM] gRFLAGS=", vmx_vmcs_read(VMCS_GUEST_RFLAGS));
+
+    /* ---- Segment selectors ---- */
+    u64 es = vmx_vmcs_read(VMCS_GUEST_ES_SELECTOR);
+    u64 cs = vmx_vmcs_read(VMCS_GUEST_CS_SELECTOR);
+    u64 ss = vmx_vmcs_read(VMCS_GUEST_SS_SELECTOR);
+    u64 ds = vmx_vmcs_read(VMCS_GUEST_DS_SELECTOR);
+    u64 fs = vmx_vmcs_read(VMCS_GUEST_FS_SELECTOR);
+    u64 gs = vmx_vmcs_read(VMCS_GUEST_GS_SELECTOR);
+    u64 ldtr = vmx_vmcs_read(VMCS_GUEST_LDTR_SELECTOR);
+    u64 tr = vmx_vmcs_read(VMCS_GUEST_TR_SELECTOR);
+    log_hex64("[VMM] sSEL ES=", es); log_hex64("[VMM] sSEL CS=", cs);
+    log_hex64("[VMM] sSEL SS=", ss); log_hex64("[VMM] sSEL DS=", ds);
+    log_hex64("[VMM] sSEL FS=", fs); log_hex64("[VMM] sSEL GS=", gs);
+    log_hex64("[VMM] sSEL LDTR=", ldtr); log_hex64("[VMM] sSEL TR=", tr);
+
+    /* ---- Segment limits ---- */
+    log_hex64("[VMM] sLIM ES=", vmx_vmcs_read(VMCS_GUEST_ES_LIMIT));
+    log_hex64("[VMM] sLIM CS=", vmx_vmcs_read(VMCS_GUEST_CS_LIMIT));
+    log_hex64("[VMM] sLIM SS=", vmx_vmcs_read(VMCS_GUEST_SS_LIMIT));
+    log_hex64("[VMM] sLIM DS=", vmx_vmcs_read(VMCS_GUEST_DS_LIMIT));
+    log_hex64("[VMM] sLIM FS=", vmx_vmcs_read(VMCS_GUEST_FS_LIMIT));
+    log_hex64("[VMM] sLIM GS=", vmx_vmcs_read(VMCS_GUEST_GS_LIMIT));
+    log_hex64("[VMM] sLIM LDTR=", vmx_vmcs_read(VMCS_GUEST_LDTR_LIMIT));
+    log_hex64("[VMM] sLIM TR=", vmx_vmcs_read(VMCS_GUEST_TR_LIMIT));
+
+    /* ---- Segment access rights ---- */
+    log_hex64("[VMM] sACC ES=", vmx_vmcs_read(VMCS_GUEST_ES_ACCESS));
+    log_hex64("[VMM] sACC CS=", vmx_vmcs_read(VMCS_GUEST_CS_ACCESS));
+    log_hex64("[VMM] sACC SS=", vmx_vmcs_read(VMCS_GUEST_SS_ACCESS));
+    log_hex64("[VMM] sACC DS=", vmx_vmcs_read(VMCS_GUEST_DS_ACCESS));
+    log_hex64("[VMM] sACC FS=", vmx_vmcs_read(VMCS_GUEST_FS_ACCESS));
+    log_hex64("[VMM] sACC GS=", vmx_vmcs_read(VMCS_GUEST_GS_ACCESS));
+    log_hex64("[VMM] sACC LDTR=", vmx_vmcs_read(VMCS_GUEST_LDTR_ACCESS));
+    log_hex64("[VMM] sACC TR=", vmx_vmcs_read(VMCS_GUEST_TR_ACCESS));
+
+    /* ---- Segment bases ---- */
+    log_hex64("[VMM] sBAS CS=", vmx_vmcs_read(VMCS_GUEST_CS_BASE));
+    log_hex64("[VMM] sBAS TR=", vmx_vmcs_read(VMCS_GUEST_TR_BASE));
+    log_hex64("[VMM] sBAS GDTR=", vmx_vmcs_read(VMCS_GUEST_GDTR_BASE));
+    log_hex64("[VMM] sBAS IDTR=", vmx_vmcs_read(VMCS_GUEST_IDTR_BASE));
+
+    /* ---- GDTR/IDTR limits ---- */
+    log_hex64("[VMM] dLIM GDTR=", vmx_vmcs_read(VMCS_GUEST_GDTR_LIMIT));
+    log_hex64("[VMM] dLIM IDTR=", vmx_vmcs_read(VMCS_GUEST_IDTR_LIMIT));
+
+    /* ---- Activity / interruptibility / link ---- */
+    log_hex64("[VMM] gACT=", vmx_vmcs_read(VMCS_GUEST_ACTIVITY_STATE));
+    log_hex64("[VMM] gINTSTATE=", vmx_vmcs_read(VMCS_GUEST_INTERRUPTIBILITY));
+    log_hex64("[VMM] gLINK=", vmx_vmcs_read(VMCS_GUEST_LINK_POINTER));
+
+    /* ---- SYSENTER ---- */
+    log_hex64("[VMM] gSYSENTER_CS=", vmx_vmcs_read(VMCS_GUEST_SYSENTER_CS));
+    log_hex64("[VMM] gDR7=", vmx_vmcs_read(VMCS_GUEST_DR7));
+
+    /* ---- Host state summary ---- */
+    log_hex64("[VMM] hCR0=", vmx_vmcs_read(VMCS_HOST_CR0));
+    log_hex64("[VMM] hCR3=", vmx_vmcs_read(VMCS_HOST_CR3));
+    log_hex64("[VMM] hCR4=", vmx_vmcs_read(VMCS_HOST_CR4));
+    log_hex64("[VMM] hRIP=", vmx_vmcs_read(VMCS_HOST_RIP));
+    log_hex64("[VMM] hRSP=", vmx_vmcs_read(VMCS_HOST_RSP));
+    log_hex64("[VMM] hEFER=", vmx_vmcs_read(VMCS_HOST_IA32_EFER));
+
+    log_info("[VMM] === End Guest State ===");
+}
+
 int vmm_self_test(void) {
     if (!g_vmm_ready) {
         log_error("[VMM] not ready");
@@ -458,13 +555,45 @@ int vmm_self_test(void) {
         log_error("[VMM] map guest TSS failed");
         return -6;
     }
+    /* P8.4: Map IDT page for KVM nested VMX (IDTR base = 0x5000) */
+    {
+        u64 guest_idt_phys = (u64)g_guest_idt - hhdm;
+        for (int i = 0; i < 4096; i++) g_guest_idt[i] = 0;
+        if (ept_map_range(0x5000, guest_idt_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
+            log_error("[VMM] map guest IDT failed");
+            return -9;
+        }
+    }
 
     /* 配置 VMCS */
     vmcs_setup_guest_state_phase1();
     vmcs_setup_controls(ept_get_eptp());
     vmcs_setup_host_state();
 
+    /* P8.4: VMCLEAR + VMPTRLD to put VMCS in "clear" state before VMLAUNCH.
+     * Without this, VMLAUNCH fails (error 4 or silent failure under KVM). */
+    if (vmx_vmcs_clear(g_vmcs_phys) != 0) {
+        log_error("[VMM] vmclear failed");
+        return -10;
+    }
+    if (vmx_vmcs_load(g_vmcs_phys) != 0) {
+        log_error("[VMM] vmptrld after vmclear failed");
+        return -11;
+    }
+
     log_info("[VMM] launching guest");
+
+    /* P8.4: dump key VMCS fields before VMLAUNCH for debugging */
+    log_hex64("[VMM] pin=", vmx_vmcs_read(VMCS_PIN_BASED_VM_EXEC_CONTROL));
+    log_hex64("[VMM] cpu=", vmx_vmcs_read(VMCS_CPU_BASED_VM_EXEC_CONTROL));
+    log_hex64("[VMM] cpu2=", vmx_vmcs_read(VMCS_SECONDARY_VM_EXEC_CONTROL));
+    log_hex64("[VMM] exit=", vmx_vmcs_read(VMCS_VM_EXIT_CONTROLS));
+    log_hex64("[VMM] entry=", vmx_vmcs_read(VMCS_VM_ENTRY_CONTROLS));
+    log_hex64("[VMM] eptp=", vmx_vmcs_read(VMCS_EPT_POINTER));
+    log_hex64("[VMM] link=", vmx_vmcs_read(VMCS_GUEST_LINK_POINTER));
+
+    /* P8.4: Dump all guest-state fields for KVM debug */
+    vmm_dump_guest_state();
 
     /* vmlaunch 控制流：
      *   - 失败：执行下一条指令，failed=1
@@ -495,6 +624,32 @@ int vmm_self_test(void) {
         serial_write("[VMM] ");
         serial_write(vmx_error_str(error));
         serial_putc('\n');
+
+        /* P8.4: diagnostic - dump guest CR0/CR4 vs VMX fixed bits */
+        {
+            u64 cr0_fixed0 = vmx_read_msr(0x486);  /* IA32_VMX_CR0_FIXED0 */
+            u64 cr0_fixed1 = vmx_read_msr(0x487);  /* IA32_VMX_CR0_FIXED1 */
+            u64 cr4_fixed0 = vmx_read_msr(0x488);  /* IA32_VMX_CR4_FIXED0 */
+            u64 cr4_fixed1 = vmx_read_msr(0x489);  /* IA32_VMX_CR4_FIXED1 */
+            u64 g_cr0 = vmx_vmcs_read(VMCS_GUEST_CR0);
+            u64 g_cr4 = vmx_vmcs_read(VMCS_GUEST_CR4);
+            log_hex64("[VMM] CR0_FIXED0=", cr0_fixed0);
+            log_hex64("[VMM] CR0_FIXED1=", cr0_fixed1);
+            log_hex64("[VMM] guest CR0  =", g_cr0);
+            log_hex64("[VMM] CR4_FIXED0=", cr4_fixed0);
+            log_hex64("[VMM] CR4_FIXED1=", cr4_fixed1);
+            log_hex64("[VMM] guest CR4  =", g_cr4);
+            /* Check: guest CR0 must have all bits in CR0_FIXED0 set,
+             * and must not have any bits set that are 0 in CR0_FIXED1 */
+            u64 cr0_missing = cr0_fixed0 & ~g_cr0;  /* bits FIXED0 requires but guest lacks */
+            u64 cr0_extra = g_cr0 & ~cr0_fixed1;     /* bits guest has but FIXED1 forbids */
+            log_hex64("[VMM] CR0 missing(need)=", cr0_missing);
+            log_hex64("[VMM] CR0 extra(forbid)=", cr0_extra);
+            u64 cr4_missing = cr4_fixed0 & ~g_cr4;
+            u64 cr4_extra = g_cr4 & ~cr4_fixed1;
+            log_hex64("[VMM] CR4 missing(need)=", cr4_missing);
+            log_hex64("[VMM] CR4 extra(forbid)=", cr4_extra);
+        }
         return -7;
     }
 

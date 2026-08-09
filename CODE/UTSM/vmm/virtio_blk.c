@@ -389,8 +389,10 @@ static void rootfs_blk_queue_notify(u32 queue_idx) {
     struct virtq_used *used;
     u32 qnum;
 
-    if (virtio_queue_get_ptrs(VIRTIO_ID_BLOCK, queue_idx,
-                              &desc, &avail, &used, &qnum) != 0) {
+    /* 必须按 gpa_base 定位：slot0 SATA blk 与本后端 device_id 同为 2，
+     * virtio_queue_get_ptrs(VIRTIO_ID_BLOCK) 只会命中第一个（slot0）。 */
+    if (virtio_queue_get_ptrs_by_gpa(VIRTIO_MMIO_ROOTFS_GPA, queue_idx,
+                                     &desc, &avail, &used, &qnum) != 0) {
         return;
     }
 
@@ -447,4 +449,199 @@ void virtio_rootfs_blk_init(void) {
     log_hex64("[VBLK] rootfs capacity(sectors)=", g_rootfs_capacity);
 
     virtio_mmio_register(&g_rootfs_blk_backend);
+}
+
+/* ===== Extra rootfs virtio-blk 后端（VSCode Phase 4，可写持久卷） =====
+ *
+ * 第三个 virtio-blk 设备，后端为内存中的 linux-extra-rootfs.img
+ * （Limine boot module，路径含 "extra"）。guest 看到 /dev/vdc，
+ * 用作 overlayfs 的 rw 上层或 VSCode 数据卷。
+ *
+ * 与 rootfs（vdb 只读）不同，本后端支持 VIRTIO_BLK_T_OUT 真正写入内存
+ * （易失：重启丢失；Phase 7 再做写回 FAT32 持久化）。
+ *
+ * 无 extra-rootfs module 时安全不注册（guest cmdline 无 slot6 参数）。 */
+
+static u8 *g_xrootfs_data;
+static u64 g_xrootfs_size;
+static u64 g_xrootfs_capacity;
+static u16 g_xrootfs_last_avail;
+
+static u32 xrootfs_blk_read_config(u32 offset, int width) {
+    (void)width;
+    struct virtio_blk_config cfg;
+    u8 *c = (u8 *)&cfg;
+    for (u32 i = 0; i < sizeof(cfg); i++) c[i] = 0;
+    cfg.capacity = g_xrootfs_capacity;
+    cfg.size_max = 128;
+    cfg.seg_max = 32;
+    cfg.blk_size = 512;
+    if (offset < sizeof(cfg)) {
+        u32 val = 0;
+        rf_memcpy(&val, c + offset, (offset + 4 <= sizeof(cfg)) ? 4 : (sizeof(cfg) - offset));
+        return val;
+    }
+    return 0;
+}
+
+static u32 xrootfs_blk_handle_chain(struct virtq_desc *desc, u16 head, u32 qnum) {
+    (void)qnum;
+    struct virtio_blk_outhdr hdr;
+    u8 *hptr = (u8 *)virtio_gpa_to_host(desc[head].addr);
+    if (!hptr) return 0;
+    rf_memcpy(&hdr, hptr, sizeof(hdr));
+
+    u32 type = hdr.type;
+    u64 sector = hdr.sector;
+
+    u16 data_idx = 0xFFFF;
+    u16 status_idx = 0xFFFF;
+    if (desc[head].flags & VIRTQ_DESC_F_NEXT) {
+        data_idx = desc[head].next;
+        u16 cur = data_idx;
+        int hops = 0;
+        while ((desc[cur].flags & VIRTQ_DESC_F_NEXT) && hops < 16) {
+            cur = desc[cur].next;
+            hops++;
+        }
+        status_idx = cur;
+    }
+
+    u8 *status = (u8 *)0;
+    if (status_idx != 0xFFFF && (desc[status_idx].flags & VIRTQ_DESC_F_WRITE)) {
+        status = (u8 *)virtio_gpa_to_host(desc[status_idx].addr);
+    }
+
+    u32 bytes_done = 0;
+    u8 result = VIRTIO_BLK_S_OK;
+
+    switch (type) {
+    case VIRTIO_BLK_T_IN: {  /* 读：镜像内存 → guest */
+        if (data_idx == 0xFFFF || !g_xrootfs_data) {
+            result = VIRTIO_BLK_S_IOERR;
+            break;
+        }
+        u8 *dbuf = (u8 *)virtio_gpa_to_host(desc[data_idx].addr);
+        u32 dlen = desc[data_idx].len;
+        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
+        u64 offset = sector * 512ULL;
+        u64 avail = (offset < g_xrootfs_size) ? (g_xrootfs_size - offset) : 0;
+        u32 copied = 0;
+        if (avail > 0) {
+            u32 n = (dlen < avail) ? dlen : (u32)avail;
+            rf_memcpy(dbuf, g_xrootfs_data + offset, n);
+            copied = n;
+        }
+        /* 越界部分填零 */
+        while (copied < dlen) dbuf[copied++] = 0;
+        bytes_done = dlen;
+        break;
+    }
+    case VIRTIO_BLK_T_OUT: {  /* 写：guest → 镜像内存（可写卷） */
+        if (data_idx == 0xFFFF || !g_xrootfs_data) {
+            result = VIRTIO_BLK_S_IOERR;
+            break;
+        }
+        const u8 *dbuf = (const u8 *)virtio_gpa_to_host(desc[data_idx].addr);
+        u32 dlen = desc[data_idx].len;
+        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
+        u64 offset = sector * 512ULL;
+        if (offset + dlen > g_xrootfs_size) {
+            /* 越界写：只写卷内部分，其余丢弃 */
+            u64 avail = (offset < g_xrootfs_size) ? (g_xrootfs_size - offset) : 0;
+            if (avail > 0) rf_memcpy(g_xrootfs_data + offset, dbuf, avail);
+        } else {
+            rf_memcpy(g_xrootfs_data + offset, dbuf, dlen);
+        }
+        bytes_done = 0;  /* 写操作 used.len=0 */
+        break;
+    }
+    case VIRTIO_BLK_T_GET_ID:
+        if (data_idx != 0xFFFF) {
+            char *idbuf = (char *)virtio_gpa_to_host(desc[data_idx].addr);
+            if (idbuf) {
+                const char *id = "DESHAB-EXTRA-ROOTFS";
+                u32 i = 0;
+                for (; id[i] && i < desc[data_idx].len - 1; i++) idbuf[i] = id[i];
+                idbuf[i] = 0;
+                bytes_done = i + 1;
+            }
+        }
+        break;
+    case VIRTIO_BLK_T_FLUSH:
+        result = VIRTIO_BLK_S_OK;
+        break;
+    default:
+        result = VIRTIO_BLK_S_UNSUPP;
+        break;
+    }
+
+    if (status) *status = result;
+    return bytes_done;
+}
+
+static void xrootfs_blk_queue_notify(u32 queue_idx) {
+    struct virtq_desc *desc;
+    struct virtq_avail *avail;
+    struct virtq_used *used;
+    u32 qnum;
+
+    /* 按 gpa_base 定位（三个 blk 后端 device_id 同为 2） */
+    if (virtio_queue_get_ptrs_by_gpa(VIRTIO_MMIO_EXTRA_ROOTFS_GPA, queue_idx,
+                                     &desc, &avail, &used, &qnum) != 0) {
+        return;
+    }
+
+    u16 cur = g_xrootfs_last_avail;
+    u16 used_idx = used->idx;
+    while (cur != avail->idx) {
+        u16 head = avail->ring[cur % qnum];
+        u32 len = xrootfs_blk_handle_chain(desc, head, qnum);
+        used->ring[used_idx % qnum].id = head;
+        used->ring[used_idx % qnum].len = len;
+        used_idx++;
+        cur++;
+    }
+    virtio_queue_bump_used(used, used_idx);
+    g_xrootfs_last_avail = cur;
+}
+
+static void xrootfs_blk_reset(void) {
+    g_xrootfs_last_avail = 0;
+}
+
+static struct virtio_backend g_xrootfs_blk_backend = {
+    .device_id = VIRTIO_ID_BLOCK,
+    .gpa_base = VIRTIO_MMIO_EXTRA_ROOTFS_GPA,
+    .irq = 11,                  /* guest ISA IRQ11（cmdline :11，vector 0x3B） */
+    .num_queues = 1,
+    .queue_size = 128,
+    .device_features = (1ULL << VIRTIO_F_VERSION_1) |
+                       (1ULL << VIRTIO_BLK_F_SIZE_MAX) |
+                       (1ULL << VIRTIO_BLK_F_SEG_MAX) |
+                       (1ULL << VIRTIO_BLK_F_BLK_SIZE) |
+                       (1ULL << VIRTIO_BLK_F_FLUSH),
+    .config_len = sizeof(struct virtio_blk_config),
+    .read_config = xrootfs_blk_read_config,
+    .queue_notify = xrootfs_blk_queue_notify,
+    .reset = xrootfs_blk_reset,
+};
+
+void virtio_extra_rootfs_blk_init(void) {
+    u64 size = 0;
+    void *img = linux_find_extra_rootfs_module(&size);
+    if (!img || size == 0) {
+        log_warn("[VBLK] no extra-rootfs module, slot6 backend not registered");
+        return;
+    }
+
+    g_xrootfs_data = (u8 *)img;
+    g_xrootfs_size = size;
+    g_xrootfs_capacity = size / 512;
+    if (size % 512) g_xrootfs_capacity++;
+
+    log_info("[VBLK] extra-rootfs-blk backend bound (rw)");
+    log_hex64("[VBLK] extra-rootfs size=", size);
+
+    virtio_mmio_register(&g_xrootfs_blk_backend);
 }

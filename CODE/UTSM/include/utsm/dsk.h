@@ -14,6 +14,23 @@
 /* ---- Probe 信息结构（通过 reserved[6] 传递给 shell/desktop） ---- */
 #define PROBE_INFO_MAGIC 0x50524F42u  /* "PRFB" — Probe inFo Buffer */
 
+/* ---- 网络租约信息（netman 写入，DSK 持有存储，经 reserved[7] 指针传递） ----
+ * reserved[0..6] 已被占用（user.conf/login/dev_mode/pe/lxc/probe），
+ * 仅 reserved[7] 空闲，故以其存放指向本结构的指针。 */
+#define NET_LEASE_MAGIC   0x4E45544Cu   /* "NETL" */
+#define NET_LEASE_F_VALID  (1u << 0)    /* ip/gateway/dns 有效 */
+#define NET_LEASE_F_STATIC (1u << 1)    /* 静态配置（非 DHCP） */
+
+typedef struct net_lease_info {
+    u32 magic;      /* NET_LEASE_MAGIC */
+    u32 flags;      /* NET_LEASE_F_* */
+    u32 ip;         /* guest IP（网络序） */
+    u32 gateway;    /* 网关（网络序） */
+    u32 dns;        /* DNS（网络序） */
+    u32 server;     /* DHCP server（网络序，调试） */
+    u32 reserved[2];
+} net_lease_info;
+
 typedef struct probe_info {
     u32 magic;              /* PROBE_INFO_MAGIC */
     u32 version;            /* ABI 版本，当前 1 */

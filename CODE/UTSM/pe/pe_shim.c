@@ -25,6 +25,8 @@
  */
 
 #include "pe_shim.h"
+#include "pe_dll_manager.h"
+#include "../include/utsm/pe.h"   /* P5: pe_window_host */
 #include <utsm/arena.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
@@ -69,11 +71,57 @@ static inline u64 gp(u64 va) {
     return va;
 }
 
+/* ===== P5 窗口模式状态 =====
+ * 全屏模式（默认）：s_wsurf==NULL，shim 直写 Limine fb + 轮询 PS/2。
+ * 窗口模式：渲染目标为 host surface（伪造 fb），输入靠 inject_*，
+ * 消息空转时回调 host pump（desktop 帧）。 */
+static u8  *s_wsurf = 0;
+static u32 s_wsurf_w = 0, s_wsurf_h = 0, s_wsurf_pitch = 0;
+static int (*s_host_pump)(void *ud) = 0;
+static void *s_host_ud = 0;
+static struct limine_framebuffer s_wsurf_fb;   /* 伪造 fb（窗口模式） */
+static const pe_window_host *s_winhost_pending = 0;  /* service 层挂起配置 */
+
+void pe_shim_set_window_host(const pe_window_host *host) {
+    s_winhost_pending = host;
+}
+
+int pe_shim_window_mode(void) { return s_wsurf != 0; }
+
 void pe_shim_init(const char *cmdline) {
     g_cmdline = cmdline ? cmdline : "";
     g_exit_jmp_set = 0;
     g_exit_code = 0;
     g_emu_mem_base = 0;  /* BUG-007: 默认非解释器上下文(原生路径恒等映射) */
+
+    /* P5：应用 service 层挂起的窗口模式配置（在状态重置之后生效） */
+    if (s_winhost_pending && s_winhost_pending->surface
+        && s_winhost_pending->width && s_winhost_pending->height
+        && s_winhost_pending->pitch) {
+        s_wsurf = s_winhost_pending->surface;
+        s_wsurf_w = s_winhost_pending->width;
+        s_wsurf_h = s_winhost_pending->height;
+        s_wsurf_pitch = s_winhost_pending->pitch;
+        s_host_pump = s_winhost_pending->pump;
+        s_host_ud = s_winhost_pending->ud;
+        /* 伪造 fb：32bpp 0xAARRGGBB（与 BitBlt/SetDIBits fast path 掩码一致） */
+        s_wsurf_fb.address = s_wsurf;
+        s_wsurf_fb.width = s_wsurf_w;
+        s_wsurf_fb.height = s_wsurf_h;
+        s_wsurf_fb.pitch = s_wsurf_pitch;
+        s_wsurf_fb.bpp = 32;
+        s_wsurf_fb.memory_model = 1;
+        s_wsurf_fb.red_mask_shift = 16; s_wsurf_fb.red_mask_size = 8;
+        s_wsurf_fb.green_mask_shift = 8; s_wsurf_fb.green_mask_size = 8;
+        s_wsurf_fb.blue_mask_shift = 0; s_wsurf_fb.blue_mask_size = 8;
+        log_info("[shim] window mode: surface target");
+    } else {
+        s_wsurf = 0;
+        s_wsurf_w = s_wsurf_h = s_wsurf_pitch = 0;
+        s_host_pump = 0;
+        s_host_ud = 0;
+    }
+    s_winhost_pending = 0;
 }
 
 /* 返回 ExitProcess longjmp 目标 jmpbuf(见 pe_shim.h 的 BUG-006 说明).
@@ -697,7 +745,7 @@ static u64 __attribute__((ms_abi)) shim_LoadLibraryA(u64 name_p) {
     name_p = gp(name_p);
     if (!name_p) return 0;
     const char *n = (const char *)name_p;
-    /* 已知 DLL 返回伪句柄(大小写不敏感子串匹配) */
+    /* 已知 shim DLL 返回伪句柄(大小写不敏感子串匹配) */
     static const char *known[] = { "kernel32", "ntdll", "user32", "gdi32", "msvcrt" };
     for (int k = 0; k < 5; k++) {
         const char *pat = known[k];
@@ -709,7 +757,22 @@ static u64 __attribute__((ms_abi)) shim_LoadLibraryA(u64 name_p) {
                 if (a != b) break;
                 i++;
             }
-            if (pat[i] == 0) return 0x10000020;
+            if (pat[i] == 0) return PE_SHIM_FAKE_MODULE;
+        }
+    }
+    /* 未知 DLL：尝试从 SYSTEM/lib 加载真实 DLL（句柄=镜像基址） */
+    if (g_pe_dll_manager_ready) {
+        char nb[64];
+        u32 i = 0;
+        while (n[i] && i + 1 < sizeof(nb)) { nb[i] = n[i]; i++; }
+        nb[i] = 0;
+        u64 base = 0;
+        if (pe_dll_load(nb, &base) == 0 && base != 0) {
+            log_info("[shim] LoadLibrary real DLL ok");
+            serial_write("  -> ");
+            serial_write(nb);
+            serial_write("\n");
+            return base;
         }
     }
     g_last_error = 126;  /* ERROR_MOD_NOT_FOUND */
@@ -723,13 +786,22 @@ static u64 __attribute__((ms_abi)) shim_lstrlenW(u64 str_p) {
     return n;
 }
 
-/* GetProcAddress — 在 shim 表内按函数名全局查找(hModule 为伪句柄,不限定 DLL).
- * lpProcName 高 16 位为 0 时是 ordinal(不支持,返回 0)。
- * Rust std 用它动态探测 Rtl 系列/dbghelp API,命中返回真实 shim 地址,miss 返回 0。 */
+/* GetProcAddress — 伪句柄在 shim 表内按函数名全局查找(不限定 DLL);
+ * 真实 DLL 句柄(pe_dll_load 返回的镜像基址)在该 DLL 导出表内解析。
+ * lpProcName 高 16 位为 0 时是 ordinal。 */
 static u64 __attribute__((ms_abi)) shim_GetProcAddress(u64 module, u64 name_p) {
-    (void)module;
     name_p = gp(name_p);
     if (!name_p) return 0;
+    /* 真实 DLL 模块：按基址解析（支持名称与序号） */
+    if (module && module != PE_SHIM_FAKE_MODULE && g_pe_dll_manager_ready) {
+        u32 ord = ((name_p >> 16) == 0) ? (u32)(name_p & 0xFFFF) : 0;
+        u64 addr = pe_dll_resolve_in_base(module,
+                        ord ? 0 : (const char *)name_p, ord);
+        if (addr) return addr;
+        g_last_error = 127;             /* ERROR_PROC_NOT_FOUND */
+        return 0;
+    }
+    (void)module;
     if ((name_p >> 16) == 0) {          /* ordinal 导入 */
         g_last_error = 127;             /* ERROR_PROC_NOT_FOUND */
         return 0;
@@ -1153,8 +1225,47 @@ static void shim_mouse_byte(u8 b) {
     s_mouse_btn = nbtn;
 }
 
-/* 排空 PS/2 输出缓冲,转成 Win32 消息入队 */
+/* 单个 set-1 扫描码 -> Win32 消息入队（P5 抽出：全屏 PS/2 轮询与
+ * 窗口模式 host 注入共用同一份 vk 映射/修饰键跟踪/WM_CHAR 合成）。
+ * sc: 原始扫描码（bit7=release）；e0: 1=E0 扩展键。 */
+static void shim_kbd_inject(u8 sc, int e0) {
+    if (!e0) {
+        if (sc == 0x2A || sc == 0x36) { s_kbd_shift = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x10, sc); return; }
+        if (sc == 0xAA || sc == 0xB6) { s_kbd_shift = 0; shim_msg_push(SHIM_WM_KEYUP, 0x10, sc); return; }
+        if (sc == 0x1D) { s_kbd_ctrl = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x11, sc); return; }
+        if (sc == 0x9D) { s_kbd_ctrl = 0; shim_msg_push(SHIM_WM_KEYUP, 0x11, sc); return; }
+        if (sc == 0x38) { s_kbd_alt = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x12, sc); return; }
+        if (sc == 0xB8) { s_kbd_alt = 0; shim_msg_push(SHIM_WM_KEYUP, 0x12, sc); return; }
+    }
+    if (sc & 0x80) {
+        u32 vk = shim_scan_vk(sc & 0x7F, e0);
+        if (vk) {
+            shim_msg_push(SHIM_WM_KEYUP, vk, sc);
+            if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYUP vk=", vk); }
+        }
+        return;
+    }
+    u32 vk = shim_scan_vk(sc, e0);
+    if (vk) {
+        shim_msg_push(SHIM_WM_KEYDOWN, vk, sc);
+        if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYDOWN vk=", vk); }
+        /* Esc -> 额外合成 WM_CLOSE:无鼠标环境下关闭窗口的唯一途径 */
+        if (vk == 0x1B && !e0) shim_msg_push(SHIM_WM_CLOSE, 0, 0);
+    }
+    if (!e0) {
+        char c = shim_scan_ascii(sc, s_kbd_shift);
+        if (c >= ' ' && c < 0x7F) {
+            shim_msg_push(SHIM_WM_CHAR, (u64)(u8)c, sc);
+            if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] CHAR ch=", (u64)(u8)c); }
+        }
+    }
+}
+
+/* 排空 PS/2 输出缓冲,转成 Win32 消息入队。
+ * P5 窗口模式：输入权归 desktop（经 inject_* 入队），此函数 no-op，
+ * 绝不触碰 PS/2 端口（避免与 desktop 的输入采集竞争）。 */
 static void shim_kbd_poll(void) {
+    if (s_wsurf) return;  /* 窗口模式：host 注入，不轮询端口 */
     shim_mouse_init_once();
     for (;;) {
         u8 st = inb(0x64);
@@ -1167,37 +1278,64 @@ static void shim_kbd_poll(void) {
         }
         if (sc == 0xE0) { s_kbd_e0 = 1; continue; }
         int e0 = s_kbd_e0;
-        if (!e0) {
-            if (sc == 0x2A || sc == 0x36) { s_kbd_shift = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x10, sc); continue; }
-            if (sc == 0xAA || sc == 0xB6) { s_kbd_shift = 0; shim_msg_push(SHIM_WM_KEYUP, 0x10, sc); continue; }
-            if (sc == 0x1D) { s_kbd_ctrl = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x11, sc); continue; }
-            if (sc == 0x9D) { s_kbd_ctrl = 0; shim_msg_push(SHIM_WM_KEYUP, 0x11, sc); continue; }
-            if (sc == 0x38) { s_kbd_alt = 1; shim_msg_push(SHIM_WM_KEYDOWN, 0x12, sc); continue; }
-            if (sc == 0xB8) { s_kbd_alt = 0; shim_msg_push(SHIM_WM_KEYUP, 0x12, sc); continue; }
-        }
         s_kbd_e0 = 0;
-        if (sc & 0x80) {
-            u32 vk = shim_scan_vk(sc & 0x7F, e0);
-            if (vk) {
-                shim_msg_push(SHIM_WM_KEYUP, vk, sc);
-                if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYUP vk=", vk); }
-            }
-            continue;
-        }
-        u32 vk = shim_scan_vk(sc, e0);
-        if (vk) {
-            shim_msg_push(SHIM_WM_KEYDOWN, vk, sc);
-            if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] KEYDOWN vk=", vk); }
-            /* Esc -> 额外合成 WM_CLOSE:无鼠标环境下关闭窗口的唯一途径 */
-            if (vk == 0x1B && !e0) shim_msg_push(SHIM_WM_CLOSE, 0, 0);
-        }
-        if (!e0) {
-            char c = shim_scan_ascii(sc, s_kbd_shift);
-            if (c >= ' ' && c < 0x7F) {
-                shim_msg_push(SHIM_WM_CHAR, (u64)(u8)c, sc);
-                if (s_dbg_key < 16) { s_dbg_key++; log_hex64("[shim] CHAR ch=", (u64)(u8)c); }
-            }
-        }
+        shim_kbd_inject(sc, e0);
+    }
+}
+
+/* ===== P5 窗口模式输入注入（pe_service 经 ABI 转发到这里）===== */
+
+int pe_shim_inject_scancode(u32 scancode, u32 e0_prefix) {
+    if (!s_wsurf) return -1;
+    shim_kbd_inject((u8)scancode, e0_prefix ? 1 : 0);
+    return 0;
+}
+
+int pe_shim_inject_pointer(i32 x, i32 y, u32 buttons) {
+    if (!s_wsurf) return -1;
+    /* 钳位到 surface 范围 */
+    if (x < 0) x = 0; else if (x >= (i32)s_wsurf_w) x = (i32)s_wsurf_w - 1;
+    if (y < 0) y = 0; else if (y >= (i32)s_wsurf_h) y = (i32)s_wsurf_h - 1;
+
+    u8 nbtn = (u8)(buttons & 0x07);
+    i32 cx = x - g_wnd_x, cy = y - g_wnd_y;  /* 客户区坐标(消息 lparam) */
+    u64 lp = (u64)(u32)(((u32)(u16)cy << 16) | (u32)(u16)cx);
+    u64 mk = 0;
+    if (nbtn & 1) mk |= SHIM_MK_LBUTTON;
+    if (nbtn & 2) mk |= SHIM_MK_RBUTTON;
+    if (nbtn & 4) mk |= SHIM_MK_MBUTTON;
+    if (s_kbd_shift) mk |= SHIM_MK_SHIFT;
+    if (s_kbd_ctrl) mk |= SHIM_MK_CONTROL;
+
+    if (x != s_mouse_x || y != s_mouse_y) {
+        s_mouse_x = x; s_mouse_y = y;
+        shim_msg_push_pt(SHIM_WM_MOUSEMOVE, mk, lp, x, y);
+    }
+    /* 按钮边沿 */
+    if ((nbtn & 1) && !(s_mouse_btn & 1)) shim_msg_push_pt(SHIM_WM_LBUTTONDOWN, mk, lp, x, y);
+    if (!(nbtn & 1) && (s_mouse_btn & 1)) shim_msg_push_pt(SHIM_WM_LBUTTONUP, mk, lp, x, y);
+    if ((nbtn & 2) && !(s_mouse_btn & 2)) shim_msg_push_pt(SHIM_WM_RBUTTONDOWN, mk, lp, x, y);
+    if (!(nbtn & 2) && (s_mouse_btn & 2)) shim_msg_push_pt(SHIM_WM_RBUTTONUP, mk, lp, x, y);
+    if ((nbtn & 4) && !(s_mouse_btn & 4)) shim_msg_push_pt(SHIM_WM_MBUTTONDOWN, mk, lp, x, y);
+    if (!(nbtn & 4) && (s_mouse_btn & 4)) shim_msg_push_pt(SHIM_WM_MBUTTONUP, mk, lp, x, y);
+    s_mouse_btn = nbtn;
+    return 0;
+}
+
+int pe_shim_inject_input(u32 msg, u64 wparam, u64 lparam, i32 ptx, i32 pty) {
+    if (!s_wsurf) return -1;
+    shim_msg_push_pt(msg, wparam, lparam, ptx, pty);
+    return 0;
+}
+
+/* 消息空转让出点：窗口模式回调 host 泵（desktop 帧），全屏 pause。
+ * pump 返回非 0 = host 请求退出 → 投递 WM_CLOSE（PE 自愿退出路径）。 */
+static void shim_msg_yield(void) {
+    if (s_host_pump) {
+        if (s_host_pump(s_host_ud))
+            shim_msg_push(SHIM_WM_CLOSE, 0, 0);
+    } else {
+        __asm__ volatile("pause");
     }
 }
 
@@ -1209,6 +1347,8 @@ static u64 __attribute__((ms_abi)) shim_RegisterClassExW(u64 wc_p) {
 }
 
 static const struct limine_framebuffer *shim_fb(void) {
+    /* P5 窗口模式：渲染目标是 host 提供的内存 surface（伪造 fb） */
+    if (s_wsurf) return &s_wsurf_fb;
     if (!g_fb_request.response || g_fb_request.response->framebuffer_count == 0) return 0;
     return g_fb_request.response->framebuffers[0];
 }
@@ -1315,6 +1455,9 @@ static u64 __attribute__((ms_abi)) shim_PeekMessageW(u64 msg_p, u64 hwnd,
                                                       u64 fmin, u64 fmax, u64 remove) {
     (void)hwnd; (void)fmin; (void)fmax;
     shim_kbd_poll();
+    /* P5 窗口模式：PeekMessage 驱动的渲染循环（Deaicup 型）下 PE 几乎不
+     * 调 GetMessage，desktop 只能靠这里的空转让出获得 CPU 跑帧。 */
+    if (g_mq_count == 0 && s_host_pump) shim_msg_yield();
     if (g_mq_count == 0) return 0;
     shim_msg_t *m = &g_msgq[g_mq_head];
     if (msg_p) *(shim_msg_t *)msg_p = *m;
@@ -1330,7 +1473,7 @@ static u64 __attribute__((ms_abi)) shim_GetMessageW(u64 msg_p, u64 hwnd,
     for (;;) {  /* 阻塞语义:轮询键盘直到有消息 */
         shim_kbd_poll();
         if (g_mq_count > 0) break;
-        __asm__ volatile("pause");
+        shim_msg_yield();  /* P5: 窗口模式泵 desktop，全屏 pause */
     }
     shim_msg_t *m = &g_msgq[g_mq_head];
     if (msg_p) *(shim_msg_t *)msg_p = *m;
@@ -1434,6 +1577,7 @@ static const char *const g_cursor_bmp[12] = {
 };
 
 static void shim_draw_cursor(const struct limine_framebuffer *fb) {
+    if (s_wsurf) return;  /* P5 窗口模式：光标由 desktop 统一绘制 */
     if (!s_mouse_ok || !g_wnd_created) return;
     i32 wx1 = g_wnd_x + g_wnd_w, wy1 = g_wnd_y + g_wnd_h;
     if (s_mouse_x < g_wnd_x || s_mouse_y < g_wnd_y) return;
@@ -1526,6 +1670,87 @@ static u64 __attribute__((ms_abi)) shim_BitBlt(u64 dstdc, u64 x, u64 y, u64 cx, 
         log_hex64("[shim] heap free_max=", fm);
     }
     return 1;
+}
+
+/* SetDIBitsToDevice: 不经内存 DC,直接把 DIB 位块贴上窗口 DC.
+ * 语义(MSDN): (xSrc,ySrc) 是 DIB 源区域左下角(DIB 坐标系 y 向上),
+ * startScan/numLines 描述 lpvBits 缓冲覆盖的扫描线区间,
+ * (xDest,yDest,w,h) 是客户区目标矩形(y 向下).
+ * bottom-up DIB: 缓冲行 0 = DIB 扫描线 startScan(从底数);
+ * top-down DIB : 缓冲行 0 = 图像顶行 + startScan.
+ * 仅支持 32bpp BI_RGB;返回实际拷贝的扫描线数. */
+static u64 __attribute__((ms_abi)) shim_SetDIBitsToDevice(
+    u64 hdc, i32 xDest, i32 yDest, u32 w, u32 h,
+    i32 xSrc, i32 ySrc, u32 startScan, u32 numLines,
+    u64 bits_p, u64 bmi_p, u64 colorUse) {
+    (void)colorUse;
+    if (hdc != SHIM_HDC_WND) return 0;  /* 仅支持窗口 DC 目标 */
+    const struct limine_framebuffer *fb = shim_fb();
+    if (!fb || !fb->address) return 0;
+    if (fb->bpp != 32 && fb->bpp != 24) return 0;
+    if (!bits_p || !bmi_p || w == 0 || h == 0) return 0;
+    const u8 *bmi = (const u8 *)bmi_p;
+    i32 bw = *(const i32 *)(bmi + 4);     /* biWidth */
+    i32 bh = *(const i32 *)(bmi + 8);     /* biHeight(负=top-down) */
+    u16 bpp = *(const u16 *)(bmi + 14);   /* biBitCount */
+    u32 comp = *(const u32 *)(bmi + 16);  /* biCompression */
+    if (bw <= 0 || bh == 0 || bpp != 32 || comp != 0 /* BI_RGB */) return 0;
+    int topdown = 0;
+    i32 H = bh;
+    if (H < 0) { H = -H; topdown = 1; }
+
+    const u32 *bits = (const u32 *)bits_p;
+    i32 dx0 = xDest + g_wnd_x;
+    i32 dy0 = yDest + g_wnd_y;
+
+    u8 *fbb = (u8 *)fb->address;
+    u32 rsh = fb->red_mask_shift, gsh = fb->green_mask_shift, bsh = fb->blue_mask_shift;
+    u32 rsz = fb->red_mask_size ? fb->red_mask_size : 8;
+    u32 gsz = fb->green_mask_size ? fb->green_mask_size : 8;
+    u32 bsz = fb->blue_mask_size ? fb->blue_mask_size : 8;
+    int fast = (fb->bpp == 32 && rsh == 16 && gsh == 8 && bsh == 0
+                && rsz == 8 && gsz == 8 && bsz == 8);
+
+    u32 copied = 0;
+    for (u32 row = 0; row < h; row++) {
+        /* 目标顶行 row=0 ← DIB 坐标 y=ySrc+h-1(源区域顶边) */
+        i32 sy = ySrc + (i32)h - 1 - (i32)row;
+        if (sy < 0 || sy >= H) continue;
+        /* DIB 扫描线 sy → lpvBits 缓冲行 */
+        i64 br = topdown ? ((i64)(H - 1 - sy) - (i32)startScan)
+                         : ((i64)sy - (i32)startScan);
+        if (br < 0 || br >= (i64)numLines) continue;
+        i32 fy = dy0 + (i32)row;
+        if (fy < 0 || fy >= (i32)fb->height) continue;
+        const u32 *src = bits + (u64)br * (u64)bw;
+        u8 *dst_row = fbb + (u64)fy * fb->pitch;
+        copied++;
+        for (u32 col = 0; col < w; col++) {
+            i32 sx = xSrc + (i32)col;
+            if (sx < 0 || sx >= bw) continue;
+            i32 fx = dx0 + (i32)col;
+            if (fx < 0 || fx >= (i32)fb->width) continue;
+            u32 px = src[sx];
+            if (fast) {
+                ((u32 *)dst_row)[fx] = px;
+            } else {
+                u32 r = (px >> 16) & 0xFF, g = (px >> 8) & 0xFF, bl = px & 0xFF;
+                u32 v = ((r >> (8 - rsz)) << rsh)
+                      | ((g >> (8 - gsz)) << gsh)
+                      | ((bl >> (8 - bsz)) << bsh);
+                if (fb->bpp == 32) {
+                    ((u32 *)dst_row)[fx] = v;
+                } else {
+                    u8 *p = dst_row + (u64)fx * 3;
+                    p[0] = (u8)(v & 0xFF);
+                    p[1] = (u8)((v >> 8) & 0xFF);
+                    p[2] = (u8)((v >> 16) & 0xFF);
+                }
+            }
+        }
+    }
+    shim_draw_cursor(fb);
+    return copied;
 }
 
 /* 未实现 stub(64位)— 日志告警(含调用点返回地址)并返回 0 */
@@ -1642,6 +1867,7 @@ static const pe_shim_entry g_shim_table[] = {
     {"gdi32.dll",    "DeleteObject",          (void*)shim_DeleteObject,        0},
     {"gdi32.dll",    "DeleteDC",              (void*)shim_DeleteDC,            0},
     {"gdi32.dll",    "BitBlt",                (void*)shim_BitBlt,              0},
+    {"gdi32.dll",    "SetDIBitsToDevice",     (void*)shim_SetDIBitsToDevice,   0},
     {"gdi32.dll",    "GetStockObject",        (void*)shim_GetStockObject,      0},
     {"gdi32.dll",    "GdiFlush",              (void*)shim_GdiFlush,            0},
     /* msvcrt.dll */

@@ -1,8 +1,13 @@
-# Deshab Linux desktop apps (LINUXAPP.CNF)
-# Format per line: DISPLAY_NAME|linux command
-# - '#' starts a comment, blank lines are ignored
-# - display name <= 11 chars, command <= 63 chars, args split on spaces
-# - command runs in the Linux guest via the compat layer (see dsl command)
-HELLO|/bin/echo hello from deshab linux
-UNAME|/bin/uname -a
-LS|/bin/ls -l /
+# Deshab Linux 应用注册表（desktop 启动时解析，注册为桌面图标）
+# 格式: NAME|DISPLAY|/guest/path|args
+#   NAME    : 应用内部名（大写，≤11 字符；VSCODE 会被 IDE attach 共享路径识别）
+#   DISPLAY : 桌面图标显示名（≤15 字符）
+#   path    : Linux guest 内程序绝对路径（经 linux_compat exec_async 启动）
+#   args    : 空格分隔参数（可省略；exec_async 子进程自带 DISPLAY=:0
+#             与 LD_LIBRARY_PATH=/usr/lib/deshab）
+# 点击图标后共享 IDE attach 路径：确保 X server 在线 → 启动程序 →
+# 切到 IDE 页并挂接显示。多实例在 args 中用 --user-data-dir 隔离。
+# NAME 精确等于 VSCODE 的条目被 IDE +NEW IDE 共享路径识别（VSCODE2 等
+# 其它实例只经桌面图标启动，IDE tab 标签显示最近启动实例的 DISPLAY）。
+VSCODE|VSCode|/opt/vscode/bin/code|--no-sandbox --disable-gpu --user-data-dir /root/.vscode-data
+VSCODE2|VSCode2|/opt/vscode/bin/code|--no-sandbox --disable-gpu --user-data-dir /root/.vscode-data2 /root/workspace2

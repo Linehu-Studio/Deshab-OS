@@ -125,9 +125,14 @@ SYSTEM/ 是打包为 IMG 后的系统根目录。
 SYSTEM/boot/ 存放启动模块，例如 utsm.elf。
 SYSTEM/driver/ 存放 ELF .drv 驱动模块和 manifest.json。
 CODE/UTSM/README.md: 编译到 SYSTEM/boot/utsm.elf
-build.bat: 调用 build.ps1。
-build.ps1: 编译 UTSM，生成 SYSTEM/boot/utsm.elf，并把 SYSTEM 打包为 ISO/deshab.img。deshab.img 是 GPT 磁盘镜像，包含 FAT32 EFI System Partition。
-ISO/run_qemu.bat: 用 QEMU + UEFI 固件启动 ISO/deshab.img，串口输出到 stdio。
+build.bat: 调用 build.ps1，透传参数（如 -Variant dev）。
+build.ps1: 编译 UTSM/DSK/工具/驱动，产出两个镜像：
+  - ISO/deshab-dev.img     开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项）
+  - ISO/deshab-release.img 发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项）
+  参数 -Variant dev|release|both（默认 both）。both 模式构建后恢复 SYSTEM 为 dev 配置。
+  配置模板在 build/configs/{dev,release}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
+ISO/run_qemu.bat: 用 QEMU + UEFI 固件启动 ISO/deshab-dev.img，串口输出到 stdio。
+build.ps1 自动把 Git usr/bin 加入 PATH（sh.exe + mkdir），解决 make `mkdir -p` 在 cmd.exe 下失败的问题。
 ```
 
 当前 UTSM 已有首阶段内核代码骨架和构建脚本，可生成 utsm.elf 与 GPT + FAT32 ESP 镜像。早期启动要求：进入 C 前 `cli/cld`，early serial 不允许无限等待硬件 ready 位，未启用 FPU/SSE 前编译必须使用 `-mno-sse -mno-sse2 -mno-mmx -msoft-float`。DATA/BSS 段使用 PF_R|PF_W|PF_X（SAS-R0 下驱动模块内存需可执行）。

@@ -73,10 +73,10 @@
 #define VMCS_GUEST_GS_SELECTOR           0x080A
 #define VMCS_GUEST_LDTR_SELECTOR         0x080C
 #define VMCS_GUEST_TR_SELECTOR           0x080E
-#define VMCS_GUEST_CS_LIMIT              0x4800
+#define VMCS_GUEST_ES_LIMIT              0x4800
+#define VMCS_GUEST_CS_LIMIT              0x4802
 #define VMCS_GUEST_SS_LIMIT              0x4804
 #define VMCS_GUEST_DS_LIMIT              0x4806
-#define VMCS_GUEST_ES_LIMIT              0x4801
 #define VMCS_GUEST_FS_LIMIT              0x4808
 #define VMCS_GUEST_GS_LIMIT              0x480A
 #define VMCS_GUEST_LDTR_LIMIT            0x480C
@@ -95,6 +95,7 @@
 #define VMCS_GUEST_PREEMPTION_TIMER      0x482E
 
 /* 64-bit guest-state fields（与 PDPTR 共享编码，仅在 EPT 启用时为 EFER/PAT） */
+#define VMCS_GUEST_LINK_POINTER         0x2800  /* P8.4: must be 0xFFFFFFFFFFFFFFFF */
 #define VMCS_GUEST_IA32_EFER             0x2806
 #define VMCS_GUEST_IA32_PAT              0x2804
 #define VMCS_GUEST_IA32_PERF_GLOBAL_CTRL 0x2808
@@ -265,6 +266,7 @@ int vmx_enable(void);
 int vmx_disable(void);
 int vmx_vmcs_alloc(u64 *phys_out);
 int vmx_vmcs_load(u64 phys);
+int vmx_vmcs_clear(u64 phys);  /* P8.4: VMCLEAR before VMLAUNCH */
 u64 vmx_vmcs_read(u64 field);
 void vmx_vmcs_write(u64 field, u64 value);
 int vmx_vmlaunch(void);

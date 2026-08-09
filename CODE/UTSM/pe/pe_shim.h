@@ -16,6 +16,10 @@
 
 #include <utsm/types.h>
 
+/* shim 伪模块句柄（LoadLibrary 对已知 shim DLL 返回值）。
+ * 真实 DLL 句柄 = pe_dll_load 镜像基址，与此值域区分。 */
+#define PE_SHIM_FAKE_MODULE 0x10000020ULL
+
 /* 32位 shim：从模拟栈读取参数（cdecl 语义，调用者清栈）。
  * esp 指向模拟栈（第一个参数在 esp[0]）。返回值 = EAX。 */
 typedef u64 (*pe_shim_fn32)(void *esp);
@@ -81,5 +85,24 @@ const char *pe_shim_get_cmdline(void);
  * → 三重故障。执行 PE32 前设置 base=mem，shim 内部 gp() 在指针解引用点
  * 完成转换；base=0 表示非解释器上下文（原生 PE32+ 路径），gp() 恒等映射。 */
 void pe_shim_set_emu_base(u64 base);
+
+/* ===== P5 窗口模式（desktop 嵌入）=====
+ * pe_service 在 run_windowed 前调用 pe_shim_set_window_host 挂起配置；
+ * pe_shim_init（run 开头）重置 shim 状态后应用该配置。host==NULL 或
+ * host->surface==NULL 时保持全屏独占行为（默认）。 */
+struct pe_window_host;   /* 定义见 utsm/pe.h */
+void pe_shim_set_window_host(const struct pe_window_host *host);
+
+/* 窗口模式输入注入（仅窗口模式生效，全屏返回 -1）。
+ * inject_scancode: set-1 扫描码（bit7=release），e0_prefix!=0 为 E0 扩展。
+ * inject_pointer : surface 局部坐标 + 按钮位（bit0/1/2=L/R/M），
+ *                  内部与上次状态比较合成 MOUSEMOVE/BUTTON 边沿。
+ * inject_input   : 直接投递任意 Win32 消息（WM_CLOSE 等宿主控制消息）。 */
+int pe_shim_inject_scancode(u32 scancode, u32 e0_prefix);
+int pe_shim_inject_pointer(i32 x, i32 y, u32 buttons);
+int pe_shim_inject_input(u32 msg, u64 wparam, u64 lparam, i32 ptx, i32 pty);
+
+/* 窗口模式是否激活（1=渲染目标为 host surface）。 */
+int pe_shim_window_mode(void);
 
 #endif /* PE_SHIM_H */

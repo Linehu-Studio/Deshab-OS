@@ -130,6 +130,34 @@ CONFIG_VIRTIO_CONSOLE=y
 CONFIG_HW_RANDOM=y
 CONFIG_HW_RANDOM_VIRTIO=y
 
+# DRM + virtio-gpu (VSCode integration Phase 3: guest graphical output)
+# Provides /dev/dri/card0 for Xorg modesetting + scanout to host framebuffer
+CONFIG_DRM=y
+CONFIG_DRM_VIRTIO_GPU=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FB=y
+CONFIG_FB_DEFERRED_IO=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FB_TILEBLITTING=y
+
+# VT + console (X server needs /dev/tty0 + VT_SWITCH)
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_HW_CONSOLE=y
+CONFIG_VT_HW_CONSOLE_BINDING=y
+
+# Input evdev (VSCode integration Phase 2: virtio-input event devices)
+# Required for /dev/input/eventX — X server evdev driver reads these
+CONFIG_INPUT_EVDEV=y
+
+# OverlayFS (VSCode integration Phase 4: rw layer over read-only rootfs)
+# /sbin/init mounts overlay -o lowerdir=/,upperdir=/tmp/rw/upper,workdir=/tmp/rw/work /
+CONFIG_OVERLAY_FS=y
+
+# tmpfs xattr (overlayfs workdir needs xattr support)
+CONFIG_TMPFS_XATTR=y
+CONFIG_TMPFS_POSIX_ACL=y
+
 # UTSM dual-kernel hypercall and IPC driver (Phase 1.3)
 CONFIG_UTSM_HCALL=y
 

@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+﻿﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Deshab QEMU 自动化测试公共库（tests/qemu/lib/QemuTest.ps1）
@@ -33,6 +33,7 @@ $script:Config      = $null
 # 场景备份（模块级，保证只备份一次、恢复幂等）
 $script:FirstInitBackup = $null
 $script:AutoexecBackup  = $null
+$script:FuckBackup      = $null
 
 # ================================================================
 #  环境初始化
@@ -67,7 +68,7 @@ function Initialize-QemuTest {
     New-Item -ItemType Directory -Force -Path $script:SuiteImgDir  | Out-Null
     New-Item -ItemType Directory -Force -Path $script:MkFat32Dir   | Out-Null
 
-    $imgSrc  = Join-Path $script:IsoDir   'deshab.img'
+    $imgSrc  = Join-Path $script:IsoDir   'deshab-dev.img'
     $nvmeSrc = Join-Path $script:BuildTmp 'nvme_test.img'
     $usbSrc  = Join-Path $script:BuildTmp 'usb_test.img'
 
@@ -261,7 +262,14 @@ function Start-QemuSession {
         '-no-reboot',
         '-name', $tag,
         '-drive', ('if=pflash,format=raw,readonly=on,file="{0}"' -f $cfg.Ovmf),
-        '-drive', ('format=raw,file="{0}",if=virtio' -f $cfg.Img)
+        # 已知坑4：主盘必须显式 virtio-blk-pci + bootindex=1。
+        #   `-drive if=virtio` 自动插件时，OVMF 只在 virtio-blk 恰好落到
+        #   PCI 0x3（无其他 PCI 设备）才会为其自动创建启动项；附加 NVMe/
+        #   USB/e1000 任一设备后 virtio 挪到 0x4/0x5，OVMF 启动项枚举整个
+        #   失效，直接掉 EFI Internal Shell（ESP/BOOTX64.EFI 均正常也没用）。
+        #   bootindex=1 经 fw_cfg bootorder 强制 OVMF 首选本盘，与设备组合无关。
+        '-drive', ('if=none,id=osdisk,format=raw,file="{0}"' -f $cfg.Img),
+        '-device', 'virtio-blk-pci,drive=osdisk,bootindex=1'
     )
 
     # -snapshot 默认开：镜像只读 + 写入落临时 overlay，避免镜像写锁与并发代理冲突。
@@ -564,6 +572,10 @@ function Invoke-MkFat32 {
 
 # 写镜像树 firstInit.txt（格式 "<first>`n<dev_mode>"，LF）并重建私有 SATA 镜像；原内容自动备份。
 # 只写 .build_tmp\tests\SYSTEM 镜像树，共享 SYSTEM 工作树保持不变（并发代理可能正在翻转它）。
+# 已知坑5：DSK 的 dev_mode 是「FUCK dev_mode OR firstInit 第二行」单向合并，
+#   firstInit 只能置 1 不能清 0。dev 镜像 FUCK dev_mode=1 时 shell.elf 自动
+#   测试后进入交互主循环阻塞启动流，cmd.elf 永远调度不到。因此 -DevMode 0
+#   必须同步把镜像树 FUCK [boot] dev_mode 也改 0（仅测试镜像树，不动共享树）。
 function Set-DeshabFirstInit {
     param(
         [Parameter(Mandatory)][int]$First,
@@ -574,6 +586,14 @@ function Set-DeshabFirstInit {
         $script:FirstInitBackup = [System.IO.File]::ReadAllBytes($path)
     }
     [System.IO.File]::WriteAllText($path, "$First`n$DevMode")
+    # 同步 FUCK [boot] dev_mode（单向合并导致 firstInit 无法清 dev_mode，见上）
+    $fuckPath = Join-Path $script:MirrorSystem 'system\deshab64\FUCK'
+    if ($null -eq $script:FuckBackup) {
+        $script:FuckBackup = [System.IO.File]::ReadAllBytes($fuckPath)
+    }
+    $fuckTxt = [System.IO.File]::ReadAllText($fuckPath)
+    $fuckTxt = $fuckTxt -replace '(?m)^dev_mode=\d', "dev_mode=$DevMode"
+    [System.IO.File]::WriteAllText($fuckPath, $fuckTxt)
     Invoke-MkFat32
 }
 
@@ -582,8 +602,15 @@ function Restore-DeshabFirstInit {
     if ($null -ne $script:FirstInitBackup) {
         [System.IO.File]::WriteAllBytes($path, $script:FirstInitBackup)
         $script:FirstInitBackup = $null
-        Invoke-MkFat32
+        $restored = $true
     }
+    $fuckPath = Join-Path $script:MirrorSystem 'system\deshab64\FUCK'
+    if ($null -ne $script:FuckBackup) {
+        [System.IO.File]::WriteAllBytes($fuckPath, $script:FuckBackup)
+        $script:FuckBackup = $null
+        $restored = $true
+    }
+    if ($restored) { Invoke-MkFat32 }
 }
 
 # 替换镜像树 AUTOEXEC.BAT 内容（cmd.elf 启动时逐行自动执行）并重建私有 SATA 镜像；原内容自动备份

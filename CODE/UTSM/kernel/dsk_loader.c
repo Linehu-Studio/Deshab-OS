@@ -7,6 +7,7 @@
 #include <utsm/linux_compat.h>
 #include <utsm/instr.h>
 #include "../arch/x86_64/limine.h"
+#include "../../tools/fat32_lfn.h"
 
 #define DSK_PATH "/system/deshab64/deshab.elf"
 #define DSK_CMDLINE "dsk:main"
@@ -176,8 +177,9 @@ static struct limine_file *dsk_find_module(void) {
 /* ---- FAT32 block-provider file reader ---- */
 static u8 g_dsk_fat32_disk[131072]; /* 256-sector BPB+FAT+root dir buffer (与 DSK 端一致) */
 static u8 g_dsk_fat32_cluster[4096]; /* 8-sector cluster buffer */
-/* 实机要求: 文件缓冲区足够大容纳 deshab.elf (~1.5MB) */
-static u8 g_dsk_fat32_filedata[2097152]; /* 2MB file data buffer */
+/* 实机要求: 文件缓冲区足够容纳 deshab.elf (~1.5MB) 及 SYSTEM/lib 下的
+ * 大型 DLL（shell32.dll ~8MB, uiautomationcore.dll ~4.3MB） */
+static u8 g_dsk_fat32_filedata[10485760]; /* 10MB file data buffer */
 /* BUG-019 修复: FAT 按需扇区读取缓冲区（仅 512 字节），
  * 当 FAT 条目偏移超出 g_dsk_fat32_disk (128KB) 时使用。 */
 static u8 g_dsk_fat32_fat_sec[512];
@@ -344,11 +346,13 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
 
 /* ---- FAT32 subdirectory traversal ---- */
 
-/* 在指定起始 cluster 的目录项中查找 name11。
+/* 在指定起始 cluster 的目录项中查找 name11（8.3）或 long_name（LFN 长名）。
+ * long_name 为 NULL 时仅按 8.3 匹配（向后兼容）。
  * is_dir=1 时只匹配子目录（attr & 0x10），is_dir=0 时只匹配文件。
- * 返回 0 成功，out_clus/out_size 返回匹配项的起始 cluster 和大小。 */
+ * 返回 0 成功，out_clus/out_size 返回匹配项的起始 cluster 和大小。
+ * 注意：LFN 缓冲跨簇遍历持续存活，支持跨簇边界的 LFN 链。 */
 static int fat32_find_in_dir(u32 start_clus, const char *name11, int is_dir,
-                              u32 *out_clus, u32 *out_size) {
+                              u32 *out_clus, u32 *out_size, const char *long_name) {
     const dkm_kernel_api *api = dkm_get_kernel_api();
     if (!api || !api->block || !api->block->device_count) return -1;
 
@@ -360,6 +364,10 @@ static int fat32_find_in_dir(u32 start_clus, const char *name11, int is_dir,
     u32 data_start_sec = bpb->reserved_sector_count + (u32)bpb->fat_count * bpb->sectors_per_fat;
     u32 spc = bpb->sectors_per_cluster;
 
+    /* LFN 缓冲必须在簇循环外声明：跨簇 LFN 链需要持续存活 */
+    fat32_lfn_buf lfn;
+    fat32_lfn_init(&lfn);
+
     u32 clus = start_clus;
     while (clus >= 2 && clus < 0x0FFFFFF8) {
         u32 clus_lba = data_start_sec + (clus - 2) * spc;
@@ -367,22 +375,50 @@ static int fat32_find_in_dir(u32 start_clus, const char *name11, int is_dir,
         int st = api->block->read(0, clus_lba, spc, cb);
         if (st != 0) return -3;
 
-        const fat32_dir_entry *dir = (const fat32_dir_entry *)cb;
-        for (u32 e = 0; e * 32 < spc * 512; e++) {
-            if (dir[e].name[0] == 0) break;
-            if ((u8)dir[e].name[0] == 0xE5) continue;
-            if (dir[e].attr == 0x0F) continue;
-            if (dir[e].attr & 0x08) continue;
-            if (!fat32_name11_eq(dir[e].name, name11)) continue;
-
-            /* 名称匹配，检查类型 */
-            int entry_is_dir = (dir[e].attr & 0x10) ? 1 : 0;
-            if (entry_is_dir != is_dir) continue;
-
-            *out_clus = fat32_read_u16((const u8 *)&dir[e].cluster_low) |
-                        ((u32)fat32_read_u16((const u8 *)&dir[e].cluster_high) << 16);
-            *out_size = dir[e].file_size;
-            return 0;
+        const u8 *entries = (const u8 *)cb;
+        u32 entry_count = (spc * 512) / 32;
+        for (u32 e = 0; e < entry_count; e++) {
+            const u8 *entry = entries + e * 32;
+            if (entry[0] == 0) break;
+            if ((u8)entry[0] == 0xE5) {
+                fat32_lfn_init(&lfn);
+                continue;
+            }
+            const fat32_dir_entry *de = (const fat32_dir_entry *)entry;
+            int is_short = fat32_lfn_process(&lfn, entry);
+            if (!is_short) continue;  /* LFN 片段 */
+            if (de->attr & 0x08) {
+                fat32_lfn_init(&lfn);
+                continue;  /* 卷标 */
+            }
+            int entry_is_dir = (de->attr & 0x10) ? 1 : 0;
+            if (entry_is_dir != is_dir) {
+                fat32_lfn_init(&lfn);
+                continue;
+            }
+            /* 匹配检查：先 8.3 短名，再 LFN 长名 */
+            int matched = 0;
+            if (name11 && fat32_name11_eq(de->name, name11)) {
+                matched = 1;
+            } else if (long_name) {
+                if (lfn.valid) {
+                    char ascii[FAT32_LFN_MAX];
+                    int n = fat32_lfn_to_ascii(&lfn, ascii, sizeof(ascii));
+                    if (n >= 0 && fat32_lfn_streq_ci(ascii, long_name)) matched = 1;
+                }
+                if (!matched) {
+                    char short_disp[13];
+                    fat32_lfn_short_to_str((const u8 *)de->name, short_disp);
+                    if (fat32_lfn_streq_ci(short_disp, long_name)) matched = 1;
+                }
+            }
+            if (matched) {
+                *out_clus = fat32_read_u16((const u8 *)&de->cluster_low) |
+                            ((u32)fat32_read_u16((const u8 *)&de->cluster_high) << 16);
+                *out_size = de->file_size;
+                return 0;
+            }
+            fat32_lfn_init(&lfn);
         }
 
         /* 跟随 FAT 链 — BUG-019: 使用按需 FAT 读取 */
@@ -392,7 +428,10 @@ static int fat32_find_in_dir(u32 start_clus, const char *name11, int is_dir,
 }
 
 /* 按路径查找文件并读取内容。
- * path: '/' 分隔的 8.3 格式路径（如 "SYSTEM  /DESHAB64 /FUCK    "）。
+ * path: '/' 分隔的路径。支持两种格式：
+ *   1) 8.3 路径（如 "SYSTEM  /DESHAB64 /FUCK    "，每段恰好 11 字符）
+ *   2) 长名路径（如 "lib/libtest.so"）
+ * 同时保留 8.3 短名（补空格）和原始长名传给 fat32_find_in_dir。
  * out_data: 返回在 g_dsk_fat32_filedata 中的文件数据指针。
  * out_size: 返回文件大小。
  * 返回 0 成功。 */
@@ -419,15 +458,19 @@ int fat32_read_path(const char *path, u8 **out_data, u32 *out_size) {
     u32 cur_clus = bpb->root_cluster;  /* 从根目录开始 */
 
     while (pos < path_len) {
-        /* 提取一个路径组件（到下一个 '/' 或结尾） */
-        char comp[12];  /* 11 字符 8.3 名 + \0 */
-        u32 ci = 0;
-        while (pos < path_len && path[pos] != '/' && ci < 11) {
-            comp[ci++] = path[pos++];
+        /* 提取一个路径组件（到下一个 '/' 或结尾），同时保留原始串用于 LFN 匹配 */
+        char comp[12];   /* 11 字符 8.3 名 + \0 */
+        char orig[260];  /* 原始长名 */
+        u32 ci = 0, oi = 0;
+        while (pos < path_len && path[pos] != '/') {
+            if (ci < 11) comp[ci++] = path[pos];
+            if (oi + 1 < sizeof(orig)) orig[oi++] = path[pos];
+            pos++;
         }
         /* 不足 11 字符则补空格 */
         while (ci < 11) comp[ci++] = ' ';
         comp[11] = 0;
+        orig[oi] = 0;
 
         /* 跳过 '/' */
         if (pos < path_len && path[pos] == '/') pos++;
@@ -438,7 +481,8 @@ int fat32_read_path(const char *path, u8 **out_data, u32 *out_size) {
         if (is_last) {
             /* 最后一级：查找文件 */
             u32 found_clus = 0, found_size = 0;
-            int rc = fat32_find_in_dir(cur_clus, comp, 0, &found_clus, &found_size);
+            int rc = fat32_find_in_dir(cur_clus, comp, 0, &found_clus, &found_size,
+                                        (oi > 0 && oi != 11) ? orig : 0);
             if (rc != 0) return -4;
 
             if (found_size > sizeof(g_dsk_fat32_filedata)) return -5;
@@ -466,7 +510,8 @@ int fat32_read_path(const char *path, u8 **out_data, u32 *out_size) {
         } else {
             /* 中间级：查找子目录 */
             u32 sub_clus = 0, sub_size = 0;
-            int rc = fat32_find_in_dir(cur_clus, comp, 1, &sub_clus, &sub_size);
+            int rc = fat32_find_in_dir(cur_clus, comp, 1, &sub_clus, &sub_size,
+                                        (oi > 0 && oi != 11) ? orig : 0);
             if (rc != 0) return -7;
             cur_clus = sub_clus;
         }

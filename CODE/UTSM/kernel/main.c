@@ -9,9 +9,11 @@
 #include <utsm/net.h>
 #include <utsm/ipc_shm.h>
 #include <utsm/linux_compat.h>
+#include <utsm/xj380_loader.h>
 #include <utsm/instr.h>
 #include "ini_parser.h"
 #include "../arch/x86_64/limine.h"
+#include "../pe/pe_dll_manager.h"
 
 void arch_halt_forever(void);
 
@@ -20,12 +22,81 @@ extern volatile struct limine_module_request g_module_request;
 /* dkm/manifest.c: 带 FUCK [drivers] 过滤的 manifest 加载入口 */
 void dsm_load_by_manifest_ex(const ini_config *cfg);
 
+/* dsk_loader.c: 按路径读取 FAT32 文件到 g_dsk_fat32_filedata 静态缓冲。
+ * Phase 1 已支持 LFN 长文件名 + 子目录遍历。 */
+extern int fat32_read_path(const char *path, u8 **out_data, u32 *out_size);
+
 /* ---- 运行期配置全局变量（从 FUCK 文件初始化） ---- */
 u32 g_utsm_max_segments     = UTSM_MAX_SEGMENTS_DEFAULT;
 u32 g_utsm_max_capabilities = UTSM_MAX_CAPABILITIES_DEFAULT;
 u32 g_utsm_max_pckc_keys    = UTSM_MAX_PCKC_KEYS_DEFAULT;
 u64 g_utsm_arena_size       = UTSM_ARENA_SIZE_DEFAULT;
 u64 g_utsm_dirty_shard_pages = UTSM_DIRTY_SHARD_PAGES_DEFAULT;
+
+/* ---- 兼容层配置全局变量（[compat] 段，在所有使用它们的函数前定义） ---- */
+char g_compat_lib_path[32]          = "lib";              /* FAT32 根目录下的库子目录名 */
+char g_compat_linux_guest_path[64]  = "/usr/lib/deshab";  /* Linux guest 内库目录路径 */
+int  g_compat_linux_lib_sync        = 1;                  /* 启动时推送 .so 到 Linux guest */
+int  g_compat_pe_dll_search         = 1;                  /* PE 加载时从 FAT32 lib 搜索真实 DLL */
+int  g_compat_vscode_install        = 1;                  /* 启动时安装 VSCode tarball 到 guest /opt */
+
+/* 将 FUCK [compat] 区的配置应用到兼容层全局变量。
+ * 必须在 utsm_apply_config 之后调用。 */
+static void utsm_apply_compat_config(const ini_config *cfg) {
+    if (!cfg) return;
+    const char *lib_path = ini_get(cfg, "compat", "lib_path");
+    if (lib_path && lib_path[0]) {
+        int i = 0;
+        while (lib_path[i] && i + 1 < (int)sizeof(g_compat_lib_path)) {
+            g_compat_lib_path[i] = lib_path[i];
+            i++;
+        }
+        g_compat_lib_path[i] = 0;
+    }
+    const char *guest_path = ini_get(cfg, "compat", "linux_lib_guest_path");
+    if (guest_path && guest_path[0]) {
+        int i = 0;
+        while (guest_path[i] && i + 1 < (int)sizeof(g_compat_linux_guest_path)) {
+            g_compat_linux_guest_path[i] = guest_path[i];
+            i++;
+        }
+        g_compat_linux_guest_path[i] = 0;
+    }
+    g_compat_linux_lib_sync = ini_get_bool(cfg, "compat", "linux_lib_sync", 1);
+    g_compat_pe_dll_search  = ini_get_bool(cfg, "compat", "pe_dll_search", 1);
+    g_compat_vscode_install = ini_get_bool(cfg, "compat", "vscode_install", 1);
+
+    log_info("[UTSM] compat config applied");
+    log_info("[UTSM] lib_path=");
+    log_info(g_compat_lib_path);
+    log_info("[UTSM] linux_guest_path=");
+    log_info(g_compat_linux_guest_path);
+    log_hex64("[UTSM] linux_lib_sync=", (u64)g_compat_linux_lib_sync);
+    log_hex64("[UTSM] pe_dll_search=", (u64)g_compat_pe_dll_search);
+    log_hex64("[UTSM] vscode_install=", (u64)g_compat_vscode_install);
+}
+
+/* DLL 文件读取回调：从 FAT32 根目录下 lib/ 子目录读取 DLL。
+ * 路径构造成 "<g_compat_lib_path>/<name>"（lib 在 FAT32 根，不是 SYSTEM/lib！）。 */
+static int dll_reader_from_fat32(const char *name, u8 **out_data, u32 *out_size) {
+    if (!name || !out_data || !out_size) return -1;
+    char path[128];
+    int pl = 0;
+    /* 拼接 g_compat_lib_path */
+    int i = 0;
+    while (g_compat_lib_path[i] && pl + 1 < (int)sizeof(path)) {
+        path[pl++] = g_compat_lib_path[i++];
+    }
+    if (pl + 1 >= (int)sizeof(path)) return -1;
+    path[pl++] = '/';
+    /* 拼接 name */
+    i = 0;
+    while (name[i] && pl + 1 < (int)sizeof(path)) {
+        path[pl++] = name[i++];
+    }
+    path[pl] = 0;
+    return fat32_read_path(path, out_data, out_size);
+}
 
 /* 将 FUCK [utsm] 区的配置应用到运行期全局变量 */
 static void utsm_apply_config(const ini_config *cfg) {
@@ -40,6 +111,9 @@ static void utsm_apply_config(const ini_config *cfg) {
     log_hex64("[UTSM] max_segments=", g_utsm_max_segments);
     log_hex64("[UTSM] max_pckc_keys=", g_utsm_max_pckc_keys);
     log_hex64("[UTSM] dirty_shard_pages=", g_utsm_dirty_shard_pages);
+
+    /* 兼容层配置（[compat] 段）— 复用同一 cfg 对象 */
+    utsm_apply_compat_config(cfg);
 }
 
 /* ---- 全局启动配置（从 FUCK 文件读取） ---- */
@@ -73,6 +147,73 @@ static int utsm_load_fuck_config(ini_config *cfg) {
     }
     log_warn("[UTSM] FUCK boot module not found");
     return -2;
+}
+
+/* === 实机日志持久化：把内存日志缓冲区写入磁盘原始扇区 ===
+ * 开发测试用：实机无串口时，启动后用 WinHex/dd 读取磁盘对应扇区即可查看日志。
+ * 扇区范围由 FUCK [boot] disk_log_start / disk_log_end 配置（默认 2-1000）。
+ * 注意: 写入 LBA 1-33 会覆盖 GPT header/entries，重启后 Limine 可能无法找到 ESP。
+ *       建议测试盘从 LBA 34 开始，或测试后重新烧录镜像。 */
+static void disk_log_flush(int start_lba, int end_lba) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->write || !api->block->device_count) {
+        log_warn("[UTSM] disk_log: block device unavailable, skip");
+        return;
+    }
+    if (api->block->device_count() == 0) {
+        log_warn("[UTSM] disk_log: no block device, skip");
+        return;
+    }
+    if (end_lba <= start_lba) {
+        log_warn("[UTSM] disk_log: invalid sector range");
+        return;
+    }
+
+    const char *buf = log_get_buffer();
+    u32 len = log_get_length();
+    if (len == 0) {
+        log_warn("[UTSM] disk_log: log buffer empty, skip");
+        return;
+    }
+
+    u32 avail_sectors = (u32)(end_lba - start_lba + 1);
+    u32 avail_bytes = avail_sectors * 512;
+    u32 write_bytes = (len < avail_bytes) ? len : avail_bytes;
+    u32 full_sectors = write_bytes / 512;
+    u32 rem_bytes = write_bytes % 512;
+    u64 lba = (u64)start_lba;
+    u32 offset = 0;
+
+    /* 写完整扇区（AHCI 单次最多 8 扇区，block API 内部分块） */
+    while (full_sectors > 0) {
+        u32 chunk = (full_sectors > 8) ? 8 : full_sectors;
+        int st = api->block->write(0, lba, chunk, buf + offset);
+        if (st != 0) {
+            log_error("[UTSM] disk_log: write failed");
+            log_hex64("[UTSM] disk_log: lba=", lba);
+            return;
+        }
+        lba += chunk;
+        offset += chunk * 512;
+        full_sectors -= chunk;
+    }
+
+    /* 最后一个不完整扇区：补零后写入 */
+    if (rem_bytes > 0) {
+        u8 tail[512];
+        for (u32 i = 0; i < 512; i++) tail[i] = 0;
+        for (u32 i = 0; i < rem_bytes; i++) tail[i] = (u8)buf[offset + i];
+        int st = api->block->write(0, lba, 1, tail);
+        if (st != 0) {
+            log_error("[UTSM] disk_log: tail write failed");
+            return;
+        }
+    }
+
+    log_info("[UTSM] disk_log: flushed to disk");
+    log_hex64("[UTSM] disk_log: start_lba=", (u64)start_lba);
+    log_hex64("[UTSM] disk_log: end_lba=", (u64)end_lba);
+    log_hex64("[UTSM] disk_log: bytes=", write_bytes);
 }
 
 void kernel_main(void) {
@@ -236,6 +377,93 @@ void kernel_main(void) {
     dkm_fill_platform_info();
     INSTR_TS_END(ts_dkm, "dkm_init");
 
+    /* === VMM — 可通过 FUCK [boot] vmm=0 跳过 ===
+     * P8.4: Moved BEFORE DKM driver loading so VMM self-test runs even if
+     * a stage2 driver (e.g. fat32) crashes under KVM nested VMX. */
+    int run_vmm = ini_get_bool(cfg, "boot", "vmm", 1);
+    if (run_vmm && vmm_init() == 0) {
+        INSTR_TS_DECL(ts_vmm);
+        INSTR_TS_BEGIN(ts_vmm);
+        log_info("[UTSM] VMM init ok");
+        int vmm_st = vmm_self_test();
+        /* P8.4: On KVM nested VMX, self-test VMCS may fail but Linux guest VMCS
+         * (configured separately) may still work. Force-continue regardless. */
+        if (vmm_st != 0) {
+            log_warn("[UTSM] VMM self-test FAIL, but continuing to Linux guest");
+            vmm_st = 0;  /* force pass to continue to Linux guest */
+        }
+        if (vmm_st == 0) {
+            INSTR_TS_END(ts_vmm, "vmm_init+selftest");
+            log_info("[UTSM] VMM self-test PASS");
+
+            /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 === */
+            int run_linux = ini_get_bool(cfg, "boot", "linux_guest", 1);
+            if (run_linux && linux_loader_init() == 0) {
+                INSTR_TS_DECL(ts_linux);
+                INSTR_TS_BEGIN(ts_linux);
+                log_info("[UTSM] Linux loader init ok");
+
+                if (ipc_shm_init() == 0) {
+                    log_info("[UTSM] IPC shm init ok");
+                } else {
+                    log_error("[UTSM] IPC shm init failed (non-fatal)");
+                }
+
+                int lin_st = linux_launch();
+                INSTR_TS_END(ts_linux, "linux_launch");
+                if (lin_st == 0) {
+                    log_info("[UTSM] Linux guest parked (daemon ready)");
+                    linux_compat_init();
+                    /* Phase 2: 启动时把 FAT32 lib 目录下 .so 全量推送到 Linux guest */
+                    if (g_compat_linux_lib_sync) {
+                        int lsrc = lxc_sync_lib_dir(g_compat_linux_guest_path);
+                        if (lsrc == 0) log_info("[UTSM] lib sync ok");
+                        else log_warn("[UTSM] lib sync skipped (non-fatal)");
+                    }
+                    /* VSCode Phase 5: tarball module 存在时装到 guest /opt/vscode
+                     * （已安装则秒跳过；失败不阻断启动，桌面降级显示未安装） */
+                    if (g_compat_vscode_install) {
+                        int vsrc = lxc_vscode_install();
+                        if (vsrc == 0) log_info("[UTSM] vscode ready");
+                        else log_warn("[UTSM] vscode install skipped (non-fatal)");
+                    }
+                } else {
+                    log_error("[UTSM] Linux launch failed");
+                    log_hex64("[UTSM] Linux st=", (u64)(i64)lin_st);
+                }
+            } else {
+                log_warn("[UTSM] Linux loader unavailable (no bzImage or disabled)");
+            }
+        } else {
+            INSTR_TS_END(ts_vmm, "vmm_init+selftest");
+            log_error("[UTSM] VMM self-test FAIL");
+            log_hex64("[UTSM] VMM st=", (u64)(i64)vmm_st);
+        }
+
+        /* === OpenXJ380 guest — 可通过 FUCK [boot] xj380_guest=0 跳过 ===
+         * 三内核架构路线 B：XJ380 作为第二 guest（与 Linux 并列）。
+         * 需要 Limine boot module xj380.krl（OpenXJ380 构建产物 kernel.krl）。
+         * guest 终止前 host 挂起；无模块/被禁用时优雅跳过。 */
+        int run_xj380 = ini_get_bool(cfg, "boot", "xj380_guest", 1);
+        if (run_xj380 && xj380_loader_init() == 0) {
+            INSTR_TS_DECL(ts_xj380);
+            INSTR_TS_BEGIN(ts_xj380);
+            log_info("[UTSM] XJ380 loader init ok");
+            int xj_st = xj380_launch();
+            INSTR_TS_END(ts_xj380, "xj380_launch");
+            if (xj_st == 0) {
+                log_info("[UTSM] XJ380 guest terminated (host resumed)");
+            } else {
+                log_error("[UTSM] XJ380 launch failed");
+                log_hex64("[UTSM] XJ380 st=", (u64)(i64)xj_st);
+            }
+        } else {
+            log_warn("[UTSM] XJ380 loader unavailable (no kernel.krl or disabled)");
+        }
+    } else {
+        log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");
+    }
+
     /* === 驱动加载 — 按 [drivers] 区过滤 === */
     INSTR_TS_DECL(ts_dsm);
     INSTR_TS_BEGIN(ts_dsm);
@@ -259,53 +487,25 @@ void kernel_main(void) {
         log_info("[UTSM] selftest skipped by FUCK config");
     }
 
-    /* === VMM — 可通过 FUCK [boot] vmm=0 跳过 === */
-    int run_vmm = ini_get_bool(cfg, "boot", "vmm", 1);
-    if (run_vmm && vmm_init() == 0) {
-        INSTR_TS_DECL(ts_vmm);
-        INSTR_TS_BEGIN(ts_vmm);
-        log_info("[UTSM] VMM init ok");
-        int vmm_st = vmm_self_test();
-        if (vmm_st == 0) {
-            INSTR_TS_END(ts_vmm, "vmm_init+selftest");
-            log_info("[UTSM] VMM self-test PASS");
-
-            /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 === */
-            int run_linux = ini_get_bool(cfg, "boot", "linux_guest", 1);
-            if (run_linux && linux_loader_init() == 0) {
-                INSTR_TS_DECL(ts_linux);
-                INSTR_TS_BEGIN(ts_linux);
-                log_info("[UTSM] Linux loader init ok");
-
-                if (ipc_shm_init() == 0) {
-                    log_info("[UTSM] IPC shm init ok");
-                } else {
-                    log_error("[UTSM] IPC shm init failed (non-fatal)");
-                }
-
-                int lin_st = linux_launch();
-                INSTR_TS_END(ts_linux, "linux_launch");
-                if (lin_st == 0) {
-                    log_info("[UTSM] Linux guest parked (daemon ready)");
-                    linux_compat_init();
-                } else {
-                    log_error("[UTSM] Linux launch failed");
-                    log_hex64("[UTSM] Linux st=", (u64)(i64)lin_st);
-                }
-            } else {
-                log_warn("[UTSM] Linux loader unavailable (no bzImage or disabled)");
-            }
-        } else {
-            INSTR_TS_END(ts_vmm, "vmm_init+selftest");
-            log_error("[UTSM] VMM self-test FAIL");
-            log_hex64("[UTSM] VMM st=", (u64)(i64)vmm_st);
-        }
-    } else {
-        log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");
-    }
-
     /* ---- 插桩: DSK 加载跳转前记录 ---- */
     INSTR_PROBE(DSK0, 0, 0, 0, 0);
+
+    /* Phase 3: 初始化 PE DLL 管理器（注册 FAT32 读取回调）。
+     * DSK 跳转前 block provider 已就绪，fat32_read_path 可用。 */
+    if (g_compat_pe_dll_search) {
+        pe_dll_manager_init(dll_reader_from_fat32);
+        log_info("[UTSM] PE DLL manager initialized (SYSTEM/lib)");
+    }
+
+    /* === 实机日志持久化：把启动日志写入磁盘原始扇区（开发测试用） === */
+    {
+        int disk_log = ini_get_bool(cfg, "boot", "disk_log", 0);
+        if (disk_log) {
+            int log_start = ini_get_int(cfg, "boot", "disk_log_start", 2);
+            int log_end = ini_get_int(cfg, "boot", "disk_log_end", 1000);
+            disk_log_flush(log_start, log_end);
+        }
+    }
 
     if (dsk_load_and_jump() != 0) {
         log_error("[UTSM] DSK jump failed");

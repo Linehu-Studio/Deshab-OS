@@ -82,6 +82,7 @@ static net_device_count_fn g_net_device_count;
 static net_device_info_fn g_net_device_info;
 static net_tx_fn g_net_tx;
 static net_rx_poll_fn g_net_rx_poll;
+static const dsk_boot_context *g_ctx;
 static u8 g_disk[131072];
 static u8 g_cluster[4096];
 static char g_conf[4096];
@@ -153,6 +154,7 @@ typedef struct {
     char name[64];
     char password[64];
     char ip[16];
+    char gateway[16];
     char dns[16];
 } net_conf;
 
@@ -163,10 +165,30 @@ static void copy_value(char *dst, u32 cap, const char *src, u32 len) {
     dst[n]=0;
 }
 
+/* 解析 "a.b.c.d" → 网络序 u32（10.0.2.15 = 0x0A00020F）。返回 0 成功。 */
+static int nm_parse_ip(const char *s, u32 *out) {
+    u32 v = 0;
+    for (int part = 0; part < 4; part++) {
+        u32 n = 0; int digits = 0;
+        while (*s >= '0' && *s <= '9') {
+            n = n * 10 + (u32)(*s - '0');
+            if (n > 255) return -1;
+            s++; digits++;
+        }
+        if (!digits) return -1;
+        v = (v << 8) | n;
+        if (part < 3) { if (*s != '.') return -1; s++; }
+    }
+    if (*s) return -1;
+    *out = v;
+    return 0;
+}
+
 static void parse_conf(const char *txt, net_conf *cfg) {
     copy_value(cfg->mode, sizeof(cfg->mode), "dhcp", 4);
     copy_value(cfg->device, sizeof(cfg->device), "auto", 4);
     copy_value(cfg->ip, sizeof(cfg->ip), "dhcp", 4);
+    copy_value(cfg->gateway, sizeof(cfg->gateway), "auto", 4);
     copy_value(cfg->dns, sizeof(cfg->dns), "auto", 4);
     cfg->name[0]=0; cfg->password[0]=0;
     const char *p = txt;
@@ -185,6 +207,7 @@ static void parse_conf(const char *txt, net_conf *cfg) {
             else if (klen==12 && streqn(line,"network.name",12)) copy_value(cfg->name,sizeof(cfg->name),v,vlen);
             else if (klen==16 && streqn(line,"network.password",16)) copy_value(cfg->password,sizeof(cfg->password),v,vlen);
             else if (klen==10 && streqn(line,"network.ip",10)) copy_value(cfg->ip,sizeof(cfg->ip),v,vlen);
+            else if (klen==15 && streqn(line,"network.gateway",15)) copy_value(cfg->gateway,sizeof(cfg->gateway),v,vlen);
             else if (klen==11 && streqn(line,"network.dns",11)) copy_value(cfg->dns,sizeof(cfg->dns),v,vlen);
         }
         p += len;
@@ -198,6 +221,7 @@ static void log_cfg(const net_conf *cfg) {
     swrite("[netman] device="); logl(cfg->device);
     swrite("[netman] name="); logl(cfg->name[0] ? cfg->name : "<empty>");
     swrite("[netman] ip="); logl(cfg->ip);
+    swrite("[netman] gateway="); logl(cfg->gateway);
     swrite("[netman] dns="); logl(cfg->dns);
     u32 pwlen=0; while(cfg->password[pwlen]) pwlen++;
     log_hex("[netman] password length=", pwlen);
@@ -598,18 +622,79 @@ static int dns_query_a(u32 index, const u8 dst_mac[6], u32 dns_ip, const char *n
     return -2;
 }
 
-static int network_full_connect(u32 index, const u8 mac[6]) {
-    int rc = dhcp_run(index, mac);
-    log_hex("[netman] DHCP final rc=", (u64)(i8)rc);
-    if (rc != 0) return rc;
+/* 将当前租约发布到 boot context（reserved[7] 指向 DSK 持有的 net_lease_info）。
+ * DHCP ACK 或静态配置确定后立即调用，保证后续 ARP/DNS 自验失败时
+ * 用户态工具（ping/curl/browser）仍能拿到可用 IP 配置。 */
+static void lease_publish(int is_static) {
+    if (!g_ctx) return;
+    u64 ptr = g_ctx->reserved[7];
+    if (!ptr) { logl("[netman] lease: reserved[7] empty (DSK too old?)"); return; }
+    net_lease_info *li = (net_lease_info *)ptr;
+    if (li->magic != NET_LEASE_MAGIC) { logl("[netman] lease: bad buffer magic"); return; }
+    li->ip = g_lease_ip;
+    li->gateway = g_gateway_ip;
+    li->dns = g_dns_ip;
+    li->server = g_server_ip;
+    li->flags = NET_LEASE_F_VALID | (is_static ? NET_LEASE_F_STATIC : 0u);
+    logl("[netman] lease published to boot context");
+}
+
+static int network_full_connect(u32 index, const u8 mac[6], const net_conf *cfg) {
+    /* 静态模式判定：mode=static，或 network.ip 为点分 IP（区别于 dhcp/auto） */
+    int use_static = 0;
+    u32 sip = 0;
+    if (cfg) {
+        if (str_eq(cfg->mode, "static")) use_static = 1;
+        if (nm_parse_ip(cfg->ip, &sip) == 0) use_static = 1;
+    }
+    if (use_static) {
+        if (nm_parse_ip(cfg->ip, &sip) != 0) {
+            logl("[netman] static mode but network.ip invalid");
+            return -10;
+        }
+        for (int i=0;i<6;i++) g_local_mac[i]=mac[i];
+        g_lease_ip = sip;
+        g_server_ip = 0;
+        u32 gw = 0;
+        if (nm_parse_ip(cfg->gateway, &gw) != 0) gw = (sip & 0xFFFFFF00u) | 0x02u; /* 约定 x.x.x.2 */
+        g_gateway_ip = gw;
+        u32 dn = 0;
+        if (nm_parse_ip(cfg->dns, &dn) != 0) dn = gw;
+        g_dns_ip = dn;
+        log_ipv4("[netman] static ip=", g_lease_ip);
+        log_ipv4("[netman] static gateway=", g_gateway_ip);
+        log_ipv4("[netman] static dns=", g_dns_ip);
+        lease_publish(1);
+    } else {
+        int rc = dhcp_run(index, mac);
+        log_hex("[netman] DHCP final rc=", (u64)(i8)rc);
+        if (rc != 0) return rc;
+        lease_publish(0);
+    }
+    /* ARP 解析网关 + DNS 查询自验（静态/DHCP 共用） */
     u8 gw_mac[6];
-    rc = arp_resolve_gateway(index, g_gateway_ip, gw_mac);
+    int rc = arp_resolve_gateway(index, g_gateway_ip, gw_mac);
     log_hex("[netman] ARP final rc=", (u64)(i8)rc);
     if (rc != 0) return rc;
     u32 resolved=0;
     rc = dns_query_a(index, gw_mac, g_dns_ip, "example.com", &resolved);
     log_hex("[netman] DNS final rc=", (u64)(i8)rc);
     return rc;
+}
+
+/* 检查设备名是否匹配配置的 device 字段。
+ * "auto" 或空匹配任意设备；否则精确匹配或前缀匹配（如 "e1000" 匹配 "e1000_0"）。 */
+static int device_match(const char *configured, const char *actual) {
+    if (!configured || !configured[0]) return 1;
+    if (str_eq(configured, "auto")) return 1;
+    if (!actual) return 0;
+    if (str_eq(configured, actual)) return 1;
+    /* 前缀匹配 */
+    int i;
+    for (i = 0; configured[i]; i++) {
+        if (configured[i] != actual[i]) return 0;
+    }
+    return 1;
 }
 
 static void query_netdevs(const net_conf *cfg) {
@@ -619,9 +704,13 @@ static void query_netdevs(const net_conf *cfg) {
     }
 
     u32 count = g_net_device_count();
-    int dhcp_done = 0;
-    int dhcp_enabled = cfg && !str_eq(cfg->mode, "disabled") && !str_eq(cfg->mode, "off") && !str_eq(cfg->ip, "static");
+    int net_done = 0;
+    int net_enabled = cfg && !str_eq(cfg->mode, "disabled") && !str_eq(cfg->mode, "off");
+    int has_dev_filter = cfg && cfg->device[0] && !str_eq(cfg->device, "auto");
     log_hex("[netman] netdev_count=", count);
+    if (has_dev_filter) {
+        swrite("[netman] device filter: "); logl(cfg->device);
+    }
     for (u32 i=0;i<count;i++) {
         nm_net_device_info info;
         memset_nm(&info, 0, sizeof(info));
@@ -642,21 +731,32 @@ static void query_netdevs(const net_conf *cfg) {
         if (info.flags & DKM_NET_F_TX_READY) logl("[netman]   tx=ready");
         if (info.flags & DKM_NET_F_RX_READY) logl("[netman]   rx=ready");
 
-        if (!dhcp_done && dhcp_enabled &&
+        /* 设备名过滤：配置了特定设备时跳过不匹配的设备 */
+        if (has_dev_filter && !device_match(cfg->device, info.name)) {
+            swrite("[netman]   skipped (device filter: ");
+            swrite(cfg->device);
+            logl(")");
+            continue;
+        }
+
+        if (!net_done && net_enabled &&
             (info.flags & (DKM_NET_F_LINK_UP|DKM_NET_F_TX_READY|DKM_NET_F_RX_READY))
             == (DKM_NET_F_LINK_UP|DKM_NET_F_TX_READY|DKM_NET_F_RX_READY)) {
-            int drc = network_full_connect(i, info.mac);
+            int drc = network_full_connect(i, info.mac, cfg);
             log_hex("[netman] network final rc=", (u64)(i8)drc);
-            dhcp_done = 1;
+            net_done = 1;
         }
     }
-    if (!dhcp_enabled) logl("[netman] DHCP skipped by config");
+    if (!net_enabled) logl("[netman] networking disabled by config");
+    if (has_dev_filter && !net_done && net_enabled)
+        logl("[netman] no matching device found for configured device filter");
 }
 
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     logl("[netman] boot");
     if (!ctx || ctx->magic != DSK_BOOT_MAGIC) { logl("[netman] bad context"); return; }
+    g_ctx = ctx;
     logl("[netman] calibrating TSC (实机 CPU 频率计算)");
     tsc_calibrate_nm();
     u64 api = ctx->dkm_kernel_api;

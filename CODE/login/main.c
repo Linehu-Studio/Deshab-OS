@@ -577,6 +577,123 @@ static int verify_password(const u8 *conf_buf, u32 conf_size, const char *passwo
     return 0;
 }
 
+/* ---- P8.2 Fix: PS/2 鼠标初始化（login 进入前 mouseInit 可能未运行） ----
+ * release 版 is_first=0 路径中 DSK 不加载 mouseInit，login 需自行初始化鼠标
+ * 端口轮询方能工作。与 mouseInit 同样的命令序列，但去掉 IRQ12 注册
+ * （login 全程 cli，无需中断驱动）。单步失败只记日志，不阻塞登录。 */
+#define PS2_DATA    0x60
+#define PS2_STATUS  0x64
+#define PS2_CMD     0x64
+#define PS2_ST_OBF  0x01
+#define PS2_ST_IBF  0x02
+#define PS2_CMD_READ_CFG   0x20
+#define PS2_CMD_WRITE_CFG  0x60
+#define PS2_CMD_ENABLE_AUX 0xA8
+#define PS2_CMD_TO_MOUSE   0xD4
+#define MOUSE_CMD_RESET    0xFF
+#define MOUSE_CMD_DEFAULTS 0xF6
+#define MOUSE_CMD_RATE     0xF3
+#define MOUSE_CMD_RESOL    0xE8
+#define MOUSE_CMD_ENABLE   0xF4
+#define MOUSE_ACK          0xFA
+#define PS2_TIMEOUT 100000u
+
+static int ps2_wait_write(void) {
+    for (u32 t = 0; t < PS2_TIMEOUT; t++) {
+        if (!(inb(PS2_STATUS) & PS2_ST_IBF)) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+static int ps2_wait_read(void) {
+    for (u32 t = 0; t < PS2_TIMEOUT; t++) {
+        if (inb(PS2_STATUS) & PS2_ST_OBF) return 0;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+static void ps2_drain(void) {
+    for (int i = 0; i < 16; i++) {
+        if (!(inb(PS2_STATUS) & PS2_ST_OBF)) break;
+        inb(PS2_DATA);
+    }
+}
+static int ps2_cmd(u8 cmd) {
+    if (ps2_wait_write() != 0) return -1;
+    outb(PS2_CMD, cmd);
+    return 0;
+}
+static int mouse_cmd(u8 cmd) {
+    if (ps2_cmd(PS2_CMD_TO_MOUSE) != 0) return -1;
+    if (ps2_wait_write() != 0) return -2;
+    outb(PS2_DATA, cmd);
+    if (ps2_wait_read() != 0) return -3;
+    return inb(PS2_DATA) == MOUSE_ACK ? 0 : -4;
+}
+static int mouse_cmd_param(u8 cmd, u8 param) {
+    int rc = mouse_cmd(cmd);
+    if (rc != 0) return rc;
+    if (ps2_cmd(PS2_CMD_TO_MOUSE) != 0) return -5;
+    if (ps2_wait_write() != 0) return -6;
+    outb(PS2_DATA, param);
+    if (ps2_wait_read() != 0) return -7;
+    return inb(PS2_DATA) == MOUSE_ACK ? 0 : -8;
+}
+static void login_mouse_init(void) {
+    logl("[login] mouse init begin");
+
+    /* 1. 冲刷残留 */
+    ps2_drain();
+
+    /* 2. 启用 AUX 端口 */
+    {
+        u8 cfg = 0;
+        if (ps2_cmd(PS2_CMD_READ_CFG) == 0 && ps2_wait_read() == 0) {
+            cfg = inb(PS2_DATA);
+            cfg &= (u8)~0x20u;                 /* bit5=0: 启用 AUX 时钟 */
+            cfg |= 0x02u | 0x40u;              /* bit1=AUX IRQ, bit6=翻译 */
+            if (ps2_cmd(PS2_CMD_WRITE_CFG) == 0 && ps2_wait_write() == 0) {
+                outb(PS2_DATA, cfg);
+                logl("[login] cfg byte written");
+            } else {
+                logl("[login] cfg write failed, continue");
+            }
+        } else {
+            logl("[login] cfg read failed, continue");
+        }
+    }
+
+    /* 3. 启用 AUX 端口 */
+    if (ps2_cmd(PS2_CMD_ENABLE_AUX) != 0)
+        logl("[login] enable AUX timeout, continue");
+
+    /* 4. 复位鼠标 + drain 应答 */
+    {
+        int rc = mouse_cmd(MOUSE_CMD_RESET);
+        if (rc != 0) logl("[login] reset failed, continue");
+        for (int i = 0; i < 8; i++) {
+            if (ps2_wait_read() != 0) break;
+            inb(PS2_DATA);
+        }
+    }
+
+    /* 5-8. Set Defaults -> 采样率 100 -> 分辨率 2 -> 启用数据报告 */
+    {
+        int rc;
+        rc = mouse_cmd(MOUSE_CMD_DEFAULTS);
+        if (rc != 0) logl("[login] set defaults failed, continue");
+        rc = mouse_cmd_param(MOUSE_CMD_RATE, 100);
+        if (rc != 0) logl("[login] sample rate failed, continue");
+        rc = mouse_cmd_param(MOUSE_CMD_RESOL, 2);
+        if (rc != 0) logl("[login] resolution failed, continue");
+        rc = mouse_cmd(MOUSE_CMD_ENABLE);
+        if (rc != 0) logl("[login] enable reporting failed, continue");
+        else logl("[login] mouse data reporting enabled");
+    }
+
+    logl("[login] mouse init complete");
+}
+
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
@@ -591,6 +708,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     logl("[login] calibrating TSC");
     tsc_calibrate_fi();
+
+    /* P8.2 Fix: 确保 PS/2 鼠标已初始化（非首次启动时 DSK 不加载 mouseInit） */
+    login_mouse_init();
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         logl("[login] bad context");
@@ -683,8 +803,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
         u8 st = inb(0x64);
         if (!(st & 1)) { __asm__("pause"); continue; }
-        /* 跳过鼠标数据（由 ps2_mouse_poll 处理） */
-        if (st & 0x20) { inb(0x60); continue; }
+        /* 鼠标数据留给 ps2_mouse_poll 读取，不消费不丢弃 */
+        if (st & 0x20) { __asm__("pause"); continue; }
         u8 data = inb(0x60);
 
         u8 sc = data;

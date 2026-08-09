@@ -1,0 +1,35 @@
+# Deshab SDK 应用 MAKEFILE 模板
+#
+# 由 scaffold/new-module.ps1 生成时自动替换:
+#   {{MODULE_NAME}}  -> 模块名 (如 myapp)
+#   {{SDK_INC}}      -> SDK include 目录相对路径 (如 ../../sdk/include)
+#   {{OUT_DIR}}      -> 输出目录相对路径 (如 $(ROOT)/SYSTEM/system/deshab64/tools)
+#   {{BITMAPS}}      -> ascii_bitmaps.c 相对路径 (如 ../../firstInit/ascii_bitmaps.c)
+#
+# 手动使用时替换上述占位符。
+
+CC := clang
+LD := ld.lld
+
+ROOT := ../../..
+OUT := {{OUT_DIR}}/{{MODULE_NAME}}.elf
+
+CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I{{SDK_INC}} -O2
+LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
+
+C_SOURCES := main.c
+OBJECTS := $(C_SOURCES:.c=.o)
+
+.PHONY: all clean
+
+all: $(OUT)
+
+$(OUT): $(OBJECTS) linker.ld
+	@mkdir -p "$(dir $(OUT))"
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	powershell -NoProfile -Command "Get-ChildItem -Path . -Recurse -Filter *.o | Remove-Item -Force; if (Test-Path '$(OUT)') { Remove-Item '$(OUT)' -Force }"

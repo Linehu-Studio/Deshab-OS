@@ -60,12 +60,16 @@ static void log_exit_diagnostics(u64 reason, u64 qualification, u64 rip, u64 len
  * - Linux guest：park（推进 RIP 越过 HLT，exit-to-host，设 g_guest_parked=1）
  *   host 调用 linux_resume() 时 vmresume 唤醒 guest 从 HLT 之后继续执行。 */
 static int handle_hlt(u64 rip, u64 instr_len, int *out_resume) {
-    *out_resume = 0;   /* 两种情况都 exit-to-host */
+    *out_resume = 0;   /* 三种情况默认 exit-to-host */
     if (g_linux_guest_active) {
         /* Linux guest: park — 推进 RIP 越过 HLT 指令 */
         vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
         g_guest_parked = 1;
         log_info("[VMEXIT] HLT - Linux guest parked");
+    } else if (g_xj380_guest_active) {
+        /* OpenXJ380 guest: 推进 RIP 并立即继续执行（不 park 不 terminate） */
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        *out_resume = 1;
     } else {
         /* self-test guest: 终止 */
         log_info("[VMEXIT] HLT - guest halted");
@@ -493,6 +497,7 @@ static void vmexit_before_resume(void) {
     vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum_1ms());
     poll_host_serial_to_guest();
     virtio_net_poll();
+    virtio_input_poll();   /* VSCode Phase 2: drain pending kbd/mouse events */
     pit_tick_update();
     maybe_inject_irq();
 }

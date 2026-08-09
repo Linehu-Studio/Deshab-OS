@@ -48,4 +48,18 @@ int pe_dll_load(const char *dll_name, u64 *out_base);
  * 返回绝对地址，0=未找到。 */
 u64 pe_dll_resolve(const char *dll_name, const char *func_name);
 
+/* 带转发深度的内部变体（转发导出链 A→B→C 递归用，外部勿调）。 */
+u64 pe_dll_resolve_ex(const char *dll_name, const char *func_name, int depth);
+
+/* 在已加载 DLL 的模块基址上解析导出（GetProcAddress 真实 DLL 路径用）。
+ * image_base 必须是 pe_dll_load 返回的基址；func_name 与 ordinal 二选一
+ * （ordinal != 0 时按序号）。返回绝对地址，0=未找到。 */
+u64 pe_dll_resolve_in_base(u64 image_base, const char *func_name, u32 ordinal);
+
+/* 延迟 DllMain 控制（PE32+ 加载期 SSE/大栈未就绪，DllMain 必须延迟）。
+ * pe_service_run 在 pe_load_image 前调 pe_dll_defer_dllmain(1)，
+ * 切换到 1MB PE 大栈后调 pe_dll_run_pending_dllmains() 统一执行。 */
+void pe_dll_defer_dllmain(int enable);
+void pe_dll_run_pending_dllmains(void);
+
 #endif /* PE_DLL_MANAGER_H */

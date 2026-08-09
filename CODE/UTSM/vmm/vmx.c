@@ -33,6 +33,9 @@ static inline u64 read_cr4(void) {
     return v;
 }
 
+static inline void write_cr0(u64 v) {
+    __asm__ volatile("mov %0, %%cr0" :: "r"(v));
+}
 static inline void write_cr4(u64 v) {
     __asm__ volatile("mov %0, %%cr4" :: "r"(v));
 }
@@ -118,6 +121,20 @@ static int vmx_truly_available(void) {
     /* Step 4: Check hypervisor vendor for nested VMX support */
     cpuid(0x40000000, &eax, &ebx, &ecx, &edx);
 
+    /* P8.3 Fix: diagnostic logging of hypervisor vendor */
+    {
+        char hv[13];
+        hv[0] = (char)(ebx & 0xFF); hv[1] = (char)((ebx >> 8) & 0xFF);
+        hv[2] = (char)((ebx >> 16) & 0xFF); hv[3] = (char)((ebx >> 24) & 0xFF);
+        hv[4] = (char)(ecx & 0xFF); hv[5] = (char)((ecx >> 8) & 0xFF);
+        hv[6] = (char)((ecx >> 16) & 0xFF); hv[7] = (char)((ecx >> 24) & 0xFF);
+        hv[8] = (char)(edx & 0xFF); hv[9] = (char)((edx >> 8) & 0xFF);
+        hv[10] = (char)((edx >> 16) & 0xFF); hv[11] = (char)((edx >> 24) & 0xFF);
+        hv[12] = 0;
+        log_info("[VMX] hypervisor vendor: ");
+        log_info(hv);
+    }
+
     /* Check for Hyper-V ("Microsoft Hv") */
     if (ebx == 0x7263694DU && ecx == 0x666F736FU && edx == 0x76482074U) {
         log_info("[VMX] Hyper-V detected");
@@ -140,18 +157,22 @@ static int vmx_truly_available(void) {
         return 0;
     }
 
-    /* Check for KVM ("KVMKVMKVM") */
-    if (ebx == 0x4B4D564BU && ecx == 0x564B4D56U && edx == 0x4D564B4DU) {
-        log_info("[VMX] KVM detected — nested VMX may be available");
-        /* KVM typically supports nested VMX if enabled */
+    /* P8.3 Fix: Check for KVM ("KVMKVMKVM"). Match ebx+ecx only
+     * (edx was wrongly 0x4D564B4D, should be 0x0000004D for "M\0\0\0"). */
+    if (ebx == 0x4B4D564BU && ecx == 0x564B4D56U) {
+        log_info("[VMX] KVM detected - nested VMX may be available");
         return 1;
     }
 
-    /* Unknown hypervisor — be conservative: skip VMX to avoid
-     * fatal exits. The user must explicitly enable nested VMX on
-     * their hypervisor for Linux compat to work. */
-    log_warn("[VMX] unknown hypervisor, VMX may not be truly available");
-    log_warn("[VMX] skipping VMX init to avoid potential fatal exit");
+    /* P8.3 Fix: Unknown hypervisor - try IA32_VMX_BASIC MSR. */
+    {
+        u64 vmx_basic = vmx_read_msr(IA32_VMX_BASIC);
+        if (vmx_basic != 0) {
+            log_info("[VMX] unknown hypervisor but IA32_VMX_BASIC non-zero, attempting");
+            return 1;
+        }
+    }
+    log_warn("[VMX] unknown hypervisor, IA32_VMX_BASIC=0, VMX not available");
     return 0;
 }
 
@@ -191,7 +212,10 @@ int vmx_enable(void) {
     log_hex64("[VMX] CR4=", cr4);
 
     /* 确保 CR0 满足 VMX 要求（这里只读不写，UEFI 已配置好） */
-    (void)vmx_required_cr0();
+    /* P8.3 Fix: ensure CR0 meets VMX requirements before VMXON */
+    u64 cr0 = vmx_required_cr0();
+    write_cr0(cr0);
+    log_hex64("[VMX] CR0=", cr0);
 
     /* 执行 vmxon */
     int err;
@@ -266,6 +290,30 @@ int vmx_vmcs_load(u64 phys) {
     );
     if (err) {
         log_error("[VMX] vmptrld failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* P8.4: VMCLEAR - put VMCS in "clear" state (required before VMLAUNCH). */
+int vmx_vmcs_clear(u64 phys) {
+    int err;
+    __asm__ volatile(
+        "vmclear %1\n"
+        "jnc 1f\n"
+        "jmp 2f\n"
+        "1:\n"
+        "mov $0, %0\n"
+        "jmp 3f\n"
+        "2:\n"
+        "mov $1, %0\n"
+        "3:\n"
+        : "=r"(err)
+        : "m"(phys)
+        : "memory"
+    );
+    if (err) {
+        log_error("[VMX] vmclear failed");
         return -1;
     }
     return 0;

@@ -47,6 +47,8 @@
 #define VIRTIO_ID_NET     1
 #define VIRTIO_ID_BLOCK   2
 #define VIRTIO_ID_CONSOLE 3
+#define VIRTIO_ID_INPUT   18   /* VSCode Phase 2: virtio-input (keyboard/mouse) */
+#define VIRTIO_ID_GPU     16   /* VSCode Phase 3: virtio-gpu 2D */
 
 /* device status bits */
 #define VIRTIO_STATUS_ACKNOWLEDGE 1
@@ -85,6 +87,10 @@ struct virtio_backend {
 
     /* 读取 device config 空间（offset 相对 0x100）。返回 32 位值。 */
     u32 (*read_config)(u32 offset, int width);
+    /* VSCode Phase 2: 写入 device config 空间（offset 相对 0x100）。
+     * virtio-input 用此通道设置 select/subsel 再读结果；其它设备 config
+     * 只读，置 NULL 时框架忽略 config 写。 */
+    void (*write_config)(u32 offset, u32 value);
     /* 通知：guest 写入 QUEUE_NOTIFY，后端处理该队列的请求。 */
     void (*queue_notify)(u32 queue_idx);
     /* 复位设备。 */
@@ -153,13 +159,113 @@ int virtio_queue_get_ptrs(u32 device_id, u32 queue_idx,
  * 由后端在写 used ring 元素后调用，内部做内存屏障。 */
 void virtio_queue_bump_used(struct virtq_used *used, u16 new_idx);
 
+/* VSCode Phase 2: 按 gpa_base 定位队列（用于 device_id 相同的多实例设备，
+ * 如两个 virtio-input：键盘+鼠标同为 VIRTIO_ID_INPUT=18）。
+ * 语义与 virtio_queue_get_ptrs 一致，只是查找键由 device_id 改为 gpa_base。 */
+int virtio_queue_get_ptrs_by_gpa(u64 gpa_base, u32 queue_idx,
+                                 struct virtq_desc **desc_out,
+                                 struct virtq_avail **avail_out,
+                                 struct virtq_used **used_out,
+                                 u32 *queue_num_out);
+
 /* 异步触发设备中断（设置 INTERRUPT_STATUS bit0 并向 guest 注入虚拟 IRQ）。
  * 用于后端在 QUEUE_NOTIFY 上下文之外完成工作（如周期轮询收到 RX 包）。
  * device_id: VIRTIO_ID_*；设备未注册或 irq==0 时为空操作。 */
 void virtio_mmio_raise_irq(u32 device_id);
 
+/* VSCode Phase 2: 按 gpa_base 触发中断。用于 device_id 相同的多实例设备
+ *（两个 virtio-input 同为 18）：virtio_mmio_raise_irq(18) 只命中第一个。 */
+void virtio_mmio_raise_irq_by_gpa(u64 gpa_base);
+
 /* 周期轮询 virtio-net RX 路径（填充 guest 已投递的 RX buffer，
  * 有填充时自动注入 IRQ）。由 vmexit 的 preemption timer 路径调用。 */
 void virtio_net_poll(void);
+
+/* ===== VSCode Phase 2: virtio-input 后端 ===== */
+
+/* Linux input event types/codes (subset, see <uapi/linux/input-event-codes.h>).
+ * We only need the few event types we actually forward from Deshab. */
+#define VIO_INPUT_EV_KEY  0x01
+#define VIO_INPUT_EV_REL  0x02   /* relative movement (mouse) */
+#define VIO_INPUT_EV_ABS  0x03
+#define VIO_INPUT_EV_SYN  0x00   /* sync marker */
+
+#define VIO_INPUT_REL_X   0x00
+#define VIO_INPUT_REL_Y   0x01
+#define VIO_INPUT_BTN_LEFT   0x110
+#define VIO_INPUT_BTN_RIGHT  0x111
+#define VIO_INPUT_BTN_MIDDLE 0x112
+
+/* virtio_input_event (8 bytes, little-endian). Matches Linux struct
+ * virtio_input_event in <uapi/linux/virtio_input.h>. */
+struct virtio_input_event {
+    u16 type;
+    u16 code;
+    u32 value;
+} __attribute__((packed));
+
+/* 注册键盘+鼠标两个 virtio-input 后端（无设备时安全空操作）。
+ * 在 virtio_mmio_init 中调用。 */
+void virtio_input_backend_init(void);
+
+/* 推送键盘事件（type=EV_KEY, code=linux keycode, value=0/1/2）。
+ * value: 0=release, 1=press, 2=repeat。 */
+void virtio_input_push_keyboard(u16 code, u32 value);
+
+/* 推送鼠标事件。三种便捷封装：
+ *   push_mouse_rel(axis, value)  — 相对位移 (EV_REL, REL_X/REL_Y)
+ *   push_mouse_button(btn, value)— 按键 (EV_KEY, BTN_LEFT/RIGHT/MIDDLE)
+ *   push_mouse_syn()             — 同步标记 (EV_SYN) */
+void virtio_input_push_mouse_rel(u16 axis, i32 value);
+void virtio_input_push_mouse_button(u16 btn, u32 value);
+void virtio_input_push_mouse_syn(void);
+
+/* 周期轮询：把挂起的输入事件排空到 guest eventq 已投递的空 buffer 中，
+ * 有事件投递时自动注入 IRQ。由 vmexit 的 preemption timer 路径调用。 */
+void virtio_input_poll(void);
+
+/* ===== VSCode Phase 3: virtio-gpu 2D 后端 ===== */
+
+/* Scanout 查询结果：desktop 在 IDE attached 时读取，把 guest 图形 blit 到
+ * Deshab framebuffer 的 IDE host 区域。
+ *   host_vaddr : scanout 影子缓冲的 host 虚拟地址（位于 graphics surface pool，
+ *                16MB，足够 1920×1080×4）。guest virtio-gpu 驱动经
+ *                TRANSFER_TO_HOST_2D + RESOURCE_FLUSH 把帧合成到这里。
+ *   width/height/stride : scanout 几何（XRGB8888，stride = width*4）
+ *   dirty   : 1 = 自上次查询以来有新帧合成（查询会清零该位）
+ *   enabled : 1 = scanout 已绑定一个 2D resource（X server 已 SET_SCANOUT）
+ *   dirty_x/y/w/h : Phase 7 累积 dirty rect（scanout 坐标系并集），
+ *                   查询随 dirty 一并清零；dirty=0 时全为 0。
+ *                   desktop 据此只 blit 变化区域（尾部追加，ABI 兼容）。 */
+struct virtio_gpu_scanout_info {
+    void *host_vaddr;
+    u32 width;
+    u32 height;
+    u32 stride;
+    u32 dirty;
+    u32 enabled;
+    u32 dirty_x;
+    u32 dirty_y;
+    u32 dirty_w;
+    u32 dirty_h;
+    /* P7.6: hardware cursor state（尾部追加，ABI 兼容）。
+     * cursor_visible=1 时 cursor_bitmap 指向 ARGB 像素（row stride=64），
+     * desktop 在 blit 后 alpha-blend 叠加到 IDE host 区域。 */
+    u32 cursor_visible;
+    u32 cursor_x;
+    u32 cursor_y;
+    u32 cursor_hot_x;
+    u32 cursor_hot_y;
+    u32 cursor_w;
+    u32 cursor_h;
+    void *cursor_bitmap;
+};
+
+/* 注册 virtio-gpu 2D 后端（slot 5 @ 0xF4005000 IRQ10）。
+ * 在 virtio_mmio_init 中调用。无 surface pool 时安全降级（scanout disabled）。 */
+void virtio_gpu_backend_init(void);
+
+/* 查询当前 scanout 状态（desktop blit 用）。返回 0 成功，-1 后端未就绪。 */
+int virtio_gpu_get_scanout_info(struct virtio_gpu_scanout_info *out);
 
 #endif /* UTSM_VIRTIO_MMIO_H */

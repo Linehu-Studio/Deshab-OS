@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 /* Shared IPC protocol — must match UTSM side */
 #include "../../../utsm-ipc/ipc_proto.h"
@@ -56,6 +57,38 @@ struct utsm_ioctl_pool {
 };
 
 static int g_utsm_fd = -1;
+
+/* pool_write 定义在文件传输段（下文），exec 同步路径复用同一通道 */
+static int pool_write(unsigned int offset, const void *buf, unsigned int len);
+static int send_msg(unsigned int type, const void *data, unsigned int len);
+static void err_write(const char *s, unsigned int len);
+
+/* ===== exec 超时看门狗（P3 补完） =====
+ * park-and-resume 模型下 UTSM 在 guest 运行期间完全不执行，宿主侧无法
+ * 看门狗。子进程超时必须 guest 内兜底：alarm + SIGALRM → SIGKILL，
+ * 保证 daemon 在 UTSM_EXEC_TIMEOUT_SEC 内一定 park，整系统不冻结。 */
+static volatile sig_atomic_t g_exec_timed_out = 0;
+static volatile sig_atomic_t g_exec_child = -1;
+
+static void on_exec_alarm(int sig)
+{
+    (void)sig;
+    g_exec_timed_out = 1;
+    if (g_exec_child > 0)
+        kill((pid_t)g_exec_child, SIGKILL);
+}
+
+/* EXEC_EXIT 必须送达：ring 满（-EAGAIN）时短暂重试。新协议下 stdout
+ * 走 payload_pool，ring 内通常只有这一条消息，满的概率极低。 */
+static void send_exit_msg(const struct ipc_exec_exit *ex)
+{
+    for (int t = 0; t < 200; t++) {
+        if (send_msg(UTSM_MSG_EXEC_EXIT, ex, sizeof(*ex)) == 0)
+            return;
+        usleep(1000);
+    }
+    err_write("utsm_exec_daemon: EXEC_EXIT send failed (ring full)\n", 52);
+}
 
 /* Send a typed message to UTSM via the linux_to_utsm ring */
 static int send_msg(unsigned int type, const void *data, unsigned int len)
@@ -111,8 +144,9 @@ static void handle_exec_request(const struct ipc_exec_request *req)
     int argc = (int)req->argc;
     if (argc > UTSM_EXEC_MAX_ARGS) argc = UTSM_EXEC_MAX_ARGS;
     if (argc < 1) {
-        struct ipc_exec_exit ex = { .exit_code = 1, .reserved = 0 };
-        send_msg(UTSM_MSG_EXEC_EXIT, &ex, sizeof(ex));
+        struct ipc_exec_exit ex = { .exit_code = 1, .flags = 0,
+                                    .stdout_len = 0, .stdout_total = 0 };
+        send_exit_msg(&ex);
         return;
     }
 
@@ -129,11 +163,49 @@ static void handle_exec_request(const struct ipc_exec_request *req)
     }
     argv[argc] = NULL;
 
+    /* VSCode Phase 5: ASYNC launch path.
+     * The caller (desktop IDE attach / app icon) wants to start a long-running
+     * GUI program (X server, VSCode) without blocking the UTSM side for its
+     * whole lifetime. We fork, detach the child into its own session with
+     * stdio routed to /dev/null, reply EXEC_EXIT(0) immediately (0 = spawned
+     * ok), and never waitpid — SIGCHLD is SIG_IGN so the kernel reaps it. */
+    if (req->flags & UTSM_EXEC_FLAG_ASYNC) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            struct ipc_exec_exit ex = { .exit_code = 127, .flags = 0,
+                                        .stdout_len = 0, .stdout_total = 0 };
+            send_exit_msg(&ex);
+            return;
+        }
+        if (pid == 0) {
+            /* Child: new session, no controlling tty, stdio → /dev/null */
+            setsid();
+            int nullfd = open("/dev/null", O_RDWR);
+            if (nullfd >= 0) {
+                dup2(nullfd, STDIN_FILENO);
+                dup2(nullfd, STDOUT_FILENO);
+                dup2(nullfd, STDERR_FILENO);
+                if (nullfd > STDERR_FILENO) close(nullfd);
+            }
+            /* 与同步路径一致的库搜索路径；DISPLAY 指向 virtio-gpu X server */
+            setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
+            setenv("DISPLAY", ":0", 1);
+            execv(req->path, argv);
+            _exit(127);  /* execv 仅失败时返回 */
+        }
+        /* Parent: report successful spawn immediately */
+        struct ipc_exec_exit ex = { .exit_code = 0, .flags = 0,
+                                    .stdout_len = 0, .stdout_total = 0 };
+        send_exit_msg(&ex);
+        return;
+    }
+
     /* Create a pipe for child stdout+stderr */
     int pipefd[2];
     if (pipe(pipefd) != 0) {
-        struct ipc_exec_exit ex = { .exit_code = 126, .reserved = 0 };
-        send_msg(UTSM_MSG_EXEC_EXIT, &ex, sizeof(ex));
+        struct ipc_exec_exit ex = { .exit_code = 126, .flags = 0,
+                                    .stdout_len = 0, .stdout_total = 0 };
+        send_exit_msg(&ex);
         return;
     }
 
@@ -142,8 +214,9 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         /* fork failed */
         close(pipefd[0]);
         close(pipefd[1]);
-        struct ipc_exec_exit ex = { .exit_code = 127, .reserved = 0 };
-        send_msg(UTSM_MSG_EXEC_EXIT, &ex, sizeof(ex));
+        struct ipc_exec_exit ex = { .exit_code = 127, .flags = 0,
+                                    .stdout_len = 0, .stdout_total = 0 };
+        send_exit_msg(&ex);
         return;
     }
 
@@ -153,6 +226,9 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+
+        /* 设置 LD_LIBRARY_PATH，让 ld-linux.so 在 /usr/lib/deshab 查找 .so */
+        setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
 
         execv(req->path, argv);
         /* execv only returns on failure */
@@ -167,30 +243,80 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         _exit(127);
     }
 
-    /* Parent: read child output from pipe, stream to UTSM */
+    /* Parent: read child output from pipe, stage into payload_pool.
+     * P3 大输出改造：旧路径逐条 EXEC_STDOUT 入 ring（64 槽 × 240B ≈ 15KB，
+     * 满则 -EAGAIN 静默丢弃）；现直写 payload_pool（~1MB），EXEC_EXIT
+     * 携带 stdout_len/stdout_total，UTSM 侧按新协议从 pool 拷出。 */
     close(pipefd[1]);
 
-    char buf[UTSM_IPC_MSG_DATA_SIZE];
+    /* 安装超时看门狗：UTSM_EXEC_TIMEOUT_SEC 内子进程不退 → SIGKILL。
+     * 不设 SA_RESTART：SIGALRM 中断 read(EINTR)，随后子进程死亡 pipe EOF。 */
+    g_exec_timed_out = 0;
+    g_exec_child = pid;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_exec_alarm;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGALRM, &sa, NULL);
+        alarm(UTSM_EXEC_TIMEOUT_SEC);
+    }
+
+    char buf[4096];
+    unsigned int pool_off = 0;
+    unsigned int total = 0;
+    int truncated = 0;
     ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-        send_msg(UTSM_MSG_EXEC_STDOUT, buf, (unsigned int)n);
+    for (;;) {
+        n = read(pipefd[0], buf, sizeof(buf));
+        if (n > 0) {
+            total += (unsigned int)n;
+            if (!truncated) {
+                unsigned int room = (pool_off < UTSM_IPC_PAYLOAD_SIZE)
+                                    ? (UTSM_IPC_PAYLOAD_SIZE - pool_off) : 0;
+                unsigned int chunk = ((unsigned int)n < room) ? (unsigned int)n : room;
+                if (chunk > 0) {
+                    if (pool_write(pool_off, buf, chunk) != 0) {
+                        /* pool 写入失败：后续输出全部丢弃，记截断 */
+                        truncated = 1;
+                    } else {
+                        pool_off += chunk;
+                    }
+                }
+                if (chunk < (unsigned int)n)
+                    truncated = 1;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;  /* SIGALRM 打断；子进程已被 SIGKILL，下轮 EOF */
+        break;         /* EOF 或真实错误 */
     }
     close(pipefd[0]);
 
     /* Wait for child and send exit code */
     int status = 0;
     waitpid(pid, &status, 0);
+    alarm(0);
+    g_exec_child = -1;
 
     struct ipc_exec_exit ex;
-    ex.reserved = 0;
-    if (WIFEXITED(status)) {
+    ex.flags = UTSM_EXEC_EXIT_F_POOL;
+    ex.stdout_len = pool_off;
+    ex.stdout_total = total;
+    if (truncated)
+        ex.flags |= UTSM_EXEC_EXIT_F_TRUNC;
+    if (g_exec_timed_out) {
+        ex.flags |= UTSM_EXEC_EXIT_F_TIMEOUT;
+        ex.exit_code = 124;  /* GNU timeout 惯例 */
+    } else if (WIFEXITED(status)) {
         ex.exit_code = (unsigned int)WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
         ex.exit_code = 128u + (unsigned int)WTERMSIG(status);
     } else {
         ex.exit_code = 1;
     }
-    send_msg(UTSM_MSG_EXEC_EXIT, &ex, sizeof(ex));
+    send_exit_msg(&ex);
 }
 
 /* ===== File transfer handlers (Phase 3) =====
@@ -423,6 +549,10 @@ static void handle_file_write(const struct ipc_file_request *req)
 
 int main(void)
 {
+    /* ASYNC children (VSCode Phase 5: X server / VSCode) are never waitpid'd;
+     * SIG_IGN lets the kernel reap them automatically so they don't zombie. */
+    signal(SIGCHLD, SIG_IGN);
+
     g_utsm_fd = open("/dev/utsm", O_RDWR);
     if (g_utsm_fd < 0) {
         /* Cannot communicate with UTSM — exit */

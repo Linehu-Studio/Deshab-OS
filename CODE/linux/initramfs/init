@@ -63,6 +63,36 @@ if [ $VDB_OK -eq 1 ]; then
             mount --move /dev  /mnt/root/dev  2>/dev/null
             mount --move /proc /mnt/root/proc 2>/dev/null
             mount --move /sys  /mnt/root/sys  2>/dev/null
+
+            # ===== VSCode Phase 4: overlay 持久化（/dev/vdc extra-rootfs 可写卷）=====
+            # rootfs 以 ro 挂载；/opt（VSCode 安装位置）、/home、/root 通过
+            # overlayfs 获得可写层，upperdir/workdir 落在 /dev/vdc（virtio-blk
+            # slot6 可写后端，内容跨启动持久）。vdc 缺失时保持 ro，安全降级。
+            if [ -b /dev/vdc ]; then
+                echo "[utsm-linux] /dev/vdc found, setting up overlay persistence..."
+                modprobe overlay 2>/dev/null
+                mkdir -p /mnt/persist
+                if mount -t ext4 -o rw /dev/vdc /mnt/persist 2>/dev/null; then
+                    for d in opt home root; do
+                        mkdir -p /mnt/persist/overlay/$d/upper \
+                                 /mnt/persist/overlay/$d/work \
+                                 /mnt/root/$d
+                        if mount -t overlay overlay \
+                            -o lowerdir=/mnt/root/$d,upperdir=/mnt/persist/overlay/$d/upper,workdir=/mnt/persist/overlay/$d/work \
+                            /mnt/root/$d 2>/dev/null; then
+                            echo "[utsm-linux] overlay: /$d rw (persist)"
+                        else
+                            echo "[utsm-linux] WARNING: overlay /$d failed (stays ro)"
+                        fi
+                    done
+                    # persist 卷搬进新 root，switch_root 后可在 /mnt/persist 访问
+                    mkdir -p /mnt/root/mnt/persist
+                    mount --move /mnt/persist /mnt/root/mnt/persist 2>/dev/null
+                else
+                    echo "[utsm-linux] WARNING: /dev/vdc mount failed (no persistence)"
+                fi
+            fi
+
             exec switch_root /mnt/root /sbin/init
             # switch_root does not return
         else

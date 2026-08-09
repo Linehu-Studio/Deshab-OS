@@ -7,8 +7,9 @@ kernel/main.o: kernel\main.c include\utsm\log.h include\utsm\types.h \
   include\utsm\hypercall.h include\utsm\drr.h include\utsm\dkm.h \
   include\utsm\dma.h include\utsm\block.h include\utsm\net.h \
   include\utsm\paging.h include\utsm\idt.h include\utsm\dsk.h \
-  include\utsm\linux_compat.h include\utsm\instr.h kernel\ini_parser.h \
-  kernel\..\arch\x86_64\limine.h
+  include\utsm\linux_compat.h include\utsm\xj380_loader.h \
+  include\utsm\instr.h kernel\ini_parser.h \
+  kernel\..\arch\x86_64\limine.h kernel\..\pe\pe_dll_manager.h
 include\utsm\log.h:
 include\utsm\types.h:
 include\utsm\arena.h:
@@ -35,6 +36,8 @@ include\utsm\paging.h:
 include\utsm\idt.h:
 include\utsm\dsk.h:
 include\utsm\linux_compat.h:
+include\utsm\xj380_loader.h:
 include\utsm\instr.h:
 kernel\ini_parser.h:
 kernel\..\arch\x86_64\limine.h:
+kernel\..\pe\pe_dll_manager.h:

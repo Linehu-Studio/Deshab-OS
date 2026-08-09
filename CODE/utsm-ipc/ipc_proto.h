@@ -69,6 +69,12 @@ enum utsm_hcall_op {
      * the bulk data buffer; see "Linux ↔ UTSM FAT32 hypercalls" below) */
     UTSM_HCALL_FILE_READ     = 0x0060,  /* Read UTSM FAT32 root file into payload_pool */
     UTSM_HCALL_FILE_WRITE    = 0x0061,  /* Write payload_pool content to UTSM FAT32 root file */
+    /* VSCode integration Phase 1: query graphics surface pool (GPA + size).
+     * The surface pool is a separate DMA region EPT-mapped into the Linux
+     * guest at LINUX_GUEST_SURFACE_GPA. Linux mmaps it via /dev/utsm and
+     * exposes it to X server as the scanout framebuffer (Phase 3 virtio-gpu
+     * shadow buffer lives here; guest writes → host reads for blit). */
+    UTSM_HCALL_SURFACE_INFO  = 0x0070,  /* Query graphics surface pool GPA + size */
 };
 
 /* Hypercall return codes */
@@ -125,17 +131,38 @@ enum utsm_ipc_msg_type {
 #define UTSM_EXEC_ARGV_MAX   96   /* total argv blob size */
 #define UTSM_EXEC_MAX_ARGS   16
 
+/* VSCode Phase 5: exec flags (ipc_exec_request.flags) */
+#define UTSM_EXEC_FLAG_ASYNC 0x00000001u  /* daemon fork+setsid+detach, replies
+                                           * EXEC_EXIT(0) immediately after
+                                           * spawn; no stdout capture, no wait.
+                                           * Used to launch X server / VSCode
+                                           * without blocking the UTSM side. */
+
 struct ipc_exec_request {
     uint32_t argc;                                   /* number of arguments */
-    uint32_t flags;                                  /* reserved (0) */
+    uint32_t flags;                                  /* UTSM_EXEC_FLAG_* (0 = sync) */
     char     path[UTSM_EXEC_PATH_MAX];               /* program path (NUL-terminated) */
     char     argv_blob[UTSM_EXEC_ARGV_MAX];          /* argv strings, each NUL-terminated */
 } __attribute__((packed));
 
 struct ipc_exec_exit {
     uint32_t exit_code;                              /* process exit status */
-    uint32_t reserved;
+    uint32_t flags;                                  /* UTSM_EXEC_EXIT_F_* (0 = 旧式 8B) */
+    uint32_t stdout_len;                             /* payload_pool 内有效字节数 */
+    uint32_t stdout_total;                           /* 截断前总输出字节数（诊断） */
 } __attribute__((packed));
+
+/* ipc_exec_exit.flags — 大输出/超时扩展（P3 补完）。
+ * 旧 daemon 只发 8B（exit_code+reserved=0），UTSM 按 data_len>=16 且
+ * flags&UTSM_EXEC_EXIT_F_POOL 判定新协议；旧式输出仍走 EXEC_STDOUT 内联。 */
+#define UTSM_EXEC_EXIT_F_POOL     0x00000001u  /* stdout 经 payload_pool 传输（offset 0） */
+#define UTSM_EXEC_EXIT_F_TRUNC    0x00000002u  /* 输出超 pool 容量被截断 */
+#define UTSM_EXEC_EXIT_F_TIMEOUT  0x00000004u  /* 子进程超时被 SIGKILL（exit_code=124） */
+
+/* 同步 exec daemon 侧子进程超时（秒）：park-and-resume 模型下 UTSM 在
+ * linux_resume() 期间不运行，无法宿主侧看门狗，必须 daemon alarm 兜底，
+ * 否则 guest 内长命令（sleep infinity 等）会永久冻结整系统。 */
+#define UTSM_EXEC_TIMEOUT_SEC     15u
 
 /* ===== Linux compat file transfer payload structures =====
  *
@@ -381,6 +408,20 @@ static inline long utsm_hcall_hello(void) {
 static inline long utsm_hcall_shm_info(uint64_t *gpa_out, uint64_t *size_out) {
     uint64_t gpa = 0, size = 0;
     long ret = utsm_hcall(UTSM_HCALL_SHM_INFO, (uint64_t)&gpa, (uint64_t)&size, 0);
+    if (ret == 0) {
+        if (gpa_out) *gpa_out = gpa;
+        if (size_out) *size_out = size;
+    }
+    return ret;
+}
+
+/* VSCode integration Phase 1: query graphics surface pool.
+ * Returns the surface pool GPA (visible inside the Linux guest) and size.
+ * Linux user-space mmaps /dev/utsm at the returned GPA to obtain a writable
+ * pointer that the host can scan for blitting to the Deshab framebuffer. */
+static inline long utsm_hcall_surface_info(uint64_t *gpa_out, uint64_t *size_out) {
+    uint64_t gpa = 0, size = 0;
+    long ret = utsm_hcall(UTSM_HCALL_SURFACE_INFO, (uint64_t)&gpa, (uint64_t)&size, 0);
     if (ret == 0) {
         if (gpa_out) *gpa_out = gpa;
         if (size_out) *size_out = size;

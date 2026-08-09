@@ -103,7 +103,9 @@ struct linux_setup_header {
  * 0x01000000-0x02FFFFFF : Linux kernel image
  * 0x03000000-0x03FFFFFF : Linux initrd
  * 0x04000000-0x040FFFFF : IPC shared memory (1MB, both kernels RW)
- * 0x05000000-MAX        : Linux general RAM
+ * 0x04100000-0x04FFFFFF : Graphics surface pool (16MB, VSCode integration Phase 1)
+ * 0x05000000-0x5FFFFFFF : Linux general RAM (~1.4GB, expanded Phase 1 for VSCode)
+ * 0xF4000000-0xF4007000 : virtio-mmio devices (8 slots, expanded Phase 1)
  */
 #define LINUX_GUEST_KERNEL_GPA  0x01000000ULL  /* 16 MB, 2MB-aligned */
 #define LINUX_GUEST_BOOTPARAMS_GPA 0x00400000ULL /* 4 MB */
@@ -118,8 +120,19 @@ struct linux_setup_header {
 #define LINUX_GUEST_IPC_SHM_GPA 0x04000000ULL  /* 64 MB */
 #define LINUX_GUEST_IPC_SHM_SIZE (1024 * 1024)  /* 1MB */
 
-/* General RAM starts after IPC region */
+/* VSCode integration Phase 1: Graphics surface pool.
+ * Separate DMA region EPT-mapped into the Linux guest. Linux user-space mmaps
+ * /dev/utsm at this GPA to obtain a writable scanout buffer that UTSM reads
+ * for blitting to the Deshab framebuffer (Phase 3 virtio-gpu shadow buffer).
+ * 16MB accommodates a 1920×1080×4 framebuffer (~8MB) with headroom for
+ * cursor plane and dirty rect tracking metadata. */
+#define LINUX_GUEST_SURFACE_GPA  0x04100000ULL  /* 65 MB (immediately after IPC shm) */
+#define LINUX_GUEST_SURFACE_SIZE (16 * 1024 * 1024)  /* 16MB */
+
+/* General RAM starts after IPC + surface regions.
+ * Phase 1 expansion: 1.4GB to fit VSCode + Electron + GUI stack. */
 #define LINUX_GUEST_RAM_GPA     0x05000000ULL  /* 80 MB */
+#define LINUX_GUEST_RAM_SIZE    0x5B000000ULL  /* 1.4GB (0x05000000..0x5FFFFFFF) */
 
 /* ===== virtio-mmio device GPA layout =====
  * virtio-mmio 设备放在 GPA 高位 MMIO 区（guest RAM 之上，不占用 e820 RAM）。
@@ -129,16 +142,33 @@ struct linux_setup_header {
  * 这些 GPA 在 EPT 中【故意不映射】，访问时触发 EPT violation，
  * 由 vmexit handler 路由到 virtio_mmio 后端模拟寄存器读写。
  *
- * GPA 选择 0xF4000000 起始（接近 4GB，远离 guest RAM 0x05000000-0x09000000）。 */
+ * GPA 选择 0xF4000000 起始（接近 4GB，远离 guest RAM 0x05000000-0x5FFFFFFF）。
+ *
+ * VSCode integration Phase 1 expansion: 槽位从 3 扩到 8，为后续阶段预留：
+ *   slot 0: blk       (Phase 1-)     IRQ5
+ *   slot 1: net       (Phase 1-)     IRQ6
+ *   slot 2: rootfs    (Phase 1-)     IRQ7
+ *   slot 3: keyboard  (Phase 2)      IRQ8   — virtio-input, evdev /dev/input/event0
+ *   slot 4: mouse     (Phase 2)      IRQ9   — virtio-input, evdev /dev/input/event1
+ *   slot 5: gpu       (Phase 3)      IRQ10  — virtio-gpu 2D, /dev/dri/card0
+ *   slot 6: extra-rootfs (Phase 4)   IRQ11 — persistent rw volume (/dev/vdc)
+ *   slot 7: reserved                          — future use
+ */
 #define VIRTIO_MMIO_GPA_BASE    0xF4000000ULL
 #define VIRTIO_MMIO_GPA_STRIDE  0x1000ULL      /* 每个设备 4KB */
+#define VIRTIO_MMIO_MAX_SLOTS   8              /* Phase 1: 3→8 */
 
-#define VIRTIO_MMIO_BLK_GPA     (VIRTIO_MMIO_GPA_BASE + 0 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4000000 */
-#define VIRTIO_MMIO_NET_GPA     (VIRTIO_MMIO_GPA_BASE + 1 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4001000 */
-#define VIRTIO_MMIO_ROOTFS_GPA  (VIRTIO_MMIO_GPA_BASE + 2 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4002000 */
+#define VIRTIO_MMIO_BLK_GPA         (VIRTIO_MMIO_GPA_BASE + 0 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4000000 */
+#define VIRTIO_MMIO_NET_GPA         (VIRTIO_MMIO_GPA_BASE + 1 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4001000 */
+#define VIRTIO_MMIO_ROOTFS_GPA      (VIRTIO_MMIO_GPA_BASE + 2 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4002000 */
+/* VSCode integration: Phase 2/3/4 device slots (currently unused, reserved) */
+#define VIRTIO_MMIO_KBD_GPA         (VIRTIO_MMIO_GPA_BASE + 3 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4003000 */
+#define VIRTIO_MMIO_MOUSE_GPA       (VIRTIO_MMIO_GPA_BASE + 4 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4004000 */
+#define VIRTIO_MMIO_GPU_GPA         (VIRTIO_MMIO_GPA_BASE + 5 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4005000 */
+#define VIRTIO_MMIO_EXTRA_ROOTFS_GPA (VIRTIO_MMIO_GPA_BASE + 6 * VIRTIO_MMIO_GPA_STRIDE) /* 0xF4006000 */
 
 /* 判断 GPA 是否落在 virtio-mmio 设备区（含两端） */
-#define VIRTIO_MMIO_GPA_END     (VIRTIO_MMIO_GPA_BASE + 3 * VIRTIO_MMIO_GPA_STRIDE)
+#define VIRTIO_MMIO_GPA_END     (VIRTIO_MMIO_GPA_BASE + VIRTIO_MMIO_MAX_SLOTS * VIRTIO_MMIO_GPA_STRIDE)
 #define IS_VIRTIO_MMIO_GPA(gpa) ((gpa) >= VIRTIO_MMIO_GPA_BASE && (gpa) < VIRTIO_MMIO_GPA_END)
 
 /* ===== Linux loader API ===== */
@@ -156,6 +186,13 @@ struct linux_guest_info {
     u64 pgt_gpa;            /* GPA of guest page tables */
     u64 gdt_gpa;            /* GPA of guest GDT */
     int loaded;             /* 1 = successfully loaded */
+    /* VSCode integration Phase 1: graphics surface pool.
+     * Allocated as a separate DMA buffer and EPT-mapped into the guest at
+     * surface_gpa. Exposed to Linux user-space via UTSM_HCALL_SURFACE_INFO
+     * and /dev/utsm mmap (see CODE/linux/patches/utsm_hcall.c). */
+    u64 surface_hpa;        /* Host physical address of surface pool (0 = none) */
+    u64 surface_gpa;        /* GPA visible inside Linux guest */
+    u64 surface_size;       /* Surface pool size in bytes */
 };
 
 /* Find the Linux bzImage boot module among Limine modules.
@@ -166,6 +203,17 @@ void *linux_find_bzimage_module(u64 *size_out);
 /* Find the Arch rootfs image boot module (path contains "rootfs").
  * Exposed to Linux guest via memory-backed virtio-blk as /dev/vdb. */
 void *linux_find_rootfs_module(u64 *size_out);
+
+/* VSCode Phase 4: find the extra rootfs image boot module (path contains
+ * "extra"). Exposed via writable virtio-blk slot6 as /dev/vdc (overlayfs
+ * upper / VSCode data volume). Returns NULL when the module is absent. */
+void *linux_find_extra_rootfs_module(u64 *size_out);
+
+/* VSCode Phase 5: find the VSCode tarball boot module (path contains
+ * "vscode", e.g. linux-vscode.tar.gz). The tarball is streamed into the
+ * guest and extracted to /opt/vscode by lxc_vscode_install().
+ * Returns NULL when the module is absent (install skipped, non-fatal). */
+void *linux_find_vscode_module(u64 *size_out);
 
 /* Parse bzImage header and extract key parameters.
  * Returns 0 on success, negative on error. */
@@ -181,6 +229,20 @@ int linux_loader_init(void);
 /* Get the loaded Linux guest info (NULL if not loaded). */
 const struct linux_guest_info *linux_get_guest_info(void);
 
+/* VSCode integration Phase 1: query graphics surface pool.
+ * Returns 0 and fills outputs if the surface pool was allocated and EPT-mapped
+ * into the Linux guest; returns -1 if not initialized (e.g. Linux guest not
+ * loaded). hpa_out receives the host physical address (for UTSM-side blit),
+ * gpa_out receives the GPA visible inside Linux (for the guest mmap path),
+ * size_out receives the pool size in bytes. Any output pointer may be NULL. */
+int linux_get_surface_info(u64 *hpa_out, u64 *gpa_out, u64 *size_out);
+
+/* VSCode Phase 3: return host virtual address of the graphics surface pool.
+ * The virtio-gpu 2D backend composites the scanout into this buffer; the
+ * desktop reads it to blit guest graphics onto the IDE host area.
+ * Returns NULL if the pool was not allocated (Linux guest not loaded / alloc failed). */
+void *linux_get_surface_vaddr(void);
+
 /* Configure VMCS for Linux guest and perform vmlaunch.
  * Must be called after vmm_init() + linux_loader_init().
  * Returns 0 on successful guest termination, negative on error. */
@@ -193,13 +255,22 @@ int linux_launch(void);
  * noapic/nolapic/nosmp: UTSM VMM 只模拟 legacy PIC(8259) + PIT(8254)，
  *        不提供 LAPIC/IOAPIC；guest 走 XT-PIC 模式，IRQ vector = 0x30+irq。
  * virtio_mmio.device=: 向 guest 声明 virtio-mmio 设备（blk@0xF4000000 IRQ5,
- *        net@0xF4001000 IRQ6），需 CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y。 */
+ *        net@0xF4001000 IRQ6），需 CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y。
+ * VSCode Phase 2: kbd@0xF4003000 IRQ8, mouse@0xF4004000 IRQ9 (virtio-input)。
+ * VSCode Phase 3: gpu@0xF4005000 IRQ10 (virtio-gpu 2D, /dev/dri/card0)。
+ * VSCode Phase 4: xrootfs@0xF4006000 IRQ11 (可写 virtio-blk, /dev/vdc)。
+ *        注：slot6 无对应 boot module 时后端不注册，guest 探测会超时跳过，
+ *        不影响启动（virtio_mmio 对无响应设备只打一条 warn）。 */
 #define LINUX_DEFAULT_CMDLINE \
     "console=ttyS0,115200 earlyprintk=serial nokaslr " \
     "no_timer_check loglevel=7 nohlt idle=poll " \
     "noapic nolapic nosmp " \
     "virtio_mmio.device=4K@0xF4000000:5 " \
     "virtio_mmio.device=4K@0xF4001000:6 " \
-    "virtio_mmio.device=4K@0xF4002000:7"
+    "virtio_mmio.device=4K@0xF4002000:7 " \
+    "virtio_mmio.device=4K@0xF4003000:8 " \
+    "virtio_mmio.device=4K@0xF4004000:9 " \
+    "virtio_mmio.device=4K@0xF4005000:10 " \
+    "virtio_mmio.device=4K@0xF4006000:11"
 
 #endif

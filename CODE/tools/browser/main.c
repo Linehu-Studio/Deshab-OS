@@ -114,7 +114,9 @@ static void do_fetch(void) {
 
     br_set_status("Receiving...");
     redraw_all_imm();
-    int n = ns_tcp_recv(0, 0, 5000);
+    /* buf=0 不拷贝（直接读全局 ns_tcp_rx），cap 必须给缓冲容量，
+     * 否则 n=min(rx_len,0) 恒为 0，误判为超时。 */
+    int n = ns_tcp_recv(0, NS_TCP_RX_CAP, 5000);
     ns_tcp_close();
 
     if (n < 0) { br_set_status("Connection reset"); return; }
@@ -277,6 +279,7 @@ void dsk_entry(const da_boot_context *ctx) {
     }
 
     da_init(&g_ac, ctx);
+    ns_apply_lease_from_ctx((u64)(const void *)ctx);  /* netman 租约覆盖默认 slirp IP */
     da_cursor_init(&g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
     da_mouse_init();
 

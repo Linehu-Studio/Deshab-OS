@@ -196,6 +196,30 @@ echo "[arch-utsm] Arch Linux rootfs booted"
 echo "[arch-utsm] Kernel: $(uname -r)"
 echo "[arch-utsm] Architecture: $(uname -m)"
 
+# ===== VSCode Phase 4: persistent rw volume (/dev/vdc) =====
+# The extra-rootfs image is exposed as a WRITABLE memory-backed virtio-blk
+# device (slot6, GPA 0xF4006000, IRQ11) by the UTSM extra_rootfs backend.
+# We mount it at /mnt/persist and bind-mount its subtrees over the volatile
+# paths VSCode and user data live in, so they survive tmpfs cleanup and
+# (Phase 7) can be written back to the FAT32 ESP for true persistence.
+if [ -b /dev/vdc ]; then
+    mkdir -p /mnt/persist
+    if mount -t ext4 -o rw /dev/vdc /mnt/persist 2>/dev/null; then
+        echo "[arch-utsm] /dev/vdc mounted rw at /mnt/persist (extra-rootfs)"
+        # Persistent subtrees: /opt (VSCode install), /home (user data),
+        # /root (daemon cwd), /var/lib/pacman is left on tmpfs (rebuildable).
+        for d in opt home root; do
+            mkdir -p "/mnt/persist/$d"
+            mount --bind "/mnt/persist/$d" "/$d" 2>/dev/null && \
+                echo "[arch-utsm] bind: /$d → persist" || true
+        done
+    else
+        echo "[arch-utsm] WARNING: /dev/vdc mount failed (not ext4?) — rw layer disabled"
+    fi
+else
+    echo "[arch-utsm] no /dev/vdc — running fully volatile (tmpfs only)"
+fi
+
 # Check if pacman is available
 if command -v pacman &>/dev/null; then
     echo "[arch-utsm] pacman available: $(pacman --version | head -1)"

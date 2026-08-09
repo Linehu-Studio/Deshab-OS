@@ -48,9 +48,14 @@ extern volatile struct vmexit_guest_regs g_guest_regs;
  *   handle_hlt 检查此标志：Linux guest HLT 时 park（推进 RIP，exit-to-host），
  *   self-test guest HLT 时 terminate。
  * g_guest_parked: 1 = Linux guest 已 HLT 驻留，可被 linux_resume() 唤醒。
- *   linux_compat_service 通过此标志判断 guest 是否就绪。 */
+ *   linux_compat_service 通过此标志判断 guest 是否就绪。
+ *
+ * g_xj380_guest_active: 1 = 当前运行的 guest 是 OpenXJ380 guest。
+ *   handle_hlt 检查此标志：XJ380 guest HLT 时推进 RIP 并立即 vmresume
+ *   （继续执行，不 park 不 terminate）。同一时刻只有一个 guest active。 */
 extern volatile int g_linux_guest_active;
 extern volatile int g_guest_parked;
+extern volatile int g_xj380_guest_active;
 
 /* ===== VM-Exit host 恢复点（vmm.c 定义，vmm.c / linux_boot.c / linux_resume.c 共用） =====
  *

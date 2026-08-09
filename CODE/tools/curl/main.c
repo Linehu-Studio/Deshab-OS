@@ -213,7 +213,9 @@ static void do_http_get(const char *url) {
     /* 收至 FIN */
     term_puts_color("  -> 等待响应...\n", DA_TEXT_DIM);
     redraw_all();
-    int n = ns_tcp_recv(0, 0, 5000);
+    /* buf=0 不拷贝（直接读全局 ns_tcp_rx），cap 必须给缓冲容量，
+     * 否则 n=min(rx_len,0) 恒为 0，误判为超时。 */
+    int n = ns_tcp_recv(0, NS_TCP_RX_CAP, 5000);
     ns_tcp_close();
     if (n < 0) {
         term_puts_color("  [错误] 连接被重置\n", DA_ERROR);
@@ -319,6 +321,7 @@ void dsk_entry(const da_boot_context *ctx) {
     }
 
     da_init(&g_ac, ctx);
+    ns_apply_lease_from_ctx((u64)(const void *)ctx);  /* netman 租约覆盖默认 slirp IP */
     term_init_layout();
     term_clear();
 

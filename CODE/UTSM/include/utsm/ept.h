@@ -8,8 +8,9 @@
 #define EPT_PAGE_SIZE   4096ULL
 #define EPT_ENTRIES     512ULL
 
-/* EPTP 构造：bits [5:0]=memory type, bits [7:6]=walk length-1, bits [51:12]=PML4 HPA */
-#define EPTP_WALK_LEN_4  (3ULL << 6)   /* 4 级页表 */
+/* EPTP 构造：bits [2:0]=memory type, bits [5:3]=walk length-1, bit 6=AD, bits [51:12]=PML4 HPA
+ * P8.4 Fix: walk length was at bits [7:6] (wrong), should be bits [5:3] per Intel SDM. */
+#define EPTP_WALK_LEN_4  (3ULL << 3)   /* 4 级页表 (3 = 4-1) at bits [5:3] */
 #define EPTP_MEMTYPE_WB  (EPT_MEMORY_TYPE_WB)
 
 /* 初始化 EPT：分配 PML4，置零。返回 0 成功。 */

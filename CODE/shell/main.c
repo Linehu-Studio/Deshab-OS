@@ -2170,8 +2170,10 @@ static void cmd_dsl(const char *args) {
     argv_ptrs[0] = prog;  /* argv[0] 用程序名（不带 /bin/ 前缀） */
     for (int i = 1; i < argc; i++) argv_ptrs[i] = argv_buf[i];
 
-    /* 执行：stdout 缓冲区 */
-    static char stdout_buf[8192];
+    /* 执行：stdout 缓冲区。P3 起 daemon 输出经 payload_pool（~1MB）传输，
+     * 缓冲区从 8KB 提到 128KB，覆盖绝大多数命令输出；超出部分由 UTSM 侧
+     * lxc_pool_copyout 钳制并记串口日志。 */
+    static char stdout_buf[128 * 1024];
     u64 stdout_len = 0;
     u64 exit_code = 0;
 

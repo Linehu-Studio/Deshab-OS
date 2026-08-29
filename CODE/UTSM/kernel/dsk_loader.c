@@ -520,6 +520,379 @@ int fat32_read_path(const char *path, u8 **out_data, u32 *out_size) {
     return -8;  /* 路径为空或无效 */
 }
 
+/* ---- FAT32 写入（实机启动日志落盘，2026-08 移植自 DSK fat32_write_*） ----
+ * 相比 DSK 版本的两点增强：
+ *   1) FAT 条目支持按需读-改-写（超出 256 扇区预读缓冲时逐扇区读写，
+ *      并同步镜像到所有 FAT 副本），不再受小分区限制。
+ *   2) 目录扫描跨簇 + 目录满时自动扩展，文件链支持多簇（日志可达 128KB）。
+ * 注意：与 DSK 一致，不更新 FSInfo（free count 会过期，测试工具可接受）。 */
+
+/* 读取 FAT 表条目（28 位），支持按需读扇区。 */
+static u32 fat32_get_cluster_entry(u32 fat_byte_off, u32 clus,
+                                   const fat32_bpb *bpb, const u8 *disk) {
+    u32 ent_off = fat_byte_off + clus * 4;
+    if (ent_off + 4 <= sizeof(g_dsk_fat32_disk)) {
+        return fat32_read_u32(disk + ent_off) & 0x0FFFFFFF;
+    }
+    return fat32_get_next_cluster(fat_byte_off, clus, bpb, disk);
+}
+
+/* 写 FAT 表条目。缓冲内条目直接改内存（同步镜像副本 1），
+ * 缓冲外条目按 FAT 副本逐个读-改-写扇区。返回 0 成功。 */
+static int fat32_set_cluster_entry(u32 fat_byte_off, u32 fat_sectors, u32 clus,
+                                   u32 value, const fat32_bpb *bpb, u8 *disk) {
+    u32 ent_off = fat_byte_off + clus * 4;
+    if (ent_off + 4 <= sizeof(g_dsk_fat32_disk)) {
+        disk[ent_off]     = (u8)(value & 0xFF);
+        disk[ent_off + 1] = (u8)((value >> 8) & 0xFF);
+        disk[ent_off + 2] = (u8)((value >> 16) & 0xFF);
+        disk[ent_off + 3] = (u8)((disk[ent_off + 3] & 0xF0) | ((value >> 24) & 0x0F));
+        /* 同步 FAT 副本 1 的缓冲镜像（若在缓冲内） */
+        if (bpb->fat_count >= 2) {
+            u32 e1 = ent_off + fat_sectors * 512;
+            if (e1 + 4 <= sizeof(g_dsk_fat32_disk)) {
+                disk[e1]     = disk[ent_off];
+                disk[e1 + 1] = disk[ent_off + 1];
+                disk[e1 + 2] = disk[ent_off + 2];
+                disk[e1 + 3] = disk[ent_off + 3];
+            }
+        }
+        return 0;
+    }
+    /* 缓冲外：逐 FAT 副本读-改-写 */
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->read || !api->block->write) return -1;
+    u32 sec_index = (clus * 4) / 512;
+    u32 ent_in_sec = (clus * 4) % 512;
+    u32 copies = bpb->fat_count;
+    if (copies > 4) copies = 4;
+    for (u32 f = 0; f < copies; f++) {
+        u32 sec_lba = bpb->reserved_sector_count + f * fat_sectors + sec_index;
+        if (api->block->read(0, sec_lba, 1, g_dsk_fat32_fat_sec) != 0) return -2;
+        g_dsk_fat32_fat_sec[ent_in_sec]     = (u8)(value & 0xFF);
+        g_dsk_fat32_fat_sec[ent_in_sec + 1] = (u8)((value >> 8) & 0xFF);
+        g_dsk_fat32_fat_sec[ent_in_sec + 2] = (u8)((value >> 16) & 0xFF);
+        g_dsk_fat32_fat_sec[ent_in_sec + 3] = (u8)((g_dsk_fat32_fat_sec[ent_in_sec + 3] & 0xF0) | ((value >> 24) & 0x0F));
+        if (api->block->write(0, sec_lba, 1, g_dsk_fat32_fat_sec) != 0) return -3;
+    }
+    return 0;
+}
+
+/* 顺序扫描 FAT 找空闲簇（缓冲内直读，缓冲外按 8 扇区批量读）。
+ * from_clus: 起始簇号（建议传入上次分配结果+1，避免反复扫描）。
+ * 返回空闲簇号，失败返回 0。 */
+static u32 fat32_find_free_cluster(u32 fat_lba, u32 fat_sectors, u32 from_clus) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    u8 *disk = g_dsk_fat32_disk;
+    u32 total_entries = (fat_sectors * 512) / 4;
+    u32 fat_byte_off = fat_lba * 512;
+    u32 c = from_clus;
+    while (c < total_entries) {
+        u32 ent_off = fat_byte_off + c * 4;
+        if (ent_off + 4 <= sizeof(g_dsk_fat32_disk)) {
+            if ((fat32_read_u32(disk + ent_off) & 0x0FFFFFFF) == 0) return c;
+            c++;
+        } else {
+            u32 sec_index = (c * 4) / 512;
+            u32 sec_lba = fat_lba + sec_index;
+            u32 secs = 8;
+            if (sec_lba + secs > fat_lba + fat_sectors) secs = fat_lba + fat_sectors - sec_lba;
+            if (api->block->read(0, sec_lba, secs, g_dsk_fat32_cluster) != 0) return 0;
+            u32 first_in_chunk = sec_index * 128;
+            u32 last_in_chunk = (sec_index + secs) * 128;
+            for (u32 cc = (c < first_in_chunk ? first_in_chunk : c);
+                 cc < last_in_chunk && cc < total_entries; cc++) {
+                if ((fat32_read_u32(g_dsk_fat32_cluster + (cc - first_in_chunk) * 4) & 0x0FFFFFFF) == 0)
+                    return cc;
+            }
+            c = last_in_chunk;
+        }
+    }
+    return 0;
+}
+
+/* 分配并链接 needed 个簇，全部标记 EOC。scan_from 记录扫描游标。
+ * 返回 0 成功；first/last 返回链首/链尾。 */
+static int fat32_alloc_clusters(const fat32_bpb *bpb, u32 fat_lba,
+                                u32 fat_sectors, u32 needed,
+                                u32 *scan_from, u32 *first, u32 *last) {
+    u32 prev = 0;
+    u32 fc = 0, lc = 0;
+    u32 cur_scan = *scan_from;
+    for (u32 i = 0; i < needed; i++) {
+        u32 nc = fat32_find_free_cluster(fat_lba, fat_sectors, cur_scan);
+        if (nc == 0) return -1;
+        cur_scan = nc + 1;
+        if (fat32_set_cluster_entry(bpb->reserved_sector_count * 512, fat_sectors,
+                                    nc, 0x0FFFFFFF, bpb, g_dsk_fat32_disk) != 0)
+            return -2;
+        if (prev) {
+            if (fat32_set_cluster_entry(bpb->reserved_sector_count * 512, fat_sectors,
+                                        prev, nc, bpb, g_dsk_fat32_disk) != 0)
+                return -3;
+        } else {
+            fc = nc;
+        }
+        prev = nc;
+        lc = nc;
+    }
+    *scan_from = cur_scan;
+    *first = fc;
+    *last = lc;
+    return 0;
+}
+
+/* 在指定目录（dir_clus 起始簇）写入文件（8.3 名，11 字符）。
+ * 存在则覆盖（复用旧链/扩展/截断），否则新建。支持多簇目录与多簇文件。
+ * data 必须指向可寻址静态内存（如 log 缓冲）。返回 0 成功。 */
+static int fat32_write_file_in_dir(u32 dir_clus, const char *name11,
+                                   const u8 *data, u32 size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->read || !api->block->write) return -1;
+    u8 *disk = g_dsk_fat32_disk;
+    if (api->block->read(0, 0, 256, disk) != 0) return -2;
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) return -3;
+
+    u32 spc = bpb->sectors_per_cluster;
+    u32 fat_lba = bpb->reserved_sector_count;
+    u32 fat_sectors = bpb->sectors_per_fat;
+    u32 data_lba = bpb->reserved_sector_count + (u32)bpb->fat_count * bpb->sectors_per_fat;
+    u32 fat_byte_off = fat_lba * 512;
+    u32 cluster_bytes = spc * 512;
+
+    /* ---- 1. 扫描目录链：找同名条目或空闲槽 ---- */
+    u32 cur = dir_clus;
+    u32 last_dir_clus = dir_clus;
+    u32 entry_clus = 0;      /* 目录项所在目录簇 */
+    u32 entry_slot = 0;
+    int found = 0;           /* 同名文件已存在 */
+    u32 old_first_clus = 0;
+    int done = 0;
+    while (cur >= 2 && cur < 0x0FFFFFF8) {
+        last_dir_clus = cur;
+        u32 clus_lba = data_lba + (cur - 2) * spc;
+        if (api->block->read(0, clus_lba, spc, g_dsk_fat32_cluster) != 0) return -4;
+        u32 me = cluster_bytes / 32;
+        const fat32_dir_entry *d = (const fat32_dir_entry *)g_dsk_fat32_cluster;
+        for (u32 e = 0; e < me; e++) {
+            if (d[e].name[0] == 0) {           /* 目录结束标记 */
+                if (entry_clus == 0) { entry_clus = cur; entry_slot = e; }
+                done = 1;
+                break;
+            }
+            if ((u8)d[e].name[0] == 0xE5) {    /* 已删除项，可复用 */
+                if (entry_clus == 0) { entry_clus = cur; entry_slot = e; }
+                continue;
+            }
+            if (d[e].attr == 0x0F || (d[e].attr & 0x08)) continue;
+            if (fat32_name11_eq(d[e].name, name11)) {
+                found = 1;
+                entry_clus = cur;
+                entry_slot = e;
+                old_first_clus = fat32_read_u16((const u8 *)&d[e].cluster_low) |
+                                 ((u32)fat32_read_u16((const u8 *)&d[e].cluster_high) << 16);
+                done = 1;
+                break;
+            }
+        }
+        if (done) break;
+        cur = fat32_get_cluster_entry(fat_byte_off, cur, bpb, disk);
+    }
+
+    /* ---- 2. 目录满时扩展一个簇 ---- */
+    if (entry_clus == 0) {
+        u32 scan_from = 2;
+        u32 nc = fat32_find_free_cluster(fat_lba, fat_sectors, scan_from);
+        if (nc == 0) return -9;
+        if (fat32_set_cluster_entry(fat_byte_off, fat_sectors, nc, 0x0FFFFFFF,
+                                    bpb, disk) != 0)
+            return -10;
+        if (fat32_set_cluster_entry(fat_byte_off, fat_sectors, last_dir_clus, nc,
+                                    bpb, disk) != 0)
+            return -11;
+        for (u32 b = 0; b < cluster_bytes; b++) g_dsk_fat32_cluster[b] = 0;
+        u32 nlba = data_lba + (nc - 2) * spc;
+        if (api->block->write(0, nlba, spc, g_dsk_fat32_cluster) != 0) return -12;
+        entry_clus = nc;
+        entry_slot = 0;
+    }
+
+    /* ---- 3. 文件簇链：复用/扩展/截断 ---- */
+    u32 needed = (size + cluster_bytes - 1) / cluster_bytes;
+    if (needed == 0) needed = 1;
+    u32 first = 0;
+    u32 scan_from = 2;
+
+    if (found && old_first_clus >= 2) {
+        /* 走旧链，收集前 needed 个簇 */
+        u32 c = old_first_clus;
+        u32 cnt = 0;
+        u32 last = 0;
+        u32 tail = 0;
+        while (c >= 2 && c < 0x0FFFFFF8 && cnt < needed) {
+            last = c;
+            cnt++;
+            c = fat32_get_cluster_entry(fat_byte_off, c, bpb, disk);
+        }
+        first = old_first_clus;
+        if (cnt == needed) {
+            /* 截断：last 指向 EOC，释放旧链尾部 */
+            tail = fat32_get_cluster_entry(fat_byte_off, last, bpb, disk);
+            if (fat32_set_cluster_entry(fat_byte_off, fat_sectors, last, 0x0FFFFFFF,
+                                        bpb, disk) != 0)
+                return -13;
+            while (tail >= 2 && tail < 0x0FFFFFF8) {
+                u32 nn = fat32_get_cluster_entry(fat_byte_off, tail, bpb, disk);
+                if (fat32_set_cluster_entry(fat_byte_off, fat_sectors, tail, 0,
+                                            bpb, disk) != 0)
+                    return -14;
+                tail = nn;
+            }
+        } else {
+            /* 旧链不足：last 之后补簇 */
+            u32 need_more = needed - cnt;
+            u32 nf = 0, nl = 0;
+            if (fat32_alloc_clusters(bpb, fat_lba, fat_sectors, need_more,
+                                     &scan_from, &nf, &nl) != 0)
+                return -15;
+            if (fat32_set_cluster_entry(fat_byte_off, fat_sectors, last, nf,
+                                        bpb, disk) != 0)
+                return -16;
+        }
+    } else {
+        u32 nf = 0, nl = 0;
+        if (fat32_alloc_clusters(bpb, fat_lba, fat_sectors, needed,
+                                 &scan_from, &nf, &nl) != 0)
+            return -17;
+        first = nf;
+    }
+
+    /* ---- 4. 写数据簇 ---- */
+    {
+        u32 c = first;
+        u32 remaining = size;
+        u32 off = 0;
+        while (c >= 2 && c < 0x0FFFFFF8 && remaining > 0) {
+            u32 lba = data_lba + (c - 2) * spc;
+            if (remaining >= cluster_bytes) {
+                if (api->block->write(0, lba, spc, data + off) != 0) return -18;
+            } else {
+                u8 *cb = g_dsk_fat32_cluster;
+                for (u32 b = 0; b < cluster_bytes; b++) cb[b] = 0;
+                for (u32 b = 0; b < remaining; b++) cb[b] = data[off + b];
+                if (api->block->write(0, lba, spc, cb) != 0) return -19;
+            }
+            if (remaining >= cluster_bytes) {
+                off += cluster_bytes;
+                remaining -= cluster_bytes;
+            } else {
+                off += remaining;
+                remaining = 0;
+            }
+            c = fat32_get_cluster_entry(fat_byte_off, c, bpb, disk);
+        }
+    }
+
+    /* ---- 5. 更新目录项 ---- */
+    {
+        u32 elba = data_lba + (entry_clus - 2) * spc;
+        if (api->block->read(0, elba, spc, g_dsk_fat32_cluster) != 0) return -20;
+        fat32_dir_entry *dir = (fat32_dir_entry *)g_dsk_fat32_cluster;
+        fat32_dir_entry *e = &dir[entry_slot];
+        if (!found) {
+            for (int i = 0; i < 11; i++) e->name[i] = name11[i];
+            e->attr = 0x20;                 /* archive */
+            e->nt_reserved = 0;
+            e->creation_tenth = 0;
+            e->creation_time = 0;
+            e->creation_date = 0;
+            e->access_date = 0;
+            e->write_time = 0;
+            e->write_date = 0;
+        }
+        e->cluster_high = (u16)((first >> 16) & 0xFFFF);
+        e->cluster_low  = (u16)(first & 0xFFFF);
+        e->file_size = size;
+        if (api->block->write(0, elba, spc, g_dsk_fat32_cluster) != 0) return -21;
+    }
+
+    /* ---- 6. 回写 FAT：缓冲内区间按副本刷回（缓冲外条目已即时写盘） ---- */
+    {
+        u32 copies = bpb->fat_count;
+        if (copies > 4) copies = 4;
+        for (u32 f = 0; f < copies; f++) {
+            u32 flba = fat_lba + f * fat_sectors;
+            if (flba >= 256) continue;
+            u32 ns = fat_sectors;
+            if (flba + ns > 256) ns = 256 - flba;
+            if (ns == 0) continue;
+            if (api->block->write(0, flba, ns, disk + (u64)flba * 512) != 0) return -22;
+        }
+    }
+
+    log_info("[UTSM] fat32 write: ok");
+    return 0;
+}
+
+/* 在根目录写入文件（8.3 名）。 */
+static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->read) return -1;
+    u8 *disk = g_dsk_fat32_disk;
+    if (api->block->read(0, 0, 256, disk) != 0) return -2;
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55) return -3;
+    return fat32_write_file_in_dir(bpb->root_cluster, name11, data, size);
+}
+
+/* 按 8.3 路径（每段 11 字符，'/' 分隔）定位子目录，返回起始簇，失败返回 0。 */
+static u32 fat32_find_dir_path(const char *path) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->read) return 0;
+    u8 *disk = g_dsk_fat32_disk;
+    if (api->block->read(0, 0, 256, disk) != 0) return 0;
+    const fat32_bpb *bpb = (const fat32_bpb *)disk;
+    if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) return 0;
+
+    u32 cur = bpb->root_cluster;
+    u32 pos = 0;
+    while (path[pos]) {
+        char comp[12];
+        u32 ci = 0;
+        while (path[pos] && path[pos] != '/') {
+            if (ci < 11) comp[ci++] = path[pos];
+            pos++;
+        }
+        while (ci < 11) comp[ci++] = ' ';
+        comp[11] = 0;
+        if (path[pos] == '/') pos++;
+        if (comp[0] == ' ') break;   /* 空段防呆 */
+        u32 sub = 0, sz = 0;
+        if (fat32_find_in_dir(cur, comp, 1, &sub, &sz, 0) != 0) return 0;
+        cur = sub;
+    }
+    return cur;
+}
+
+/* 实机启动日志落盘：写 FAT32 文件。
+ * 优先写 SYSTEM/DESHAB64/DEV/BOOTLOG.TXT；DEV 目录缺失时回退根目录 BOOTLOG.TXT。
+ * 相比旧原始扇区方案不再覆盖 GPT header/entries，主机可直接读取该文件。
+ * 返回 0 成功。 */
+int utsm_bootlog_write(const u8 *data, u32 size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->block || !api->block->device_count) return -1;
+    if (api->block->device_count() == 0) return -2;
+    if (!api->block->write) return -3;
+    if (!data || size == 0) return -4;
+
+    static const char name11[11] = {'B','O','O','T','L','O','G',' ','T','X','T'};
+    u32 dev_clus = fat32_find_dir_path("SYSTEM  /DESHAB64 /DEV     ");
+    if (dev_clus >= 2)
+        return fat32_write_file_in_dir(dev_clus, name11, data, size);
+    return fat32_write_root_file(name11, data, size);
+}
+
 /* ---- ELF checks ---- */
 static int dsk_check_elf(const void *address, u64 size) {
     if (!address || size < sizeof(elf64_ehdr)) return -1;

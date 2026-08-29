@@ -305,11 +305,28 @@ static void go_up(void) {
     }
 }
 
-/* 查找并进入 SYSTEM/user 目录 */
+/* 查找并进入用户目录。
+ * 布局探测顺序（磁盘布局约定不同，两种镜像并存）：
+ *   1) 根级 USER/           —— 树形布局（dev 镜像，含 DESKTOP/PICTURE/VEDIO）
+ *   2) SYSTEM/USER/         —— 旧树形布局（兼容遗留镜像）
+ *   3) 都不存在              —— 扁平布局（SATA 盘，用户文件直接在根目录，停留根目录即可）
+ * 匹配用 8.3 显示名（f32_name_from_83 已 trim 空格），如 "USER"/"SYSTEM"。 */
 static void find_user_dir(void) {
-    /* 先查找 SYSTEM 目录 */
+    /* 1) 根级 USER */
     file_count = 0;
     f32_list_dir(0, fm_collect_cb, 0);
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].is_dir && files[i].name[0] == 'U' && files[i].name[1] == 'S' &&
+            files[i].name[2] == 'E' && files[i].name[3] == 'R') {
+            path_clus[0] = files[i].clus;
+            path_name[0][0] = 'U'; path_name[0][1] = 'S'; path_name[0][2] = 'E';
+            path_name[0][3] = 'R'; path_name[0][4] = 0;
+            path_depth = 1;
+            return;
+        }
+    }
+
+    /* 2) 旧树形布局 SYSTEM/USER */
     u32 system_clus = 0;
     for (int i = 0; i < file_count; i++) {
         if (files[i].is_dir && files[i].name[0] == 'S' && files[i].name[1] == 'Y' &&
@@ -319,15 +336,14 @@ static void find_user_dir(void) {
             break;
         }
     }
-    if (!system_clus) return;  /* SYSTEM 目录不存在，保持根目录 */
+    if (!system_clus) return;  /* 扁平布局，保持根目录 */
 
-    /* 在 SYSTEM 中查找 user 目录 */
     file_count = 0;
     f32_list_dir(system_clus, fm_collect_cb, 0);
     for (int i = 0; i < file_count; i++) {
         if (files[i].is_dir && files[i].name[0] == 'U' && files[i].name[1] == 'S' &&
             files[i].name[2] == 'E' && files[i].name[3] == 'R') {
-            /* 找到了 SYSTEM/user，设置路径栈 */
+            /* 找到了 SYSTEM/USER，设置路径栈 */
             path_clus[0] = system_clus;
             path_name[0][0] = 'S'; path_name[0][1] = 'Y'; path_name[0][2] = 'S';
             path_name[0][3] = 'T'; path_name[0][4] = 'E'; path_name[0][5] = 'M';
@@ -339,6 +355,7 @@ static void find_user_dir(void) {
             return;
         }
     }
+    /* SYSTEM 存在但无 SYSTEM/USER：停留根目录（保持原行为） */
 }
 
 __attribute__((visibility("default")))
@@ -359,7 +376,7 @@ void dsk_entry(const da_boot_context *ctx) {
     f32_init((f32_block_read_fn)g_ac.block_read, (f32_block_write_fn)g_ac.block_write);
 
     path_depth = 0;
-    /* 尝试进入 SYSTEM/user 目录 */
+    /* 查找用户目录：自动适配树形（根级 USER/）与扁平（根目录直放）两种布局 */
     find_user_dir();
     load_current_dir();
     redraw_all();

@@ -108,6 +108,8 @@ static u32 g_ready_port = 0xffffffffu;
 static ahci_cmd_header *g_cmd_header;
 static struct dkm_dma_buffer g_cmd_table;
 static struct dkm_dma_buffer g_data;
+/* IDENTIFY 读出的用户可寻址扇区数；LBA48 优先，回退 LBA28 */
+static u64 g_sector_count;
 
 static u32 pci_read(u8 bus, u8 dev, u8 func, u8 reg) {
     return dkm_pci_read(bus, dev, func, reg);
@@ -534,6 +536,17 @@ static int ahci_identify_port(u32 port, const struct dkm_dma_api *dma) {
             log_hex("[ahci] IDENTIFY word0=", id[0]);
             log_hex("[ahci] IDENTIFY word49=", id[49]);
             log_hex("[ahci] IDENTIFY word83=", id[83]);
+            /* 容量必须在 ahci_read_lba0 复用 data 缓冲区前提取，
+             * 否则 IDENTIFY 数据被 LBA0 内容覆盖后容量丢失。 */
+            if ((id[83] & 0x0400u) && (id[103] | id[102] | id[101] | id[100])) {
+                /* LBA48: word100-103 小端 u16 序列拼接 */
+                g_sector_count = (u64)id[100] | ((u64)id[101] << 16)
+                               | ((u64)id[102] << 32) | ((u64)id[103] << 48);
+            } else {
+                /* LBA28: word60-61 */
+                g_sector_count = (u64)id[60] | ((u64)id[61] << 16);
+            }
+            log_hex("[ahci] IDENTIFY sector_count=", g_sector_count);
             ahci_read_lba0(port, hdr, &table, &data);
             g_ready_port = port;
             g_cmd_header = hdr;
@@ -678,7 +691,7 @@ int driver_init(const struct dkm_kernel_api *api,
         struct dkm_block_device_desc desc;
         desc.name = "ahci0";
         desc.sector_size = 512;
-        desc.sector_count = 0;
+        desc.sector_count = g_sector_count;
         desc.ctx = 0;
         desc.read = ahci_block_read;
         desc.write = ahci_block_write;

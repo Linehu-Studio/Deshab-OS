@@ -92,6 +92,14 @@
           "provides": ["block"]
         },
         {
+          "name": "ehci",
+          "path": "driver/block/ehci.drv",
+          "class": "storage",
+          "required": false,
+          "depends": ["pci"],
+          "provides": ["block"]
+        },
+        {
           "name": "xhci",
           "path": "driver/block/xhci.drv",
           "class": "storage",

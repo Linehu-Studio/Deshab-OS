@@ -2,7 +2,8 @@
 
 /* ---- 内存日志缓冲区（实机启动日志持久化） ----
  * 默认启用捕获：所有日志同时写串口和内存缓冲。
- * 块设备就绪后由 disk_log_flush() 把缓冲区写入磁盘原始扇区。 */
+ * 块设备就绪后由 disk_log_flush() 把缓冲区写入 FAT32 文件
+ * SYSTEM/DESHAB64/DEV/BOOTLOG.TXT（DEV 缺失时回退根目录 BOOTLOG.TXT）。 */
 #define LOG_BUF_SIZE 524288u  /* 512KB, 覆盖 LBA 2-1000 (999 扇区 ~500KB) */
 static char g_log_buf[LOG_BUF_SIZE];
 static u32  g_log_len = 0;

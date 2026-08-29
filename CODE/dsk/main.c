@@ -34,6 +34,8 @@ typedef struct dsk_block_api_mirror {
     void *pad0; void *pad1;  /* register_device, device_count */
     block_read_fn  read;
     block_write_fn write;
+    void *pad2; void *pad3; void *pad4;  /* sector_size, device_name, set_write_fn */
+    u64 (*sector_count)(u32 index);      /* 0x38: tail-append, 老内核该槽为 NULL */
 } dsk_block_api_mirror;
 
 typedef struct dsk_kernel_api_mirror {
@@ -55,6 +57,8 @@ _Static_assert(offsetof(dsk_kernel_api_mirror, block) == 0xA8,
     "dsk_kernel_api_mirror.block offset must be 0xA8 (matching dkm_kernel_api)");
 _Static_assert(offsetof(dsk_block_api_mirror, read) == 16,
     "dsk_block_api_mirror.read offset must be 16 (matching dkm_block_api)");
+_Static_assert(offsetof(dsk_block_api_mirror, sector_count) == 0x38,
+    "dsk_block_api_mirror.sector_count offset must be 0x38 (matching dkm_block_api tail-append)");
 
 static void sputc(char c) { for(unsigned i=0;i<100000;i++){if(inb(COM1+5)&0x20)break;} outb(COM1,(u8)c); }
 static void swrite(const char *s) { while(*s){if(*s=='\n')sputc('\r');sputc(*s++);} }

@@ -117,6 +117,7 @@ typedef struct dkm_block_api {
     u64  (*sector_size)(u32 index);
     const char *(*device_name)(u32 index);
     int  (*set_write_fn)(u32 index, dkm_block_write_fn fn);
+    u64  (*sector_count)(u32 index);  /* 0x38: tail-append, 与 utsm/block.h 同步 */
 } dkm_block_api;
 
 /* ---- MMIO / 页表 API ----

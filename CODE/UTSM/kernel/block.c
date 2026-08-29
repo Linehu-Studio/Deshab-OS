@@ -58,6 +58,11 @@ static int block_set_write_fn_impl(u32 index, dkm_block_write_fn fn) {
     return 0;
 }
 
+static u64 block_sector_count_impl(u32 index) {
+    if (index >= g_device_count) return 0;
+    return g_devices[index].sector_count;
+}
+
 static const dkm_block_api g_block_api = {
     .register_device = block_register_device_impl,
     .device_count = block_device_count_impl,
@@ -65,7 +70,8 @@ static const dkm_block_api g_block_api = {
     .write = block_write_impl,
     .sector_size = block_sector_size_impl,
     .device_name = block_device_name_impl,
-    .set_write_fn = block_set_write_fn_impl
+    .set_write_fn = block_set_write_fn_impl,
+    .sector_count = block_sector_count_impl
 };
 
 const dkm_block_api *block_get_api(void) {

@@ -26,6 +26,10 @@ void dsm_load_by_manifest_ex(const ini_config *cfg);
  * Phase 1 已支持 LFN 长文件名 + 子目录遍历。 */
 extern int fat32_read_path(const char *path, u8 **out_data, u32 *out_size);
 
+/* dsk_loader.c: 实机启动日志落盘。把日志缓冲写入 FAT32 文件：
+ * SYSTEM/DESHAB64/DEV/BOOTLOG.TXT（DEV 缺失时回退根目录 BOOTLOG.TXT）。 */
+extern int utsm_bootlog_write(const u8 *data, u32 size);
+
 /* ---- 运行期配置全局变量（从 FUCK 文件初始化） ---- */
 u32 g_utsm_max_segments     = UTSM_MAX_SEGMENTS_DEFAULT;
 u32 g_utsm_max_capabilities = UTSM_MAX_CAPABILITIES_DEFAULT;
@@ -149,12 +153,16 @@ static int utsm_load_fuck_config(ini_config *cfg) {
     return -2;
 }
 
-/* === 实机日志持久化：把内存日志缓冲区写入磁盘原始扇区 ===
- * 开发测试用：实机无串口时，启动后用 WinHex/dd 读取磁盘对应扇区即可查看日志。
- * 扇区范围由 FUCK [boot] disk_log_start / disk_log_end 配置（默认 2-1000）。
- * 注意: 写入 LBA 1-33 会覆盖 GPT header/entries，重启后 Limine 可能无法找到 ESP。
- *       建议测试盘从 LBA 34 开始，或测试后重新烧录镜像。 */
-static void disk_log_flush(int start_lba, int end_lba) {
+/* === 实机日志持久化：把内存日志缓冲区写入 FAT32 文件 ===
+ * 目标: SYSTEM/DESHAB64/DEV/BOOTLOG.TXT（DEV 目录不存在时回退根目录 BOOTLOG.TXT）。
+ * 由 FUCK [boot] disk_log=1 启用。
+ * 相比旧原始扇区方案（LBA 2-1000）：
+ *   - 不再覆盖 GPT header/entries，不破坏 Limine 引导链
+ *   - 日志以普通 FAT32 文件呈现，主机直接读取即可，无需 WinHex/dd
+ * 日志超出 BOOTLOG_MAX_BYTES 时截断（128KB 足够覆盖完整启动链）。 */
+#define BOOTLOG_MAX_BYTES (128u * 1024u)
+
+static void disk_log_flush(void) {
     const dkm_kernel_api *api = dkm_get_kernel_api();
     if (!api || !api->block || !api->block->write || !api->block->device_count) {
         log_warn("[UTSM] disk_log: block device unavailable, skip");
@@ -164,10 +172,6 @@ static void disk_log_flush(int start_lba, int end_lba) {
         log_warn("[UTSM] disk_log: no block device, skip");
         return;
     }
-    if (end_lba <= start_lba) {
-        log_warn("[UTSM] disk_log: invalid sector range");
-        return;
-    }
 
     const char *buf = log_get_buffer();
     u32 len = log_get_length();
@@ -175,45 +179,16 @@ static void disk_log_flush(int start_lba, int end_lba) {
         log_warn("[UTSM] disk_log: log buffer empty, skip");
         return;
     }
+    if (len > BOOTLOG_MAX_BYTES) len = BOOTLOG_MAX_BYTES;
 
-    u32 avail_sectors = (u32)(end_lba - start_lba + 1);
-    u32 avail_bytes = avail_sectors * 512;
-    u32 write_bytes = (len < avail_bytes) ? len : avail_bytes;
-    u32 full_sectors = write_bytes / 512;
-    u32 rem_bytes = write_bytes % 512;
-    u64 lba = (u64)start_lba;
-    u32 offset = 0;
-
-    /* 写完整扇区（AHCI 单次最多 8 扇区，block API 内部分块） */
-    while (full_sectors > 0) {
-        u32 chunk = (full_sectors > 8) ? 8 : full_sectors;
-        int st = api->block->write(0, lba, chunk, buf + offset);
-        if (st != 0) {
-            log_error("[UTSM] disk_log: write failed");
-            log_hex64("[UTSM] disk_log: lba=", lba);
-            return;
-        }
-        lba += chunk;
-        offset += chunk * 512;
-        full_sectors -= chunk;
+    int rc = utsm_bootlog_write((const u8 *)buf, len);
+    if (rc == 0) {
+        log_info("[UTSM] disk_log: BOOTLOG.TXT written");
+        log_hex64("[UTSM] disk_log: bytes=", len);
+    } else {
+        log_error("[UTSM] disk_log: FAT32 write failed");
+        log_hex64("[UTSM] disk_log: rc=", (u64)(i64)rc);
     }
-
-    /* 最后一个不完整扇区：补零后写入 */
-    if (rem_bytes > 0) {
-        u8 tail[512];
-        for (u32 i = 0; i < 512; i++) tail[i] = 0;
-        for (u32 i = 0; i < rem_bytes; i++) tail[i] = (u8)buf[offset + i];
-        int st = api->block->write(0, lba, 1, tail);
-        if (st != 0) {
-            log_error("[UTSM] disk_log: tail write failed");
-            return;
-        }
-    }
-
-    log_info("[UTSM] disk_log: flushed to disk");
-    log_hex64("[UTSM] disk_log: start_lba=", (u64)start_lba);
-    log_hex64("[UTSM] disk_log: end_lba=", (u64)end_lba);
-    log_hex64("[UTSM] disk_log: bytes=", write_bytes);
 }
 
 void kernel_main(void) {
@@ -497,13 +472,11 @@ void kernel_main(void) {
         log_info("[UTSM] PE DLL manager initialized (SYSTEM/lib)");
     }
 
-    /* === 实机日志持久化：把启动日志写入磁盘原始扇区（开发测试用） === */
+    /* === 实机日志持久化：把启动日志写入 FAT32 文件 BOOTLOG.TXT === */
     {
         int disk_log = ini_get_bool(cfg, "boot", "disk_log", 0);
         if (disk_log) {
-            int log_start = ini_get_int(cfg, "boot", "disk_log_start", 2);
-            int log_end = ini_get_int(cfg, "boot", "disk_log_end", 1000);
-            disk_log_flush(log_start, log_end);
+            disk_log_flush();
         }
     }
 

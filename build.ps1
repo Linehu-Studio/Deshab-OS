@@ -1,5 +1,6 @@
 param(
-    [ValidateSet('dev','release','realtest','both')][string]$Variant = 'both'
+    [ValidateSet('dev','release','realtest','both')][string]$Variant = 'both',
+    [switch]$Vhd
 )
 
 $ErrorActionPreference = 'Stop'
@@ -211,8 +212,13 @@ function New-ShortEntry([string]$ShortName, [byte]$Attr, [int]$Cluster, [uint32]
 function Add-DirectoryEntry($Entries, [string]$Name, [byte]$Attr, [int]$Cluster, [uint32]$Size, $UsedNames) {
     $shortName = New-ShortFatName $Name $UsedNames
     $shortBytes = Get-ShortNameBytes $shortName
-    $upper = $Name.ToUpperInvariant()
-    $needsLfn = -not (Test-ShortFatName $upper) -or (($shortName.Trim() -replace ' +', '') -ne ($upper -replace '\.', ''))
+    # 用原始名（含大小写）判断是否生成 LFN：Test-ShortFatName 内部用
+    # -cmatch '[a-z]' 检测小写字母，含小写的名字（如 limine）必须生成
+    # LFN 才能在 Windows 上保留原始大小写显示。FAT32 查找仍不区分大小写。
+    # 注意：拆成两步赋值——PowerShell 5.1 对 `-not (函数调用) -or (...)` 内联
+    # 表达式解析异常返回 $null，分开赋值保证布尔短路正常。
+    $isUpperShort = Test-ShortFatName $Name
+    $needsLfn = (-not $isUpperShort) -or (($shortName.Trim() -replace ' +', '') -ne ($Name.ToUpperInvariant() -replace '\.', ''))
 
     if ($needsLfn) {
         $checksum = Get-LfnChecksum $shortBytes
@@ -501,32 +507,94 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
     Write-Host "[build] GPT + FAT32 ESP IMG: $ImagePath"
 }
 
+# Convert a raw GPT disk image to a fixed VHD by appending the 512-byte VHD
+# footer. Fixed VHD = raw data + footer, so this is a cheap copy + footer.
+# Windows can mount the result natively (double-click / Mount-DiskImage).
+function ConvertTo-FixedVhd([string]$RawImage, [string]$VhdPath) {
+    if (-not (Test-Path $RawImage)) { throw "Raw image not found: $RawImage" }
+    Copy-Item -LiteralPath $RawImage -Destination $VhdPath -Force
+    $fs = [System.IO.File]::Open($VhdPath, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $size = $fs.Length
+        $totalSectors = [UInt64]($size / 512)
+
+        $footer = [byte[]]::new(512)
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes('conectix'), 0, $footer, 0, 8)
+        Set-Le32 $footer 8 0x00000002          # features
+        Set-Le32 $footer 12 0x00010000         # file format version
+        Set-Le64 $footer 16 ([UInt64]::MaxValue) # data offset: fixed disk
+        $epoch = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+        Set-Le32 $footer 24 ([UInt64][Math]::Max(0, [int]([DateTime]::UtcNow - $epoch).TotalSeconds))
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes('dshb'), 0, $footer, 28, 4)
+        Set-Le32 $footer 32 0x00010000         # creator version
+        [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes('Wi2k'), 0, $footer, 36, 4)
+        Set-Le64 $footer 40 ([UInt64]$size)    # original size
+        Set-Le64 $footer 48 ([UInt64]$size)    # current size
+
+        # Disk geometry (VHD layout is big-endian here: 2-byte cylinders + 1 head + 1 spt)
+        $spt = 0; $h = 0
+        if ($totalSectors -ge 65535 * 16 * 255) { $spt = 255; $h = 16 }
+        elseif ($totalSectors -ge 65535 * 16 * 17) { $spt = 63; $h = 16 }
+        else { $spt = 17; $h = 16 }
+        $c = [UInt64][Math]::Floor([double]$totalSectors / ($h * $spt))
+        if ($c -gt 65535) { $c = 65535 }
+        $footer[56] = [byte](($c -shr 8) -band 0xFF)
+        $footer[57] = [byte]($c -band 0xFF)
+        $footer[58] = [byte]$h
+        $footer[59] = [byte]$spt
+
+        Set-Le32 $footer 60 2                   # disk type: fixed
+        [Array]::Copy(([Guid]::NewGuid()).ToByteArray(), 0, $footer, 68, 16)
+        $footer[84] = 0                         # saved state: normal
+
+        # Checksum: one's complement of the uint32 sum over the whole footer
+        $sum = [UInt64]0
+        for ($i = 0; $i -lt 512; $i += 4) {
+            $sum = ($sum + [BitConverter]::ToUInt32($footer, $i)) -band 0xFFFFFFFF
+        }
+        Set-Le32 $footer 64 ((0xFFFFFFFF -bxor $sum) -band 0xFFFFFFFF)
+
+        [void]$fs.Seek(0, [System.IO.SeekOrigin]::End)
+        $fs.Write($footer, 0, 512)
+    } finally {
+        $fs.Close()
+    }
+    Write-Host "[build] VHD (Windows mountable): $VhdPath"
+}
+
 # Build a single image variant (dev/release): inject FUCK + firstInit.txt from
 # build/configs/<variant>/ into SYSTEM/, then package via New-GptFat32Image.
 # If $ImagePath is $null, only injects config without packaging (used to
 # restore SYSTEM dir to dev config after dual-image build).
+# NOTE: configs/<variant> dir may be absent; then SYSTEM is packaged as-is.
 function Build-ImageVariant([string]$VariantName, [string]$ImagePath) {
     $cfgDir = Join-Path $ConfigsDir $VariantName
-    if (-not (Test-Path $cfgDir)) {
-        throw "Config variant directory not found: $cfgDir"
+
+    if (Test-Path $cfgDir) {
+        $fuckSrc = Join-Path $cfgDir 'FUCK'
+        $fuckDst = Join-Path $SystemDir 'system\deshab64\FUCK'
+        $fiSrc   = Join-Path $cfgDir 'firstInit.txt'
+        $fiDst   = Join-Path $SystemDir 'system\user\use\firstInit.txt'
+
+        if (-not (Test-Path $fuckSrc)) { throw "Missing FUCK template: $fuckSrc" }
+        if (-not (Test-Path $fiSrc))   { throw "Missing firstInit.txt template: $fiSrc" }
+
+        Copy-Item -LiteralPath $fuckSrc -Destination $fuckDst -Force
+        Copy-Item -LiteralPath $fiSrc   -Destination $fiDst   -Force
+        Write-Host "[build] Injected config variant=$VariantName (FUCK + firstInit.txt)"
+    } else {
+        Write-Host "[build] WARN: configs/$VariantName absent, packaging SYSTEM as-is"
     }
-
-    $fuckSrc = Join-Path $cfgDir 'FUCK'
-    $fuckDst = Join-Path $SystemDir 'system\deshab64\FUCK'
-    $fiSrc   = Join-Path $cfgDir 'firstInit.txt'
-    $fiDst   = Join-Path $SystemDir 'system\user\use\firstInit.txt'
-
-    if (-not (Test-Path $fuckSrc)) { throw "Missing FUCK template: $fuckSrc" }
-    if (-not (Test-Path $fiSrc))   { throw "Missing firstInit.txt template: $fiSrc" }
-
-    Copy-Item -LiteralPath $fuckSrc -Destination $fuckDst -Force
-    Copy-Item -LiteralPath $fiSrc   -Destination $fiDst   -Force
-    Write-Host "[build] Injected config variant=$VariantName (FUCK + firstInit.txt)"
 
     if ($ImagePath) {
         # Phase 0: ESP enlarged from 768 to $EspSizeMB (default 2048) to fit
         # VSCode + Electron + GUI stack libs (VSCode integration roadmap).
         New-GptFat32Image $SystemDir $ImagePath $EspSizeMB
+        if ($Vhd) {
+            $vhdPath = [System.IO.Path]::ChangeExtension($ImagePath, '.vhd')
+            ConvertTo-FixedVhd $ImagePath $vhdPath
+        }
     }
 }
 
@@ -785,6 +853,7 @@ Build-DkmDriver (Join-Path $Root 'CODE\DKM\apic\apic.c') (Join-Path $SystemDir '
 
 Write-Host '[build] Building DKM storage drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\nvme\nvme.c') (Join-Path $SystemDir 'driver\block\nvme.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\ehci\ehci.c') (Join-Path $SystemDir 'driver\block\ehci.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\xhci\xhci.c') (Join-Path $SystemDir 'driver\block\xhci.drv')
 
 Write-Host '[build] Building DKM network drivers...'

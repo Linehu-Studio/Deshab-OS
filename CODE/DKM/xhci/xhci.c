@@ -92,6 +92,9 @@ const struct dkm_driver_desc driver_desc = {
 #define XHCI_RT_IR0_ERDP_LO   0x38
 #define XHCI_RT_IR0_ERDP_HI   0x3C
 
+/* ERDP bits: bit3 = Event Handler Busy (软件写 1 清挂起) */
+#define ERDP_EHB      (1u << 3)
+
 /* USBCMD bits */
 #define USBCMD_RS     (1u << 0)
 #define USBCMD_RST   (1u << 1)
@@ -109,8 +112,11 @@ const struct dkm_driver_desc driver_desc = {
 #define PORTSC_PR    (1u << 4)
 #define PORTSC_PLS_SHIFT 5
 #define PORTSC_PLS_MASK  0xF
-#define PORTSC_SPEED_SHIFT 17
-#define PORTSC_SPEED_MASK  0x7
+/* Port Speed 字段在 PORTSC bits[13:10]（xHCI 1.2 §5.4.8）。
+ * BUG-FIX: 原实现 shift=17/mask=0x7 是错的——QEMU 用 10:13，
+ * 误读导致 SuperSpeed(4) 被当成 FULL(1)，EP0 MPS 错误。 */
+#define PORTSC_SPEED_SHIFT 10
+#define PORTSC_SPEED_MASK  0xF
 
 /* TRB types */
 #define TRB_TYPE_NORMAL        0x01
@@ -124,12 +130,14 @@ const struct dkm_driver_desc driver_desc = {
 #define TRB_TYPE_CONFIGURE_EP 0x0C
 #define TRB_TYPE_NOOP         0x17
 
-/* Event TRB types — same namespace as command/transfer TRB types.
- * Per xHCI spec §6.4: these are the TRB Type field values in the
- * Event TRB control dword [15:10]. */
-#define EVT_TYPE_TRANSFER     0x01   /* Transfer Event */
-#define EVT_TYPE_CMD_COMPLETE 0x02   /* Command Completion Event */
-#define EVT_TYPE_PORT_CHANGE 0x21   /* Port Status Change Event */
+/* Event TRB types — xHCI 1.2 spec Table 6-28 (TRB Type field [15:10]).
+ * 规范值：Transfer=0x20, Command Completion=0x21, Port Status Change=0x22。
+ * BUG-FIX: 原定义 0x01/0x02/0x21 与规范冲突——CMD_COMPLETE(0x21) 被
+ * 误判为 PORT_CHANGE 事件消费，导致 Enable Slot 等命令事件环被提前
+ * 清空，后续命令全部超时（QEMU hcd-xhci.c xhci_write_event 佐证）。 */
+#define EVT_TYPE_TRANSFER     0x20   /* Transfer Event */
+#define EVT_TYPE_CMD_COMPLETE 0x21   /* Command Completion Event */
+#define EVT_TYPE_PORT_CHANGE 0x22   /* Port Status Change Event */
 
 /* TRB control field helpers */
 #define TRB_TYPE_SHIFT 10
@@ -281,6 +289,149 @@ static void log_hex(const char *prefix, u64 value) {
     g_log->info(buf);
 }
 
+/* ================================================================
+ *  Framebuffer 阶段诊断（实机无串口时屏幕直接显示 xhci 失败点）
+ *  失败时整屏填背景色 + 中央画大号两位十六进制状态码，然后 halt。
+ *  码表（调用点注释中注明）：
+ *    红底 0x01..0x07  基础设施失败（PCI/MMIO/caps/reset/ring/start）
+ *    红底 0x11..0x14  PCI 自检细分（见 xhci_pci_diag_code）
+ *    黄底 0x08        所有端口无设备可枚举
+ *    黄底 0x0A..0x0F  枚举失败（slot/address/descriptor/configure/scsi）
+ *  依赖 dkm_kernel_api.fb_* 字段（32bpp，与 console_fb 一致）。
+ * ================================================================ */
+static const u8 g_fb_font_hex[16][8] = {
+    {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0x00}, /* 0 */
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00}, /* 1 */
+    {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0x00}, /* 2 */
+    {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00}, /* 3 */
+    {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00}, /* 4 */
+    {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00}, /* 5 */
+    {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00}, /* 6 */
+    {0x7E,0x66,0x06,0x0C,0x18,0x18,0x18,0x00}, /* 7 */
+    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00}, /* 8 */
+    {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00}, /* 9 */
+    {0x3C,0x66,0x66,0x7E,0x66,0x66,0x66,0x00}, /* A */
+    {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0x00}, /* B */
+    {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00}, /* C */
+    {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0x00}, /* D */
+    {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0x00}, /* E */
+    {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0x00}, /* F */
+};
+
+static void fb_draw_char(u32 *fb, u64 pitch, int x0, int y0, int scale,
+                         u32 color, int ch) {
+    const u8 *g = g_fb_font_hex[ch & 0xF];
+    for (int row = 0; row < 8; row++) {
+        u8 bits = g[row];
+        for (int col = 0; col < 8; col++) {
+            if (!(bits & (0x80u >> col))) continue;
+            for (int sy = 0; sy < scale; sy++) {
+                u32 *line = (u32 *)((u8 *)fb + (u64)(y0 + row * scale + sy) * pitch);
+                for (int sx = 0; sx < scale; sx++)
+                    line[x0 + col * scale + sx] = color;
+            }
+        }
+    }
+}
+
+static void fb_diag_show(const struct dkm_kernel_api *api, u32 bg, u32 code) {
+    if (!api || !api->fb_address || !api->fb_width || !api->fb_height)
+        return;  /* 无 framebuffer 时退化为仅串口日志 */
+    u32 *fb = (u32 *)api->fb_address;
+    u64 pitch = api->fb_pitch;
+    u64 w = api->fb_width, h = api->fb_height;
+    for (u64 y = 0; y < h; y++) {
+        u32 *line = (u32 *)((u8 *)fb + y * pitch);
+        for (u64 x = 0; x < w; x++) line[x] = bg;
+    }
+    int scale = 8;
+    int cw = 8 * scale;
+    int cx = (int)(w / 2) - cw;             /* 两位数字整体居中 */
+    int cy = (int)(h / 2) - (8 * scale) / 2;
+    u32 fg = 0xFFFFFFFFu;
+    if (code >= 0x10) fb_draw_char(fb, pitch, cx, cy, scale, fg, (int)(code >> 4));
+    fb_draw_char(fb, pitch, cx + cw, cy, scale, fg, (int)(code & 0xF));
+    /* 停住屏幕，等待实机拍照/观察 */
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
+/* 任意位数 hex（n=1..8），低位在前填充 */
+static void fb_draw_hexn(u32 *fb, u64 pitch, int x0, int y0, int scale,
+                         u32 color, u32 v, int n) {
+    for (int i = 0; i < n; i++) {
+        int nib = (int)((v >> (4 * (n - 1 - i))) & 0xF);
+        fb_draw_char(fb, pitch, x0 + i * 8 * scale, y0, scale, color, nib);
+    }
+}
+
+/* PCI 自检诊断清单项（bus/dev/device_id/class/progif） */
+struct usb_ctl_info {
+    u32 bus;
+    u32 dev;
+    u32 devid;    /* PCI device ID */
+    u32 cls;      /* (class<<8)|subclass */
+    u32 progif;
+};
+
+/* 扩展诊断：大字标题码 + 下方逐行列出扫描到的 PCI 设备。
+ * 每行：bus(1) dev(1) deviceid(4) = 左 6 hex，class(2) progif(2) = 右 4 hex。
+ * scale=2 支持 16 行（640x480 完整容纳）。device ID 用于区分芯片型号：
+ *   Intel 7系: xHCI=1e31, EHCI1=1e2d, EHCI2=1e26
+ *   Intel 6系: EHCI1=1c2d, EHCI2=1c26 (H61 仅 1 个 EHCI)
+ *   第三方 USB3: ASMedia=1b21, Renesas=1033 */
+/* 诊断用，保留 */
+static void fb_diag_show_usb(const struct dkm_kernel_api *api, u32 bg, u32 code,
+                             const struct usb_ctl_info *usb, u32 usb_count) __attribute__((unused));
+static void fb_diag_show_usb(const struct dkm_kernel_api *api, u32 bg, u32 code,
+                             const struct usb_ctl_info *usb, u32 usb_count) {
+    if (!api || !api->fb_address || !api->fb_width || !api->fb_height)
+        return;
+    u32 *fb = (u32 *)api->fb_address;
+    u64 pitch = api->fb_pitch;
+    u64 w = api->fb_width, h = api->fb_height;
+    for (u64 y = 0; y < h; y++) {
+        u32 *line = (u32 *)((u8 *)fb + y * pitch);
+        for (u64 x = 0; x < w; x++) line[x] = bg;
+    }
+    u32 fg = 0xFFFFFFFFu;
+    /* 标题大字（scale 6，两位居中，固定顶部） */
+    int s = 6, cw = 8 * s;
+    int cx = (int)(w / 2) - cw;
+    int cy = 8;
+    if (code >= 0x10) fb_draw_char(fb, pitch, cx, cy, s, fg, (int)(code >> 4));
+    fb_draw_char(fb, pitch, cx + cw, cy, s, fg, (int)(code & 0xF));
+    /* 信息行（scale 2，最多 16 行）：
+     * 左：bus(1)+dev(1)+devid(4)=6 hex；右：class(2)+progif(2)=4 hex */
+    int s2 = 2, cw2 = 8 * s2;
+    int row_y = cy + 8 * s + 8;
+    int total = (6 + 1 + 4) * cw2;          /* 176px */
+    int xl = (int)(w / 2) - total / 2;
+    int xr = xl + (6 + 1) * cw2;
+    u32 max_rows = usb_count < 16 ? usb_count : 16;
+    for (u32 i = 0; i < max_rows; i++) {
+        u32 bd = ((usb[i].bus & 0xFF) << 4) | (usb[i].dev & 0x1F);
+        fb_draw_hexn(fb, pitch, xl, row_y, s2, fg, bd, 2);
+        fb_draw_hexn(fb, pitch, xl + 2 * cw2, row_y, s2, fg, usb[i].devid & 0xFFFF, 4);
+        fb_draw_hexn(fb, pitch, xr, row_y, s2, fg, usb[i].cls & 0xFFFF, 2);
+        fb_draw_hexn(fb, pitch, xr + 2 * cw2, row_y, s2, fg, usb[i].progif & 0xFFFF, 2);
+        row_y += 8 * s2 + 4;                /* 20px/行 */
+    }
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
+/* 红底 = 基础设施失败，halt（0xFFFF0000 在 BGRA 下是纯红；
+ * 原 0xFF0000FF 实际渲染为蓝——0x01 那次实机测试显示“蓝底”即此原因） */
+#define FB_FATAL(api, code) fb_diag_show((api), 0xFFFF0000u, (code))
+/* 红底 PCI 自检：标题码 + USB 控制器清单 */
+#define FB_FATAL_show_usb(api, code) \
+    fb_diag_show_usb((api), 0xFFFF0000u, (code), g_diag_usb, g_diag_usb_count)
+/* 黄底 = 枚举失败，halt */
+#define FB_ENUM_FAIL(code)  fb_diag_show(g_api, 0xFFFFC800u, (code))
+
 static void xhci_zero(void *ptr, u32 len) {
     u8 *p = (u8 *)ptr;
     for (u32 i = 0; i < len; i++) p[i] = 0;
@@ -320,6 +471,96 @@ static __inline__ void xhci_mb(void) {
 /* ================================================================
  *  Phase 1: PCI discovery + MMIO mapping
  * ================================================================ */
+
+/* PCI 自检：区分“传统 0xCF8/0xCFC 配置机制失效” vs “确实无 xHCI 控制器”。
+ * 实机现象：xhci_find 全扫描失败（诊断码 0x01）——USB3 主板必然有 xHCI，
+ * 扫不到只可能是 (a) 配置机制读不到任何设备 (b) 设备在异常位置 (c) 控制器
+ * 是 EHCI 等非 xHCI。返回细分诊断码：
+ *   0x11  bus0/dev0/func0 vendor=0xFFFF → 0xCF8/0xCFC 机制失效
+ *   0x12  机制可用但全扫描无任何 USB 控制器 (class 0x0C/03)
+ *   0x13  有 USB 控制器但无 prog_if=0x30（全部 EHCI/UHCI/OHCI）
+ *   0x14  存在 prog_if=0x30 的 xHCI 但 xhci_find 漏匹配（防御性，理论不可能）
+ * 同时把扫描到的设备填入 g_diag_usb 供屏幕显示——记录策略：
+ * 第一遍收集全部 USB 控制器（class 0C/03，含 bus1+ 第三方芯片），
+ * 第二遍收集其他设备（bus0 优先），总上限 16 行。
+ * 关键 device ID 判读：Intel 7系 xHCI=1e31 / EHCI1=1e2d / EHCI2=1e26；
+ * Intel 6系 EHCI1=1c2d / EHCI2=1c26（H61 仅 1 个）；ASMedia=1b21；
+ * Renesas=1033。 */
+static struct usb_ctl_info g_diag_usb[16];
+static u32 g_diag_usb_count;
+
+#define DIAG_MAX 16
+
+static void diag_add(u32 bus, u32 dev, u32 devid, u32 cls, u32 progif) {
+    if (g_diag_usb_count >= DIAG_MAX) return;
+    g_diag_usb[g_diag_usb_count].bus    = bus;
+    g_diag_usb[g_diag_usb_count].dev    = dev;
+    g_diag_usb[g_diag_usb_count].devid  = devid;
+    g_diag_usb[g_diag_usb_count].cls    = cls;
+    g_diag_usb[g_diag_usb_count].progif = progif;
+    g_diag_usb_count++;
+}
+
+/* 诊断用，保留（无 xHCI 场景默认不调用，可通过临时改 driver_init 调试） */
+static u32 xhci_pci_diag_code(void) __attribute__((unused));
+static u32 xhci_pci_diag_code(void) {
+    u32 vd0 = dkm_pci_read(0, 0, 0, PCI_VENDOR_ID);
+    g_diag_usb_count = 0;
+    if ((vd0 & 0xffff) == 0xffff) return 0x11;
+
+    u32 usb_total = 0, xhci_total = 0;
+
+    /* 第一遍：USB 控制器（全 bus，含 bus1+ 第三方芯片） */
+    for (u16 bus = 0; bus < 256; bus++) {
+        for (u8 dev = 0; dev < 32; dev++) {
+            u32 vd = dkm_pci_read((u8)bus, dev, 0, PCI_VENDOR_ID);
+            if ((vd & 0xffff) == 0xffff) continue;
+            u8 header = (u8)(dkm_pci_read((u8)bus, dev, 0, PCI_HEADER) >> 16);
+            u8 func_count = (header & 0x80) ? 8 : 1;
+            for (u8 func = 0; func < func_count; func++) {
+                u32 vd2 = dkm_pci_read((u8)bus, dev, func, PCI_VENDOR_ID);
+                if ((vd2 & 0xffff) == 0xffff) continue;
+                u32 class_reg = dkm_pci_read((u8)bus, dev, func, 0x08);
+                u8 prog_if    = (u8)((class_reg >> 8)  & 0xff);
+                u8 subclass   = (u8)((class_reg >> 16) & 0xff);
+                u8 class_code = (u8)((class_reg >> 24) & 0xff);
+                if (class_code == 0x0C && subclass == 0x03) {
+                    usb_total++;
+                    if (prog_if == 0x30) xhci_total++;
+                    diag_add(bus, dev, vd2 >> 16,
+                             (u32)((class_code << 8) | subclass), prog_if);
+                }
+            }
+        }
+    }
+
+    /* 第二遍：其他设备补位（bus0 优先） */
+    if (g_diag_usb_count < DIAG_MAX) {
+        for (u16 bus = 0; bus < 256 && g_diag_usb_count < DIAG_MAX; bus++) {
+            for (u8 dev = 0; dev < 32 && g_diag_usb_count < DIAG_MAX; dev++) {
+                u32 vd = dkm_pci_read((u8)bus, dev, 0, PCI_VENDOR_ID);
+                if ((vd & 0xffff) == 0xffff) continue;
+                u8 header = (u8)(dkm_pci_read((u8)bus, dev, 0, PCI_HEADER) >> 16);
+                u8 func_count = (header & 0x80) ? 8 : 1;
+                for (u8 func = 0; func < func_count && g_diag_usb_count < DIAG_MAX; func++) {
+                    u32 vd2 = dkm_pci_read((u8)bus, dev, func, PCI_VENDOR_ID);
+                    if ((vd2 & 0xffff) == 0xffff) continue;
+                    u32 class_reg = dkm_pci_read((u8)bus, dev, func, 0x08);
+                    u8 prog_if    = (u8)((class_reg >> 8)  & 0xff);
+                    u8 subclass   = (u8)((class_reg >> 16) & 0xff);
+                    u8 class_code = (u8)((class_reg >> 24) & 0xff);
+                    if (class_code == 0x0C && subclass == 0x03) continue; /* 已收集 */
+                    diag_add(bus, dev, vd2 >> 16,
+                             (u32)((class_code << 8) | subclass), prog_if);
+                }
+            }
+        }
+    }
+
+    if (usb_total == 0) return 0x12;
+    if (xhci_total > 0) return 0x14;
+    return 0x13;
+}
 
 static int xhci_find(u8 *out_bus, u8 *out_dev, u8 *out_func) {
     for (u16 bus = 0; bus < 256; bus++) {
@@ -518,9 +759,18 @@ static int xhci_parse_caps(void) {
     g_doorbell_off = mmio_read32(XHCI_CAP_DBOFF) & 0xFFFFFFF0u;
     g_runtime_off  = mmio_read32(XHCI_CAP_RTSOFF) & 0xFFFFFFE0u;
 
-    /* Page size */
+    /* Page size: PAGESIZE 寄存器 bit[n] 置位表示支持 2^(n+12) 字节页。
+     * 取置位的最低 bit（xHCI 规范要求软件使用最小支持页）。
+     * 原实现 (ps_reg & 0xF) 语义错误，实机多 bit 置位时会得到错误页大小。 */
     u32 ps_reg = mmio_read32(g_cap_length + XHCI_OP_PAGESIZE);
-    g_page_size = 1u << ((ps_reg & 0xF) + 12);
+    u32 ps_bits = ps_reg & 0xFFFFu;
+    u32 ps_shift = 0;
+    if (ps_bits) {
+        while (!(ps_bits & 1u)) { ps_bits >>= 1; ps_shift++; }
+        g_page_size = 4096u << ps_shift;
+    } else {
+        g_page_size = 4096;
+    }
 
     log_hex("[xhci] CAPLEN=", g_cap_length);
     log_hex("[xhci] MaxSlots=", g_max_slots);
@@ -591,9 +841,13 @@ static u32 xhci_ring_enqueue(xhci_ring *ring, u64 param, u32 status, u32 control
     return idx;
 }
 
-/* Ring a doorbell: slot_id=0 for command, otherwise endpoint doorbell */
+/* Ring a doorbell: slot_id=0 for command, otherwise endpoint doorbell。
+ * Doorbell Registers 每个 4 字节（xHCI 1.2 §5.6）：offset = slot_id * 4。
+ * BUG-FIX: 原实现 slot_id * 0x20 偏移错误——QEMU 门铃区 reg>>=2 后
+ * reg 即 slot_id，0x20 偏移会敲到 slot 8，该 slot 无 EP → 控制器不
+ * 处理 TRB → 无 Transfer Event → 轮询超时。 */
 static void xhci_ring_doorbell(u32 slot_id, u32 target) {
-    mmio_write32(g_doorbell_off + slot_id * 0x20, target);
+    mmio_write32(g_doorbell_off + slot_id * 4, target);
 }
 
 /* ================================================================
@@ -627,9 +881,9 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
                 g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
                 if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
 
-                /* Update ERDP */
+                /* Update ERDP: 地址 16 字节对齐，bit0 保持 0，bit3=EHB 清挂起 */
                 u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
-                mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | g_evt_ccs);
+                mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
 
                 /* Check completion code */
                 u32 cc = (evt->status >> 24) & 0xFF;
@@ -659,7 +913,7 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
             g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
             if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
             u64 erdp2 = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
-            mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp2 | g_evt_ccs);
+            mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp2 | ERDP_EHB);
             continue;
         }
 
@@ -677,7 +931,7 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
 
 static int xhci_cmd_submit(u64 param, u32 status, u32 control,
                            u64 timeout_ms,
-                           u64 *out_param, u32 *out_status) {
+                           u64 *out_param, u32 *out_status, u32 *out_control) {
     /* Clear Event Ring interrupt pending */
     mmio_write32(g_runtime_off + XHCI_RT_IR0_IMAN,
                  mmio_read32(g_runtime_off + XHCI_RT_IR0_IMAN) | 2u);
@@ -705,7 +959,7 @@ static int xhci_cmd_submit(u64 param, u32 status, u32 control,
     }
 
     int rc = xhci_poll_event(EVT_TYPE_CMD_COMPLETE, timeout_ms,
-                             out_param, out_status, 0);
+                             out_param, out_status, out_control);
 
     /* Clear EINT */
     mmio_write32(g_cap_length + XHCI_OP_USBSTS,
@@ -810,8 +1064,8 @@ static int xhci_controller_start(void) {
     /* Configure Event Ring */
     mmio_write32(g_runtime_off + XHCI_RT_IR0_ERSTSZ, 1);
     mmio_write64(g_runtime_off + XHCI_RT_IR0_ERSTBA_LO, g_erst.phys);
-    u64 erdp = g_evt_ring.dma.phys | (u64)g_evt_ccs;
-    mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp);
+    u64 erdp = g_evt_ring.dma.phys;
+    mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
 
     /* Enable interrupt (IMAN.IE=1) */
     mmio_write32(g_runtime_off + XHCI_RT_IR0_IMAN,
@@ -883,7 +1137,7 @@ static int xhci_reset_port(u32 port_idx) {
                 g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
                 if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
                 u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
-                mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | g_evt_ccs);
+                mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
             }
 
             return 0;
@@ -911,15 +1165,18 @@ static int xhci_enable_slot(u8 *out_slot_id) {
     u32 control = (TRB_TYPE_ENABLE_SLOT << TRB_TYPE_SHIFT);
     u64 out_param = 0;
     u32 out_status = 0;
+    u32 out_control = 0;
 
-    int rc = xhci_cmd_submit(0, 0, control, 5000, &out_param, &out_status);
+    int rc = xhci_cmd_submit(0, 0, control, 5000, &out_param, &out_status, &out_control);
     if (rc != 0) {
         g_log->error("[xhci] Enable Slot failed");
         return rc;
     }
 
-    /* Slot ID is in the upper bits of the completion event parameter */
-    *out_slot_id = (u8)((out_param >> 24) & 0xFF);
+    /* Slot ID 位于 Command Completion Event 的 TRB control[31:24]。
+     * (xHCI 1.2 §6.4.2.2：CMD_COMPLETE 事件 TRB parameter = 命令 TRB 地址，
+     *  slot id 在 control 高字节 —— QEMU hcd-xhci.c xhci_write_event 佐证) */
+    *out_slot_id = (u8)((out_control >> 24) & 0xFF);
     log_hex("[xhci] slot_id=", *out_slot_id);
     return 0;
 }
@@ -940,7 +1197,8 @@ static int xhci_address_device(u8 slot_id, int bsr) {
 
     u64 out_param = 0;
     u32 out_status = 0;
-    int rc = xhci_cmd_submit(input_ctx_phys, 0, control, 5000, &out_param, &out_status);
+    u32 out_control = 0;
+    int rc = xhci_cmd_submit(input_ctx_phys, 0, control, 5000, &out_param, &out_status, &out_control);
     if (rc != 0) {
         g_log->error("[xhci] Address Device failed");
         return rc;
@@ -958,7 +1216,8 @@ static int xhci_configure_endpoint(u8 slot_id) {
 
     u64 out_param = 0;
     u32 out_status = 0;
-    int rc = xhci_cmd_submit(input_ctx_phys, 0, control, 5000, &out_param, &out_status);
+    u32 out_control = 0;
+    int rc = xhci_cmd_submit(input_ctx_phys, 0, control, 5000, &out_param, &out_status, &out_control);
     if (rc != 0) {
         g_log->error("[xhci] Configure Endpoint failed");
         return rc;
@@ -979,7 +1238,16 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
                  ((u64)setup_pkt[2] << 16) | ((u64)setup_pkt[3] << 24);
 
     u32 setup_status = 8;  /* Setup packet length */
-    u32 setup_control = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IOC;
+    /* Setup Stage TRB（不设 IOC：控制传输只需在最后一个 TRB 上报完成，
+     * 中间 TRB 设 IOC 会让 QEMU/实机产生多余 Transfer Event，残留事件
+     * 污染后续 CMD_COMPLETE 轮询——日志表现为 "unexpected event type"） */
+    u32 setup_control = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT);
+    /* Setup Stage TRB 必须设置 IDT (Immediate Data, bit6)：
+     * setup 包 8 字节直接内嵌在 TRB parameter 字段。
+     * BUG-FIX: 原实现缺 IDT，QEMU xhci_fire_ctl_transfer 校验
+     * `!(trb_setup->control & TRB_TR_IDT)` 直接返回 -1 → 无 Transfer
+     * Event → 轮询超时（GET_DESCRIPTOR 失败）。 */
+    setup_control |= (1u << 6);  /* TRB_TR_IDT */
     /* Set direction in TRB: bit 16 of Setup Stage TRB */
     if (direction) setup_control |= (1u << 16);
 
@@ -995,7 +1263,8 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
 
         u64 data_phys = direction ? g_xfer_buf.phys : g_xfer_buf.phys;
         u32 data_status = data_len;
-        u32 data_control = (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT) | TRB_IOC;
+        /* Data Stage 不设 IOC（避免多余事件残留） */
+        u32 data_control = (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT);
         if (direction) data_control |= (1u << 16);  /* DIR=IN */
 
         xhci_ring_enqueue(&g_ep0_ring, data_phys, data_status, data_control);
@@ -1088,7 +1357,11 @@ static int xhci_bulk_transfer(xhci_ring *ring, u8 ep_num,
     xhci_ring_enqueue(ring, g_xfer_buf.phys, data_len, control);
 
     xhci_mb();
-    xhci_ring_doorbell(g_msc.slot_id, ep_num);
+    /* Doorbell target = Endpoint ID：EPn OUT→2n，EPn IN→2n+1。
+     * BUG-FIX: 原实现传 EP 号（2/1），QEMU xhci_kick_ep 按 Endpoint ID
+     * 索引 eps[epid-1] → 敲错端点 → 无 Transfer Event → 轮询超时。 */
+    u8 db_target = (direction ? (u8)(2u * ep_num + 1) : (u8)(2u * ep_num));
+    xhci_ring_doorbell(g_msc.slot_id, db_target);
 
     /* Poll for Transfer Event */
     u64 out_param = 0;
@@ -1097,6 +1370,7 @@ static int xhci_bulk_transfer(xhci_ring *ring, u8 ep_num,
                              &out_param, &out_status, 0);
     if (rc != 0) {
         g_log->warn("[xhci] bulk transfer failed");
+        log_hex("[xhci] bulk rc=", (u64)(i64)rc);
         return rc;
     }
 
@@ -1343,32 +1617,48 @@ static int xhci_block_write(void *ctx, u64 lba, u32 count, const void *buffer) {
  *  Phase 3: Build Input Context for Address Device
  * ================================================================ */
 
-static void xhci_build_input_ctx_slot(u8 slot_id, u8 speed, u16 mps0) {
+static void xhci_build_input_ctx_slot(u8 slot_id, u8 speed, u16 mps0, u32 port_idx) {
     (void)slot_id;
     u32 ctx_sz = g_ctx_size;
     u8 *ic = (u8 *)g_input_ctx.virt;
     xhci_zero(ic, g_input_ctx.size);
 
-    /* Input Control Context: enable Slot Context (bit 0) and EP0 (bit 1) */
+    /* Input Control Context (xHCI 1.2 §6.4.3):
+     *   DWORD0 = Drop Context Flags（本次全 0，不 drop 任何上下文）
+     *   DWORD1 = Add Context Flags（bit0=Slot, bit1=EP0）
+     * BUG-FIX: 原实现把 Add flags 写进 DWORD0（Drop 槽），
+     * QEMU/实机校验 ictl_ctx[0]==0 && ictl_ctx[1]==0x3 直接失败 CC_TRB_ERROR。 */
     u32 *icc = (u32 *)ic;
-    icc[0] = (1u << 1) | (1u << 0);  /* A0=1 (Slot), A1=1 (EP0) */
+    icc[0] = 0x0;                                /* Drop Context Flags */
+    icc[1] = (1u << 0) | (1u << 1);              /* Add: Slot + EP0 */
 
-    /* Slot Context starts at offset ctx_sz */
+    /* Slot Context (§6.2.2):
+     *   DWORD0: Route String [0:19] + Speed [20:22] + Context Entries [27:31]
+     *   DWORD1: Max Exit Latency [0:7] + Root Hub Port Number [16:23]
+     * BUG-FIX: 原实现 speed<<29（占用 Context Entries 位域）、MPS0 写入
+     * DWORD1（规范 Slot Context 无 MPS0 字段，MPS0 在 EP0 Context）——
+     * QEMU xhci_lookup_uport 读 DWORD1[16:23] 找端口，原值 port=0 查不到
+     * 设备 → CC_TRB_ERROR。 */
     u32 *slot_ctx = (u32 *)(ic + ctx_sz);
     u32 route_string = 0;  /* direct-connect, no hub */
-    slot_ctx[0] = route_string | ((u32)speed << 29);
-    slot_ctx[1] = (u32)mps0;  /* Max Packet Size for EP0 */
-    slot_ctx[2] = (1u << 27); /* Context Entries = 1 (only EP0) */
+    slot_ctx[0] = route_string | ((u32)speed << 20) | (1u << 27);
+    slot_ctx[1] = (port_idx + 1) << 16;  /* Root Hub Port Number (1-based) */
 
-    /* EP0 Context starts at offset ctx_sz * 2 */
+    /* EP0 Context starts at offset ctx_sz * 2
+     * Endpoint Context (§6.2.3) 布局：
+     *   DWORD1: CErr[4:5] + EP Type[6:8] + Max Packet Size[16:31]
+     *   DWORD2: Dequeue Pointer Low[4:31]（bit0=DCS, bits1:3=reserved）
+     *   DWORD3: Dequeue Pointer High
+     *   DWORD4: Average TRB Length[0:15]
+     * BUG-FIX: 原实现把 dequeue 写到 DWORD6/7——QEMU xhci_init_epctx
+     * 从 DWORD2/3 读 dequeue（ctx[2]&~0xf, ctx[3]），读到 0 → ring 无
+     * dequeue → kick_epctx 直接返回，TRB 永不处理 → 无 Transfer Event。 */
     u32 *ep0_ctx = (u32 *)(ic + ctx_sz * 2);
-    /* EP Type = Control, Max Packet Size, etc. */
     ep0_ctx[1] = (4u << 3) | ((u32)mps0 << 16);  /* EP Type=4 (Control IN), MPS */
-    ep0_ctx[4] = 8;   /* Average TRB Length */
-    /* Dequeue Pointer: EP0 transfer ring */
     u64 ep0_deq = g_ep0_ring.dma.phys | (u64)g_ep0_ring.ccs;
-    ep0_ctx[6] = (u32)(ep0_deq & 0xFFFFFFFFu);
-    ep0_ctx[7] = (u32)(ep0_deq >> 32);
+    ep0_ctx[2] = (u32)(ep0_deq & 0xFFFFFFF0u) | (u32)g_ep0_ring.ccs;
+    ep0_ctx[3] = (u32)(ep0_deq >> 32);
+    ep0_ctx[4] = 8;   /* Average TRB Length */
 }
 
 static void xhci_build_input_ctx_bulk_eps(u8 bulk_out_ep, u8 bulk_in_ep,
@@ -1376,31 +1666,45 @@ static void xhci_build_input_ctx_bulk_eps(u8 bulk_out_ep, u8 bulk_in_ep,
     u32 ctx_sz = g_ctx_size;
     u8 *ic = (u8 *)g_input_ctx.virt;
 
-    /* Update Input Control Context: enable EP0, Bulk OUT, Bulk IN */
+    /* Input Control Context（Configure Endpoint 语义，xHCI 1.2 §6.4.3）：
+     *   DWORD0 = Drop（0），DWORD1 = Add。
+     * Configure 时 bit0=Slot 必须 Add，bit1=EP0 不可重复 Add
+     * （QEMU xhci_configure_slot 校验 (ictl[1]&0x3)==0x1）。
+     * 端点位用 Context Index：EPn OUT→2n，EPn IN→2n+1
+     * （QEMU 从 i=2 开始遍历 Add flags，按 ictx+32*i 读 EP Context）。 */
     u32 *icc = (u32 *)ic;
-    icc[0] = (1u << 1) | (1u << 0) |
-             (1u << bulk_out_ep) | (1u << bulk_in_ep);
+    u32 out_idx = 2u * bulk_out_ep;
+    u32 in_idx  = 2u * bulk_in_ep + 1;
+    icc[0] = 0x0;
+    icc[1] = (1u << 0) | (1u << out_idx) | (1u << in_idx);
 
-    /* Update Slot Context: Context Entries = max(bulk_in_ep, bulk_out_ep) */
+    /* Update Slot Context: Context Entries = max Context Index
+     * （DWORD0 bits[27:31]，保留 Speed/Route 原值）。 */
     u32 *slot_ctx = (u32 *)(ic + ctx_sz);
-    u32 max_ep = bulk_out_ep > bulk_in_ep ? bulk_out_ep : bulk_in_ep;
-    slot_ctx[2] = (max_ep << 27);
+    u32 max_idx = out_idx > in_idx ? out_idx : in_idx;
+    slot_ctx[0] &= ~(0x1Fu << 27);
+    slot_ctx[0] |= (max_idx << 27);
 
-    /* Bulk OUT Endpoint Context (at offset ctx_sz * (1 + bulk_out_ep)) */
-    u32 *out_ctx = (u32 *)(ic + ctx_sz * (1 + bulk_out_ep));
+    /* Bulk OUT Endpoint Context。
+     * 偏移 = ctx_sz * (out_idx + 1)：input context 布局是
+     * [ICC][Slot][EP0][EP1]... 每个占 1 个 ctx_sz，Context Index i 的
+     * EP context 在 (i+1) 个槽处（QEMU xhci_configure_slot 用
+     * ictx+32+(32*i) 读取）。BUG-FIX: 原实现 ctx_sz*out_idx 少了 ICC
+     * 槽 → 全部错位 32 字节 → QEMU 读到零 EP context。 */
+    u32 *out_ctx = (u32 *)(ic + ctx_sz * (out_idx + 1));
     out_ctx[1] = (EP_TYPE_BULK_OUT << 3) | ((u32)out_mps << 16);
-    out_ctx[4] = 512;  /* Average TRB Length */
     u64 out_deq = g_bulk_out_ring.dma.phys | (u64)g_bulk_out_ring.ccs;
-    out_ctx[6] = (u32)(out_deq & 0xFFFFFFFFu);
-    out_ctx[7] = (u32)(out_deq >> 32);
+    out_ctx[2] = (u32)(out_deq & 0xFFFFFFF0u) | (u32)g_bulk_out_ring.ccs;
+    out_ctx[3] = (u32)(out_deq >> 32);
+    out_ctx[4] = 512;  /* Average TRB Length */
 
-    /* Bulk IN Endpoint Context (at offset ctx_sz * (1 + bulk_in_ep)) */
-    u32 *in_ctx = (u32 *)(ic + ctx_sz * (1 + bulk_in_ep));
+    /* Bulk IN Endpoint Context (at offset ctx_sz * (in_idx + 1)) */
+    u32 *in_ctx = (u32 *)(ic + ctx_sz * (in_idx + 1));
     in_ctx[1] = (EP_TYPE_BULK_IN << 3) | ((u32)in_mps << 16);
-    in_ctx[4] = 512;  /* Average TRB Length */
     u64 in_deq = g_bulk_in_ring.dma.phys | (u64)g_bulk_in_ring.ccs;
-    in_ctx[6] = (u32)(in_deq & 0xFFFFFFFFu);
-    in_ctx[7] = (u32)(in_deq >> 32);
+    in_ctx[2] = (u32)(in_deq & 0xFFFFFFF0u) | (u32)g_bulk_in_ring.ccs;
+    in_ctx[3] = (u32)(in_deq >> 32);
+    in_ctx[4] = 512;  /* Average TRB Length */
 }
 
 /* ================================================================
@@ -1411,18 +1715,22 @@ static int xhci_enum_msc_device(u32 port_idx) {
     u8 speed = xhci_get_port_speed(port_idx);
     log_hex("[xhci] port speed=", speed);
 
-    /* Default MaxPacketSize for EP0 based on speed */
-    u16 mps0 = 64;  /* High/Super-Speed default */
-    if (speed == USB_SPEED_FULL) mps0 = 64;
+    /* Default MaxPacketSize for EP0 based on speed
+     * (xHCI 1.2 §4.3: Full=8? No — FS/HS EP0 通常 64，LS=8，SS=512) */
+    u16 mps0 = 64;  /* Full/High-Speed default */
     if (speed == USB_SPEED_LOW)  mps0 = 8;
+    if (speed == USB_SPEED_SUPER) mps0 = 512;
 
     /* Step 1: Enable Slot */
     u8 slot_id = 0;
-    if (xhci_enable_slot(&slot_id) != 0) return -1;
+    if (xhci_enable_slot(&slot_id) != 0) {
+        FB_ENUM_FAIL(0x0A);  /* 黄: Enable Slot 失败 */
+        return -1;
+    }
     g_msc.slot_id = slot_id;
     g_msc.speed = speed;
 
-    /* Step 2: Allocate per-device DMA buffers */
+    /* Step 1.5: Allocate per-device DMA buffers（在 DCBAA 指向输出上下文之前） */
     if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_input_ctx) != 0) return -2;
     if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_dev_ctx) != 0) return -2;
     if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_xfer_buf) != 0) return -2;
@@ -1431,18 +1739,30 @@ static int xhci_enum_msc_device(u32 port_idx) {
     if (xhci_ring_init(&g_bulk_out_ring, XFER_RING_SIZE) != 0) return -2;
     if (xhci_ring_init(&g_bulk_in_ring, XFER_RING_SIZE) != 0) return -2;
 
+    /* DCBAA[slot_id] 必须指向输出上下文（Device Context）。
+     * Address Device/Configure Endpoint 命令都会读取该地址；
+     * 缺失时 QEMU/实机将 octx=0 → DMA 写失败/CC_TRB_ERROR。 */
+    xhci_zero(g_dev_ctx.virt, g_dev_ctx.size);
+    u64 *dcbaa = (u64 *)g_dcbaa.virt;
+    dcbaa[slot_id] = g_dev_ctx.phys;
+    log_hex("[xhci] DCBAA[slot]=", dcbaa[slot_id]);
+
     /* Step 3: Build Input Context and Address Device (BSR=1 first) */
-    xhci_build_input_ctx_slot(slot_id, speed, mps0);
+    xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
     if (xhci_address_device(slot_id, 1) != 0) {
         /* BSR=1 failed, try without BSR */
-        xhci_build_input_ctx_slot(slot_id, speed, mps0);
-        if (xhci_address_device(slot_id, 0) != 0) return -3;
+        xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
+        if (xhci_address_device(slot_id, 0) != 0) {
+            FB_ENUM_FAIL(0x0B);  /* 黄: Address Device 失败（BSR=1/0 均失败） */
+            return -3;
+        }
     }
 
     /* Step 4: Get Device Descriptor */
     u8 dev_desc[18];
     if (xhci_get_device_descriptor(dev_desc) != 0) {
         g_log->warn("[xhci] GET_DESCRIPTOR(Device) failed");
+        FB_ENUM_FAIL(0x0C);  /* 黄: GET_DESCRIPTOR(Device) 失败 */
         return -4;
     }
 
@@ -1459,7 +1779,7 @@ static int xhci_enum_msc_device(u32 port_idx) {
     /* Step 5: Re-address with real MPS if different */
     if (real_mps0 != mps0 && real_mps0 >= 8) {
         mps0 = real_mps0;
-        xhci_build_input_ctx_slot(slot_id, speed, mps0);
+        xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
         if (xhci_address_device(slot_id, 0) != 0) {
             g_log->warn("[xhci] re-address failed");
             /* Continue anyway — device may still work */
@@ -1470,12 +1790,16 @@ static int xhci_enum_msc_device(u32 port_idx) {
     u8 cfg_desc[255];
     if (xhci_get_config_descriptor(cfg_desc, 255) != 0) {
         g_log->warn("[xhci] GET_DESCRIPTOR(Config) failed");
+        FB_ENUM_FAIL(0x0C);  /* 黄: GET_DESCRIPTOR(Config) 失败 */
         return -5;
     }
 
     /* Parse configuration descriptor to find MSC interface and endpoints */
     u16 total_len = (u16)cfg_desc[2] | ((u16)cfg_desc[3] << 8);
-    if (total_len < 9) return -5;
+    if (total_len < 9) {
+        FB_ENUM_FAIL(0x0D);  /* 黄: 配置描述符过短 */
+        return -5;
+    }
 
     u8 bulk_out_ep = 0, bulk_in_ep = 0;
     u16 bulk_out_mps = 512, bulk_in_mps = 512;
@@ -1497,24 +1821,34 @@ static int xhci_enum_msc_device(u32 port_idx) {
                 msc_found = 1;
                 g_log->info("[xhci] MSC BOT interface found");
 
-                /* Scan following endpoint descriptors */
+                /* Scan following endpoint descriptors.
+                 * SuperSpeed 设备在 endpoint 后紧跟 6 字节 SS Endpoint
+                 * Companion descriptor (type 0x30)——必须跳过继续找下一
+                 * 个 endpoint，不能因 type!=5 提前终止（Bulk OUT 常在
+                 * IN 之后且被 companion 隔开）。 */
                 u32 ep_pos = pos + desc_len;
-                while (ep_pos + 7 <= (u32)total_len &&
-                       cfg_desc[ep_pos + 1] == 5) {  /* endpoint descriptor */
-                    u8 ep_addr   = cfg_desc[ep_pos + 2];
-                    u8 ep_attr   = cfg_desc[ep_pos + 3];
-                    u16 ep_mps   = (u16)cfg_desc[ep_pos + 4] | ((u16)cfg_desc[ep_pos + 5] << 8);
+                while (ep_pos + 2 <= (u32)total_len) {
+                    u8 ep_len = cfg_desc[ep_pos];
+                    if (ep_len == 0 || ep_pos + ep_len > (u32)total_len) break;
+                    if (cfg_desc[ep_pos + 1] == 5) {  /* endpoint descriptor */
+                        u8 ep_addr   = cfg_desc[ep_pos + 2];
+                        u8 ep_attr   = cfg_desc[ep_pos + 3];
+                        u16 ep_mps   = (u16)cfg_desc[ep_pos + 4] | ((u16)cfg_desc[ep_pos + 5] << 8);
 
-                    if ((ep_attr & 0x03) == 0x02) {  /* Bulk */
-                        if (ep_addr & 0x80) {
-                            bulk_in_ep  = ep_addr & 0x0F;
-                            bulk_in_mps = ep_mps;
-                        } else {
-                            bulk_out_ep  = ep_addr & 0x0F;
-                            bulk_out_mps = ep_mps;
+                        if ((ep_attr & 0x03) == 0x02) {  /* Bulk */
+                            if (ep_addr & 0x80) {
+                                bulk_in_ep  = ep_addr & 0x0F;
+                                bulk_in_mps = ep_mps;
+                            } else {
+                                bulk_out_ep  = ep_addr & 0x0F;
+                                bulk_out_mps = ep_mps;
+                            }
                         }
+                    } else if (cfg_desc[ep_pos + 1] == 4) {
+                        /* 下一个 interface — 停止扫描 */
+                        break;
                     }
-                    ep_pos += cfg_desc[ep_pos];
+                    ep_pos += ep_len;
                 }
                 break;
             }
@@ -1524,6 +1858,7 @@ static int xhci_enum_msc_device(u32 port_idx) {
 
     if (!msc_found || bulk_out_ep == 0 || bulk_in_ep == 0) {
         g_log->warn("[xhci] no MSC BOT interface found");
+        FB_ENUM_FAIL(0x0D);  /* 黄: 未找到 MSC BOT 接口/端点 */
         return -6;
     }
 
@@ -1543,6 +1878,7 @@ static int xhci_enum_msc_device(u32 port_idx) {
                                    bulk_out_mps, bulk_in_mps);
     if (xhci_configure_endpoint(slot_id) != 0) {
         g_log->warn("[xhci] Configure Endpoint failed");
+        FB_ENUM_FAIL(0x0E);  /* 黄: Configure Endpoint 失败 */
         return -7;
     }
 
@@ -1601,7 +1937,10 @@ int driver_init(const struct dkm_kernel_api *api,
     u8 bus = 0, dev = 0, func = 0;
     if (xhci_find(&bus, &dev, &func) != 0) {
         g_log->info("[xhci] xHCI controller not found");
-        g_log->info("[xhci] driver ready");
+        /* BUG-FIX: 不 halt。xhci 是可选驱动（manifest required=false），
+         * 无 xHCI 的平台（Intel 6 系/纯 EHCI）必须继续引导到 EHCI/DSK，
+         * 否则 `for(;;)hlt` 卡死整条启动链。仅记日志，如需诊断可开
+         * xhci_pci_diag_code() 打印控制器清单（见注释）。 */
         return 0;
     }
 
@@ -1628,7 +1967,7 @@ int driver_init(const struct dkm_kernel_api *api,
     u64 bar_phys;
     if (bar0_lo & 1u) {
         g_log->warn("[xhci] BAR0 is IO space; unsupported");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x02);  /* 红: BAR0 是 IO 空间 */
         return 0;
     }
     if ((bar0_lo & 0x6u) == 0x4u) {
@@ -1644,7 +1983,7 @@ int driver_init(const struct dkm_kernel_api *api,
 
     if (!api->hhdm_offset || !bar_phys) {
         g_log->warn("[xhci] missing HHDM or BAR0; skip");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x02);  /* 红: 缺 HHDM/BAR */
         return 0;
     }
 
@@ -1652,14 +1991,14 @@ int driver_init(const struct dkm_kernel_api *api,
     g_mmio = xhci_map_bar(api, bar_phys);
     if (!g_mmio) {
         g_log->error("[xhci] BAR MMIO unavailable; driver inactive");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x03);  /* 红: BAR MMIO 映射失败 */
         return 0;
     }
 
     /* ---- Phase 1: Parse capabilities ---- */
     if (xhci_parse_caps() != 0) {
         g_log->error("[xhci] capability parse failed");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x04);  /* 红: capability 解析失败 */
         return 0;
     }
 
@@ -1669,27 +2008,27 @@ int driver_init(const struct dkm_kernel_api *api,
     /* ---- Phase 1: Controller Reset ---- */
     if (xhci_controller_reset() != 0) {
         g_log->error("[xhci] controller reset failed");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x05);  /* 红: 控制器 reset 失败 */
         return 0;
     }
 
     /* ---- Phase 2: Setup Rings + DCBAA + Scratchpad ---- */
     if (!api->dma) {
         g_log->warn("[xhci] DMA API unavailable");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x06);  /* 红: DMA API 缺失 */
         return 0;
     }
 
     if (xhci_setup_rings() != 0) {
         g_log->error("[xhci] ring setup failed");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x06);  /* 红: ring 初始化失败 */
         return 0;
     }
 
     /* ---- Phase 2: Start Controller ---- */
     if (xhci_controller_start() != 0) {
         g_log->error("[xhci] controller start failed");
-        g_log->info("[xhci] driver ready");
+        FB_FATAL(api, 0x07);  /* 红: 控制器启动失败 */
         return 0;
     }
 
@@ -1765,6 +2104,7 @@ int driver_init(const struct dkm_kernel_api *api,
         }
     } else {
         g_log->info("[xhci] no MSC device found; block provider not registered");
+        FB_FATAL(api, 0x08);  /* 黄: 所有端口无设备/枚举全部失败 */
     }
 
     g_log->info("[xhci] driver ready");

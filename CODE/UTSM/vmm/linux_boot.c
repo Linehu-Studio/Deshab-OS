@@ -17,6 +17,7 @@
 #include <utsm/ept.h>
 #include <utsm/vmm.h>
 #include <utsm/virtio_mmio.h>
+#include <utsm/ipc_shm.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
@@ -48,14 +49,6 @@ static inline u64 read_cr4_local(void) {
     u64 v;
     __asm__ volatile("mov %%cr4, %0" : "=r"(v));
     return v;
-}
-
-static u64 vmx_adjust_control(u64 value, u32 msr) {
-    u32 allowed0 = (u32)vmx_read_msr(msr);
-    u32 allowed1 = (u32)(vmx_read_msr(msr) >> 32);
-    u32 adjusted = (u32)value | allowed0;
-    adjusted &= allowed1;
-    return adjusted;
 }
 
 /* MSR bitmap (4KB, all zeros = don't intercept any MSR) */
@@ -125,11 +118,13 @@ static void linux_vmcs_setup_host_state(void) {
 /* ===== VMCS guest state for Linux ===== */
 
 static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
-    /* CR0/CR3/CR4: long mode with paging */
+    /* CR0/CR3/CR4: long mode with paging.
+     * P8.5: CR4 必须含 VMXE（IA32_VMX_CR4_FIXED0=0x2000 强制，
+     * 旧代码漏掉会触发 VM-entry invalid guest state）。 */
     vmx_vmcs_write(VMCS_GUEST_CR0, CR0_PE | CR0_NE | CR0_PG | CR0_WP);
     /* CR3 points to guest PML4 (GPA) */
     vmx_vmcs_write(VMCS_GUEST_CR3, gi->pgt_gpa);
-    vmx_vmcs_write(VMCS_GUEST_CR4, CR4_PAE | CR4_PGE | CR4_PSE);
+    vmx_vmcs_write(VMCS_GUEST_CR4, CR4_VMXE | CR4_PAE | CR4_PGE | CR4_PSE);
 
     /* Segment selectors from guest GDT */
     vmx_vmcs_write(VMCS_GUEST_CS_SELECTOR, 0x08);
@@ -165,14 +160,18 @@ static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
     vmx_vmcs_write(VMCS_GUEST_GDTR_LIMIT, 0x28);
     vmx_vmcs_write(VMCS_GUEST_IDTR_LIMIT, 0xFFFF);
 
-    /* Access rights */
+    /* Access rights.
+     * P8.5: selector=0 的段必须标记 unusable（access rights bit 16），
+     * 否则 VM-entry guest-state 检查失败：
+     *   FS/GS selector=0 → 0x1C093（unusable）
+     *   LDTR selector=0 → 0x10082（unusable，旧值 0x82 缺 bit 16） */
     vmx_vmcs_write(VMCS_GUEST_CS_ACCESS, 0xA09B);  /* 64-bit code, L=1 */
     vmx_vmcs_write(VMCS_GUEST_SS_ACCESS, 0xC093);
     vmx_vmcs_write(VMCS_GUEST_DS_ACCESS, 0xC093);
     vmx_vmcs_write(VMCS_GUEST_ES_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_FS_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_GS_ACCESS, 0xC093);
-    vmx_vmcs_write(VMCS_GUEST_LDTR_ACCESS, 0x82);  /* unusable */
+    vmx_vmcs_write(VMCS_GUEST_FS_ACCESS, 0x1C093);  /* unusable (selector=0) */
+    vmx_vmcs_write(VMCS_GUEST_GS_ACCESS, 0x1C093);  /* unusable (selector=0) */
+    vmx_vmcs_write(VMCS_GUEST_LDTR_ACCESS, 0x10082); /* unusable (selector=0) */
     vmx_vmcs_write(VMCS_GUEST_TR_ACCESS, 0x8B);    /* busy 64-bit TSS */
 
     /* Guest RIP = Linux 64-bit entry (startup_64) */
@@ -204,10 +203,22 @@ static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
 /* ===== VMCS controls for Linux ===== */
 
 static void linux_vmcs_setup_controls(u64 eptp) {
+    log_hex64("[LINUX] TRUE_PINBASED_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_PINBASED_CTLS));
+    log_hex64("[LINUX] TRUE_PROCBASED_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_PROCBASED_CTLS));
+    log_hex64("[LINUX] PROCBASED_CTLS2 raw=",
+              vmx_read_msr(IA32_VMX_PROCBASED_CTLS2));
+    log_hex64("[LINUX] TRUE_EXIT_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_EXIT_CTLS));
+    log_hex64("[LINUX] TRUE_ENTRY_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_ENTRY_CTLS));
+
     /* Pin-based：外部中断 exit + NMI exit + VMX preemption timer（若支持）。
      * preemption timer 提供 1ms 周期 exit，用于轮询 host 串口 RX、
      * 推进 guest PIT tick、注入 pending virtio/COM1 IRQ。 */
-    u64 pin_want = PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING;
+    u64 pin_want = PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING |
+                   PIN_VIRTUAL_NMIS;
     if (vmx_preemption_timer_supported()) {
         pin_want |= PIN_VMX_PREEMPTION_TIMER;
     }
@@ -222,13 +233,12 @@ static void linux_vmcs_setup_controls(u64 eptp) {
             | CPU_BASED_INVLPG_EXITING;
     cpu = vmx_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
 
-    /* Secondary: EPT + VPID */
+    /* Secondary: EPT + VPID（经 capability MSR 调整；
+     * EPT 不可用则打日志——Linux guest 的 GPA 布局依赖 EPT）。 */
     u64 cpu2 = SEC_EXEC_ENABLE_EPT | SEC_EXEC_ENABLE_VPID;
-    {
-        u64 msr = vmx_read_msr(IA32_VMX_PROCBASED_CTLS2);
-        u32 allowed1 = (u32)(msr >> 32);
-        cpu2 &= allowed1;
-        cpu2 |= SEC_EXEC_ENABLE_EPT;
+    cpu2 = vmx_adjust_control(cpu2, IA32_VMX_PROCBASED_CTLS2);
+    if (!(cpu2 & SEC_EXEC_ENABLE_EPT)) {
+        log_warn("[LINUX] EPT not available (shadow paging) - guest GPA map disabled");
     }
 
     u64 exit_ctrl = VM_EXIT_SAVE_DEBUG_CONTROLS
@@ -249,20 +259,31 @@ static void linux_vmcs_setup_controls(u64 eptp) {
 
     /* MSR bitmap */
     {
-        u64 hhdm = g_hhdm_request.response ? g_hhdm_request.response->offset : 0;
-        u64 msr_bitmap_phys = (u64)g_linux_msr_bitmap - hhdm;
+        u64 msr_bitmap_phys = vmx_kernel_virt_to_phys(g_linux_msr_bitmap);
+        log_hex64("[LINUX] MSR bitmap phys=", msr_bitmap_phys);
         vmx_vmcs_write(VMCS_MSR_BITMAP, msr_bitmap_phys);
     }
 
-    vmx_vmcs_write(VMCS_EPT_POINTER, eptp);
-    vmx_vmcs_write(VMCS_VPID, 2);  /* VPID 1 = self-test, VPID 2 = Linux */
+    if (cpu2 & SEC_EXEC_ENABLE_EPT) {
+        vmx_vmcs_write(VMCS_EPT_POINTER, eptp);
+    } else {
+        vmx_vmcs_write(VMCS_EPT_POINTER, 0);
+    }
+    if (cpu2 & SEC_EXEC_ENABLE_VPID) {
+        vmx_vmcs_write(VMCS_VPID, 2);  /* VPID 1 = self-test, VPID 2 = Linux */
+    } else {
+        vmx_vmcs_write(VMCS_VPID, 0);
+    }
 
-    /* Exception bitmap: catch #GP, #PF, #UD, #DF (triple fault handled separately) */
-    vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, (1ULL << 13) | (1ULL << 14) | (1ULL << 6) | (1ULL << 8));
+    /* Linux owns its IDT. Intercepting #PF here livelocks: the guest
+     * page-fault handler never runs, so early mm faults spin in VM-exit. */
+    vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, 0);
 }
 
 /* ===== Global for passing RSI to launch asm ===== */
 static volatile u64 g_linux_rsi;
+static volatile int g_linux_launch_failed;
+static volatile u64 g_linux_launch_flags;
 
 /* ===== Linux launch =====
  *
@@ -306,17 +327,44 @@ int linux_launch(void) {
     linux_vmcs_setup_controls(vmm_get_eptp());
     linux_vmcs_setup_host_state();
 
-    /* 初始 arm preemption timer（1ms 后首次周期 exit） */
-    vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum_1ms());
+    /* 仅在 pin-based control 真正启用 timer 时 arm。 */
+    if (vmx_vmcs_read(VMCS_PIN_BASED_VM_EXEC_CONTROL) &
+        PIN_VMX_PREEMPTION_TIMER) {
+        vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER,
+                       vmx_preemption_quantum());
+    } else {
+        vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, 0);
+    }
 
     /* Set RSI for Linux boot_params (passed via global, loaded in asm) */
     g_linux_rsi = gi->bootparams_gpa;
+
+    /* P8.5: VMCLEAR + VMPTRLD —— VMLAUNCH 要求 VMCS 处于 "clear" 态。
+     * 自检成功后 VMCS 状态为 "launched"，不 VMCLEAR 会报
+     * "VMLAUNCH with non-clear VMCS"（error 4）。
+     * 内容不受影响：VMCLEAR 只回写内存并改状态，VMPTRLD 再挂载。 */
+    if (vmx_vmcs_clear(vmm_get_vmcs_phys()) != 0) {
+        log_error("[LINUX] vmclear failed");
+        return -4;
+    }
+    if (vmx_vmcs_load(vmm_get_vmcs_phys()) != 0) {
+        log_error("[LINUX] vmptrld after vmclear failed");
+        return -5;
+    }
 
     log_hex64("[LINUX] RIP=", gi->kernel_entry);
     log_hex64("[LINUX] RSP=", LINUX_GUEST_STACK_GPA + 0x1000);
     log_hex64("[LINUX] RSI=", gi->bootparams_gpa);
     log_hex64("[LINUX] CR3=", gi->pgt_gpa);
     log_hex64("[LINUX] GDTR=", gi->gdt_gpa);
+    log_hex64("[LINUX] pin=", vmx_vmcs_read(VMCS_PIN_BASED_VM_EXEC_CONTROL));
+    log_hex64("[LINUX] cpu=", vmx_vmcs_read(VMCS_CPU_BASED_VM_EXEC_CONTROL));
+    log_hex64("[LINUX] cpu2=", vmx_vmcs_read(VMCS_SECONDARY_VM_EXEC_CONTROL));
+    log_hex64("[LINUX] exit=", vmx_vmcs_read(VMCS_VM_EXIT_CONTROLS));
+    log_hex64("[LINUX] entry=", vmx_vmcs_read(VMCS_VM_ENTRY_CONTROLS));
+    log_hex64("[LINUX] eptp=", vmx_vmcs_read(VMCS_EPT_POINTER));
+    log_hex64("[LINUX] msr_bitmap=", vmx_vmcs_read(VMCS_MSR_BITMAP));
+    log_hex64("[LINUX] vpid=", vmx_vmcs_read(VMCS_VPID));
     log_info("[LINUX] vmlaunch");
 
     /* vmlaunch with RSI = boot_params.
@@ -324,38 +372,98 @@ int linux_launch(void) {
      *   - On failure: failed=1, falls through
      *   - On success: enters guest, VM-Exit → vmx_vm_exit_handler
      *   - On terminate: handler restores RSP, jmps to post_guest label */
-    int failed;
+    g_linux_launch_failed = 1;
+    g_linux_launch_flags = 0;
     __asm__ volatile(
         "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
         "leaq 1f(%%rip), %%rax\n\t"
         "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+        /* Linux 64-bit boot protocol requires every GPR except RSI zero. */
+        "xorl %%eax, %%eax\n\t"
+        "xorl %%ebx, %%ebx\n\t"
+        "xorl %%ecx, %%ecx\n\t"
+        "xorl %%edx, %%edx\n\t"
+        "xorl %%edi, %%edi\n\t"
+        "xorl %%ebp, %%ebp\n\t"
+        "xorl %%r8d, %%r8d\n\t"
+        "xorl %%r9d, %%r9d\n\t"
+        "xorl %%r10d, %%r10d\n\t"
+        "xorl %%r11d, %%r11d\n\t"
+        "xorl %%r12d, %%r12d\n\t"
+        "xorl %%r13d, %%r13d\n\t"
+        "xorl %%r14d, %%r14d\n\t"
+        "xorl %%r15d, %%r15d\n\t"
         "movq g_linux_rsi(%%rip), %%rsi\n\t"   /* RSI = boot_params GPA */
         "vmlaunch\n\t"
         /* ---- failure path ---- */
-        "movl $1, %0\n\t"
+        "movl $1, g_linux_launch_failed(%%rip)\n\t"
+        "pushfq\n\t"
+        "popq g_linux_launch_flags(%%rip)\n\t"
         "jmp 2f\n\t"
         /* ---- post_guest: terminate path jmps here ---- */
         "1:\n\t"
-        "movl $0, %0\n\t"
+        "movl $0, g_linux_launch_failed(%%rip)\n\t"
         "2:\n\t"
-        : "=r"(failed)
-        :: "rax", "rcx", "rdx", "rsi", "rdi",
-           "r8", "r9", "r10", "r11", "memory"
+        :
+        :
+        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp",
+          "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+          "cc", "memory"
     );
 
+    int failed = g_linux_launch_failed;
+    u64 vm_flags = g_linux_launch_flags;
     if (failed) {
-        u64 error = vmx_vmcs_read(VMCS_VMX_INSTRUCTION_ERROR);
+        /* CF=1 → VMfailInvalid；ZF=1 → VMfailValid（error field 有效）。 */
+        if (vm_flags & 0x1) {
+            log_error("[LINUX] vmlaunch VMfailInvalid (invalid current-VMCS)");
+        } else if (vm_flags & 0x40) {
+            log_error("[LINUX] vmlaunch VMfailValid");
+        }
+        u64 error = 0;
+        if (vm_flags & 0x40) {
+            vmx_vmcs_read_checked(VMCS_VMX_INSTRUCTION_ERROR, &error);
+        }
         log_hex64("[LINUX] vmlaunch failed, error=", error);
         g_linux_guest_active = 0;
         return -3;
     }
 
-    /* Guest parked (HLT) — Linux daemon 已驻留，等待 linux_resume() 唤醒 */
-    g_linux_guest_active = 0;   /* 回到 host 上下文，清除 active 标志 */
-    g_guest_parked = 1;         /* 标记 guest 已 park，linux_resume() 可唤醒 */
-    log_info("[LINUX] guest parked (daemon ready)");
+    /* Only handle_hlt() may mark the Linux guest parked.  A fatal exception,
+     * triple fault, or EPT failure also returns through post_guest, but must
+     * not make the compatibility layer report a ready daemon. */
+    g_linux_guest_active = 0;
     log_hex64("[LINUX] last exit reason=", g_last_exit_reason);
     log_hex64("[LINUX] vmexit count=", vmexit_get_count());
+    if (!g_guest_parked) {
+        log_error("[LINUX] guest terminated before daemon park");
+        return -6;
+    }
+
+    /* A kernel idle/fatal HLT is indistinguishable from the daemon's PARK at
+     * the VM-exit reason level.  The daemon must first publish EXEC_READY
+     * through /dev/utsm; this proves the driver PING, SHM mapping, userspace
+     * daemon, and Linux→UTSM ring are all alive. */
+    {
+        struct utsm_ipc_msg ready;
+        int got_ready = 0;
+        for (int i = 0; i < 8; i++) {
+            if (ipc_shm_recv(&ready) != 0) break;
+            if (ready.type == UTSM_MSG_EXEC_READY) {
+                got_ready = 1;
+                break;
+            }
+            log_hex64("[LINUX] pre-ready message type=", ready.type);
+        }
+        if (!got_ready) {
+            g_guest_parked = 0;
+            log_error("[LINUX] HLT without EXEC_READY handshake");
+            return -7;
+        }
+    }
+
+    log_info("[LINUX] EXEC_READY received from /dev/utsm");
+    log_info("[LINUX] guest parked (daemon ready)");
 
     return 0;
 }

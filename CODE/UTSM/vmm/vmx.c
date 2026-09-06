@@ -6,6 +6,7 @@
 #include "../arch/x86_64/limine.h"
 
 extern volatile struct limine_hhdm_request g_hhdm_request;
+extern volatile struct limine_kernel_address_request g_kernel_address_request;
 
 /* ===== MSR / CR helpers ===== */
 
@@ -13,6 +14,41 @@ u64 vmx_read_msr(u32 msr) {
     u32 lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
     return ((u64)hi << 32) | lo;
+}
+
+u64 vmx_adjust_control(u64 value, u32 msr) {
+    u64 raw = vmx_read_msr(msr);
+    u32 allowed0 = (u32)raw;
+    u32 allowed1 = (u32)(raw >> 32);
+    /* KVM / nested-KVM polarity (verified 2026-09-06):
+     *   low bit=1  => must be 1
+     *   high bit=0 => must be 0
+     * Secondary CTLS2 reports allowed0=0; inverting low would force every
+     * allowed1 feature on and fail VM-entry check 7. */
+    u32 adjusted = ((u32)value | allowed0) & allowed1;
+    log_hex64("[VMX] adjust msr=", msr);
+    log_hex64("[VMX] adjust desired=", value);
+    log_hex64("[VMX] adjust allowed0=", allowed0);
+    log_hex64("[VMX] adjust allowed1=", allowed1);
+    log_hex64("[VMX] adjust result=", adjusted);
+    return adjusted;
+}
+
+u64 vmx_kernel_virt_to_phys(const void *address) {
+    const struct limine_kernel_address_response *response =
+        g_kernel_address_request.response;
+    u64 virt = (u64)address;
+
+    if (!response) {
+        log_error("[VMX] Limine kernel-address response missing");
+        return 0;
+    }
+    if (virt < response->virtual_base) {
+        log_error("[VMX] address is below kernel virtual base");
+        return 0;
+    }
+
+    return response->physical_base + (virt - response->virtual_base);
 }
 
 static __attribute__((unused)) void vmx_write_msr(u32 msr, u64 value) {
@@ -176,6 +212,8 @@ static int vmx_truly_available(void) {
     return 0;
 }
 
+/* P8.5: VMX 指令成功条件是 CF=0 且 ZF=0（即 ja）。
+ * 旧代码只查 CF（jnc）：VMfailInvalid（ZF=1, CF=0）会被误判为成功。 */
 int vmx_enable(void) {
     if (g_vmx_enabled) return 0;
 
@@ -221,7 +259,7 @@ int vmx_enable(void) {
     int err;
     __asm__ volatile(
         "vmxon %1\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "jmp 2f\n"
         "1:\n"
         "mov $0, %0\n"
@@ -276,7 +314,7 @@ int vmx_vmcs_load(u64 phys) {
     int err;
     __asm__ volatile(
         "vmptrld %1\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "jmp 2f\n"
         "1:\n"
         "mov $0, %0\n"
@@ -300,7 +338,7 @@ int vmx_vmcs_clear(u64 phys) {
     int err;
     __asm__ volatile(
         "vmclear %1\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "jmp 2f\n"
         "1:\n"
         "mov $0, %0\n"
@@ -330,6 +368,23 @@ u64 vmx_vmcs_read(u64 field) {
     return value;
 }
 
+int vmx_vmcs_read_checked(u64 field, u64 *value) {
+    u64 v;
+    u8 ok;
+    __asm__ volatile(
+        "vmread %2, %1\n"
+        "seta %0\n"          /* CF=0 且 ZF=0 才是 VMsucceed */
+        : "=q"(ok), "=r"(v)
+        : "r"(field)
+        : "memory"
+    );
+    if (ok) {
+        if (value) *value = v;
+        return 0;
+    }
+    return -1;
+}
+
 void vmx_vmcs_write(u64 field, u64 value) {
     __asm__ volatile(
         "vmwrite %1, %0\n"
@@ -342,7 +397,7 @@ int vmx_vmlaunch(void) {
     int err;
     __asm__ volatile(
         "vmlaunch\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "jmp 2f\n"
         "1:\n"
         "mov $0, %0\n"
@@ -360,7 +415,7 @@ int vmx_vmresume(void) {
     int err;
     __asm__ volatile(
         "vmresume\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "jmp 2f\n"
         "1:\n"
         "mov $0, %0\n"

@@ -8,26 +8,36 @@
 
 extern volatile struct limine_hhdm_request g_hhdm_request;
 
-/* ===== VMX 指令错误码 ===== */
+/* ===== VMX 指令错误码（Intel SDM Vol 3D, "VM Instruction Error Numbers"） ===== */
 static const char *vmx_error_str(u64 err) {
     switch (err) {
-    case 1: return "VMCALL/VMCLEAR/VMLAUNCH/VMRESUME with non-launched VMCS";
-    case 2: return "VMRESUME after VMXOFF";
-    case 3: return "VMRESUME with corrupted VMCS";
-    case 4: return "vmlaunch with non-clear VMCS";
-    case 5: return "VM operation invalid";
-    case 6: return "VMCS revision mismatch";
-    case 7: return "VMCS shadowing mismatch";
-    case 8: return "invalid guest state";
-    case 9: return "host state invalid";
-    case 10: return "VM-execution control invalid";
-    case 11: return "VM-exit control invalid";
-    case 12: return "VM-entry control invalid";
-    case 13: return "VM-exit control fields invalid";
-    case 15: return "address out of width";
-    case 16: return "MSR bitmap addr invalid";
-    case 17: return "VMREAD/VMWRITE from unsupported field";
-    case 18: return "VMCS addr invalid";
+    case 1: return "VMCALL executed in VMX root operation";
+    case 2: return "VMCLEAR with invalid physical address";
+    case 3: return "VMCLEAR with VMXON pointer";
+    case 4: return "VMLAUNCH with non-clear VMCS";
+    case 5: return "VMRESUME with non-launched VMCS";
+    case 6: return "VMRESUME after VMXOFF";
+    case 7: return "VM entry with invalid VM-execution control fields";
+    case 8: return "VM entry with invalid host-state fields";
+    case 9: return "VMPTRLD with invalid physical address";
+    case 10: return "VMPTRLD with VMXON pointer";
+    case 11: return "VMPTRLD with incorrect VMCS revision identifier";
+    case 12: return "VMREAD from unsupported VMCS component";
+    case 13: return "VMWRITE to read-only VMCS component";
+    case 15: return "VM entry with invalid guest-state fields";
+    case 16: return "VM entry with invalid executive-VMCS pointer";
+    case 17: return "VM entry with non-launched executive VMCS";
+    case 18: return "VM entry with executive-VMCS inconsistency";
+    case 19: return "VM entry with invalid VM-exit control fields";
+    case 20: return "VM entry with invalid MSEG VMCS revision";
+    case 22: return "VMCALL with non-clear VMCS";
+    case 23: return "VMCALL with invalid VM-exit control fields";
+    case 24: return "VMCALL with incorrect MSEG VMCS revision";
+    case 25: return "VM switch with invalid VM-exit control fields";
+    case 26: return "VM switch with invalid VM-exit MSEG VMCS revision";
+    case 28: return "VMRETURN with non-launched VMCS";
+    case 29: return "VMRETURN with invalid executive VMCS";
+    case 30: return "VM entry with invalid VM-execution control fields in event injection";
     default: return "unknown";
     }
 }
@@ -77,6 +87,17 @@ static u8 g_guest_code[4096] __attribute__((aligned(4096))) = {
 
 /* guest 栈页 */
 static u8 g_guest_stack[4096] __attribute__((aligned(4096)));
+
+/* P8.5: guest 自有页表（EPT 模式下 guest CR3 不能指向 host 页表——
+ * host 页表页未在 EPT 映射，页表遍历本身就会 EPT violation）。
+ * 布局（GPA）：
+ *   0x6000 PML4  [0] -> 0x7000 | P|RW
+ *   0x7000 PDPT  [0] -> 0x9000 | P|RW
+ *   0x9000 PD    [0] -> 2MB 大页 | P|RW|PS  （GPA 0..2MB 恒等映射）
+ * guest 代码/栈/GDT/TSS/IDT 页全部落在低 2MB 内。 */
+static u64 g_guest_pml4[512] __attribute__((aligned(4096)));
+static u64 g_guest_pdpt[512] __attribute__((aligned(4096)));
+static u64 g_guest_pd[512] __attribute__((aligned(4096)));
 
 /* MSR bitmap（4KB 全 0 = 不拦截 MSR） */
 static u8 g_msr_bitmap[4096] __attribute__((aligned(4096)));
@@ -162,14 +183,6 @@ static inline u64 read_cr3_local(void) {
 
 /* ===== VMCS 配置 ===== */
 
-static u64 vmx_adjust_control(u64 value, u32 msr) {
-    u32 allowed0 = (u32)vmx_read_msr(msr);
-    u32 allowed1 = (u32)(vmx_read_msr(msr) >> 32);
-    u32 adjusted = (u32)value | allowed0;
-    adjusted &= allowed1;
-    return adjusted;
-}
-
 static void vmcs_setup_host_state(void) {
     vmx_vmcs_write(VMCS_HOST_CR0, read_cr0_local() | CR0_PE | CR0_NE | CR0_PG);
     vmx_vmcs_write(VMCS_HOST_CR3, read_cr3_local());
@@ -235,10 +248,11 @@ static void vmcs_setup_host_state(void) {
 }
 
 static void vmcs_setup_guest_state_phase1(void) {
-    /* Guest CR0/CR3/CR4：启用 PE/NE/PG/PAE，复用 host 页表。
-     * P8.4: CR4 must include VMXE (CR4_FIXED0 requires it under KVM). */
+    /* Guest CR0/CR3/CR4：启用 PE/NE/PG/PAE。
+     * P8.5: CR3 指向 guest 自有页表（GPA 0x6000），
+     * 不再借用 host CR3（EPT 下 host 页表页未映射，遍历会失败）。 */
     vmx_vmcs_write(VMCS_GUEST_CR0, CR0_PE | CR0_NE | CR0_PG | CR0_WP);
-    vmx_vmcs_write(VMCS_GUEST_CR3, read_cr3_local());
+    vmx_vmcs_write(VMCS_GUEST_CR3, 0x6000);
     vmx_vmcs_write(VMCS_GUEST_CR4, CR4_VMXE | CR4_PAE | CR4_PGE | CR4_PSE);
 
     /* 段选择子：flat 模型。
@@ -324,7 +338,19 @@ static void vmcs_setup_guest_state_phase1(void) {
 }
 
 static void vmcs_setup_controls(u64 eptp) {
-    u64 pin = vmx_adjust_control(PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING,
+    log_hex64("[VMM] TRUE_PINBASED_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_PINBASED_CTLS));
+    log_hex64("[VMM] TRUE_PROCBASED_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_PROCBASED_CTLS));
+    log_hex64("[VMM] PROCBASED_CTLS2 raw=",
+              vmx_read_msr(IA32_VMX_PROCBASED_CTLS2));
+    log_hex64("[VMM] TRUE_EXIT_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_EXIT_CTLS));
+    log_hex64("[VMM] TRUE_ENTRY_CTLS raw=",
+              vmx_read_msr(IA32_VMX_TRUE_ENTRY_CTLS));
+
+    u64 pin = vmx_adjust_control(PIN_EXT_INTERRUPT_EXITING | PIN_NMI_EXITING |
+                                 PIN_VIRTUAL_NMIS,
                                  IA32_VMX_TRUE_PINBASED_CTLS);
 
     u64 cpu = CPU_BASED_HLT_EXITING
@@ -334,11 +360,12 @@ static void vmcs_setup_controls(u64 eptp) {
             | CPU_BASED_INVLPG_EXITING;
     cpu = vmx_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
 
-    /* P8.4d: Try without EPT first to isolate nested VMX issue under KVM.
-     * If KVM requires EPT, vmx_adjust_control will OR it back in. */
-    u64 cpu2 = 0;  /* no EPT, no VPID */
+    /* P8.5: 请求 EPT（KVM 报告的 allowed-1 集合含 EPT 位）。
+     * 自检 guest 用 GPA 0x1000..0x9000 + 自有页表，必须开 EPT
+     * 才能让 ept_map_range 的映射真正生效。
+     * EPT 不可用时 cpu2 会失去 EPT 位并打日志，自检将失败。 */
+    u64 cpu2 = SEC_EXEC_ENABLE_EPT;
     cpu2 = vmx_adjust_control(cpu2, IA32_VMX_PROCBASED_CTLS2);
-    log_hex64("[VMM] IA32_VMX_PROCBASED_CTLS2 raw=", vmx_read_msr(IA32_VMX_PROCBASED_CTLS2));
 
     u64 exit_ctrl = VM_EXIT_SAVE_DEBUG_CONTROLS
                   | VM_EXIT_HOST_ADDR_SPACE_SIZE
@@ -358,8 +385,8 @@ static void vmcs_setup_controls(u64 eptp) {
 
     /* MSR bitmap 物理地址 */
     {
-        u64 hhdm = g_hhdm_request.response ? g_hhdm_request.response->offset : 0;
-        u64 msr_bitmap_phys = (u64)g_msr_bitmap - hhdm;
+        u64 msr_bitmap_phys = vmx_kernel_virt_to_phys(g_msr_bitmap);
+        log_hex64("[VMM] MSR bitmap phys=", msr_bitmap_phys);
         vmx_vmcs_write(VMCS_MSR_BITMAP, msr_bitmap_phys);
     }
 
@@ -371,6 +398,8 @@ static void vmcs_setup_controls(u64 eptp) {
     }
     if (cpu2 & SEC_EXEC_ENABLE_VPID) {
         vmx_vmcs_write(VMCS_VPID, 1);
+    } else {
+        vmx_vmcs_write(VMCS_VPID, 0);
     }
 
     /* Exception bitmap：捕获 #GP(13)/#PF(14)/#UD(6) */
@@ -430,6 +459,9 @@ void vmm_shutdown(void) {
 
 int vmm_is_ready(void) { return g_vmm_ready; }
 u64 vmm_get_eptp(void) { return ept_get_eptp(); }
+/* P8.5: 暴露 VMCS 物理地址，供 linux_launch() 在 vmlaunch 前
+ * 执行 VMCLEAR+VMPTRLD（VMCS 状态机：VMLAUNCH 要求 clear 态）。 */
+u64 vmm_get_vmcs_phys(void) { return g_vmcs_phys; }
 
 /* P8.4: Dump all guest-state VMCS fields for KVM nested VMX debugging.
  * Called before VMLAUNCH to identify field encoding/value errors. */
@@ -532,12 +564,12 @@ int vmm_self_test(void) {
 
     /* EPT 映射 guest 代码页（GPA 0x1000）、栈页（GPA 0x8000）、
      * GDT 页（GPA 0x3000）、TSS 页（GPA 0x4000）。
-     * g_guest_* 是 UTSM 虚拟地址，物理地址 = virt - HHDM */
-    u64 hhdm = g_hhdm_request.response ? g_hhdm_request.response->offset : 0;
-    u64 guest_code_phys = (u64)g_guest_code - hhdm;
-    u64 guest_stack_phys = (u64)g_guest_stack - hhdm;
-    u64 guest_gdt_phys = (u64)g_guest_gdt - hhdm;
-    u64 guest_tss_phys = (u64)g_guest_tss - hhdm;
+     * g_guest_* 属于高半 UTSM 内核映像，必须使用 Limine 提供的
+     * kernel virtual/physical base 转换；它们不是 HHDM 指针。 */
+    u64 guest_code_phys = vmx_kernel_virt_to_phys(g_guest_code);
+    u64 guest_stack_phys = vmx_kernel_virt_to_phys(g_guest_stack);
+    u64 guest_gdt_phys = vmx_kernel_virt_to_phys(g_guest_gdt);
+    u64 guest_tss_phys = vmx_kernel_virt_to_phys(g_guest_tss);
 
     if (ept_map_range(0x1000, guest_code_phys, 4096, EPT_RWX) != 0) {
         log_error("[VMM] map guest code failed");
@@ -557,11 +589,34 @@ int vmm_self_test(void) {
     }
     /* P8.4: Map IDT page for KVM nested VMX (IDTR base = 0x5000) */
     {
-        u64 guest_idt_phys = (u64)g_guest_idt - hhdm;
+        u64 guest_idt_phys = vmx_kernel_virt_to_phys(g_guest_idt);
         for (int i = 0; i < 4096; i++) g_guest_idt[i] = 0;
         if (ept_map_range(0x5000, guest_idt_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
             log_error("[VMM] map guest IDT failed");
             return -9;
+        }
+    }
+
+    /* P8.5: 构建 guest 自有页表（GPA 低 2MB 恒等，2MB 大页）并 EPT 映射。
+     * 页表项：P(bit0)|RW(bit1)，大页加 PS(bit7)；NX=0（可执行）。 */
+    {
+        for (int i = 0; i < 512; i++) {
+            g_guest_pml4[i] = 0;
+            g_guest_pdpt[i] = 0;
+            g_guest_pd[i] = 0;
+        }
+        g_guest_pml4[0] = 0x7000 | 0x3;   /* P|RW -> PDPT @ GPA 0x7000 */
+        g_guest_pdpt[0] = 0x9000 | 0x3;   /* P|RW -> PD   @ GPA 0x9000 */
+        g_guest_pd[0]   = 0x0000 | 0x83;  /* P|RW|PS -> 2MB page @ GPA 0 */
+
+        u64 pml4_phys = vmx_kernel_virt_to_phys(g_guest_pml4);
+        u64 pdpt_phys = vmx_kernel_virt_to_phys(g_guest_pdpt);
+        u64 pd_phys   = vmx_kernel_virt_to_phys(g_guest_pd);
+        if (ept_map_range(0x6000, pml4_phys, 4096, EPT_READ | EPT_WRITE) != 0 ||
+            ept_map_range(0x7000, pdpt_phys, 4096, EPT_READ | EPT_WRITE) != 0 ||
+            ept_map_range(0x9000, pd_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
+            log_error("[VMM] map guest page tables failed");
+            return -12;
         }
     }
 
@@ -590,36 +645,56 @@ int vmm_self_test(void) {
     log_hex64("[VMM] exit=", vmx_vmcs_read(VMCS_VM_EXIT_CONTROLS));
     log_hex64("[VMM] entry=", vmx_vmcs_read(VMCS_VM_ENTRY_CONTROLS));
     log_hex64("[VMM] eptp=", vmx_vmcs_read(VMCS_EPT_POINTER));
+    log_hex64("[VMM] msr_bitmap=", vmx_vmcs_read(VMCS_MSR_BITMAP));
+    log_hex64("[VMM] vpid=", vmx_vmcs_read(VMCS_VPID));
     log_hex64("[VMM] link=", vmx_vmcs_read(VMCS_GUEST_LINK_POINTER));
 
     /* P8.4: Dump all guest-state fields for KVM debug */
     vmm_dump_guest_state();
 
     /* vmlaunch 控制流：
-     *   - 失败：执行下一条指令，failed=1
+     *   - 失败：执行下一条指令，failed=1（同时捕获 RFLAGS 区分
+     *     VMfailValid CF=1 / VMfailInvalid ZF=1）
      *   - 成功：进入 guest，不返回。VM-Exit 后跳到 vmx_vm_exit_handler。
      *   - guest 终止时，handler 恢复 saved_rsp 并 jmp 到 post_guest 标签。
      *
      * 我们在 vmlaunch 前保存 RSP 与"vmlaunch 后"的 RIP（= post_guest 标签地址）。 */
     int failed;
+    u64 vm_flags = 0;
     __asm__ volatile(
         "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"      /* 保存当前 RSP */
         "leaq 1f(%%rip), %%rax\n\t"                     /* 取 post_guest 标签地址 */
         "movq %%rax, g_saved_return_rip(%%rip)\n\t"     /* 保存返回 RIP */
         "vmlaunch\n\t"                                  /* 启动 guest */
-        /* ---- 失败路径 ---- */
+        /* ---- 失败路径（mov 不改 flags，先存 failed 再抓 RFLAGS） ---- */
         "movl $1, %0\n\t"
+        "pushfq\n\t"
+        "popq %1\n\t"
         "jmp 2f\n\t"
         /* ---- post_guest 标签：终止路径 jmp 到这里 ---- */
         "1:\n\t"
         "movl $0, %0\n\t"
         "2:\n\t"
-        : "=r"(failed)
+        : "=r"(failed), "=r"(vm_flags)
         :: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory"
     );
 
     if (failed) {
-        u64 error = vmx_vmcs_read(VMCS_VMX_INSTRUCTION_ERROR);
+        /* CF(bit0)=1 → VMfailInvalid（current-VMCS 无效）；
+         * ZF(bit6)=1 → VMfailValid（错误码在 VMCS 0x4400）。 */
+        if (vm_flags & 0x1) {
+            log_error("[VMM] vmlaunch VMfailInvalid (invalid current-VMCS)");
+        } else if (vm_flags & 0x40) {
+            log_error("[VMM] vmlaunch VMfailValid");
+        } else {
+            log_error("[VMM] vmlaunch failed (unexpected flags)");
+        }
+        u64 error = 0;
+        if (!(vm_flags & 0x40)) {
+            log_error("[VMM] VM-instruction error unavailable");
+        } else if (vmx_vmcs_read_checked(VMCS_VMX_INSTRUCTION_ERROR, &error) != 0) {
+            log_error("[VMM] VMREAD error field failed (current-VMCS invalid)");
+        }
         log_hex64("[VMM] vmlaunch failed, error=", error);
         serial_write("[VMM] ");
         serial_write(vmx_error_str(error));

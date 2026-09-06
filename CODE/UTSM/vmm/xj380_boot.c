@@ -48,7 +48,7 @@ static inline u64 read_cr4_local(void) {
     return v;
 }
 
-static u64 vmx_adjust_control(u64 value, u32 msr) {
+static u64 xj380_adjust_control(u64 value, u32 msr) {
     u32 allowed0 = (u32)vmx_read_msr(msr);
     u32 allowed1 = (u32)(vmx_read_msr(msr) >> 32);
     u32 adjusted = (u32)value | allowed0;
@@ -186,14 +186,14 @@ static void xj380_vmcs_setup_controls(u64 eptp) {
     if (vmx_preemption_timer_supported()) {
         pin_want |= PIN_VMX_PREEMPTION_TIMER;
     }
-    u64 pin = vmx_adjust_control(pin_want, IA32_VMX_TRUE_PINBASED_CTLS);
+    u64 pin = xj380_adjust_control(pin_want, IA32_VMX_TRUE_PINBASED_CTLS);
 
     u64 cpu = CPU_BASED_HLT_EXITING
             | CPU_BASED_ACTIVATE_SECONDARY
             | CPU_BASED_USE_MSR_BITMAPS
             | CPU_BASED_UNCOND_IO_EXITING
             | CPU_BASED_INVLPG_EXITING;
-    cpu = vmx_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
+    cpu = xj380_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
 
     u64 cpu2 = SEC_EXEC_ENABLE_EPT | SEC_EXEC_ENABLE_VPID;
     {
@@ -206,12 +206,12 @@ static void xj380_vmcs_setup_controls(u64 eptp) {
     u64 exit_ctrl = VM_EXIT_SAVE_DEBUG_CONTROLS
                   | VM_EXIT_HOST_ADDR_SPACE_SIZE
                   | VM_EXIT_LOAD_HOST_EFER;
-    exit_ctrl = vmx_adjust_control(exit_ctrl, IA32_VMX_TRUE_EXIT_CTLS);
+    exit_ctrl = xj380_adjust_control(exit_ctrl, IA32_VMX_TRUE_EXIT_CTLS);
 
     u64 entry_ctrl = VM_ENTRY_LOAD_DEBUG_CONTROLS
                    | VM_ENTRY_IA32E_MODE_GUEST
                    | VM_ENTRY_LOAD_GUEST_EFER;
-    entry_ctrl = vmx_adjust_control(entry_ctrl, IA32_VMX_TRUE_ENTRY_CTLS);
+    entry_ctrl = xj380_adjust_control(entry_ctrl, IA32_VMX_TRUE_ENTRY_CTLS);
 
     vmx_vmcs_write(VMCS_PIN_BASED_VM_EXEC_CONTROL, pin);
     vmx_vmcs_write(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu);
@@ -270,7 +270,7 @@ int xj380_launch(void) {
     xj380_vmcs_setup_host_state();
 
     /* 初始 arm preemption timer（1ms 后首次周期 exit） */
-    vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum_1ms());
+    vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum());
 
     /* KernelMain 3 个 SysV 参数（HHDM 虚拟地址） */
     g_xj380_rdi = XJ380_FBC_GPA + XJ380_HHDM_OFFSET;

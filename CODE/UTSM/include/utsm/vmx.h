@@ -9,6 +9,7 @@
 #define IA32_VMX_PROCBASED_CTLS      0x482
 #define IA32_VMX_EXIT_CTLS           0x483
 #define IA32_VMX_ENTRY_CTLS          0x484
+#define IA32_VMX_MISC                0x485
 #define IA32_VMX_PROCBASED_CTLS2     0x48B
 #define IA32_VMX_EPT_VPID_CAP        0x48C
 #define IA32_VMX_TRUE_PINBASED_CTLS  0x48D
@@ -37,15 +38,9 @@
 
 /* Control fields */
 #define VMCS_VPID                        0x0000
-#define VMCS_GUEST_ES_ADDR               0x0006
-#define VMCS_GUEST_CS_ADDR               0x0008
-#define VMCS_GUEST_SS_ADDR               0x000A
-#define VMCS_GUEST_DS_ADDR               0x000C
-#define VMCS_GUEST_FS_ADDR               0x000E
-#define VMCS_GUEST_GS_ADDR               0x0010
-#define VMCS_GUEST_LDTR_ADDR             0x0012
-#define VMCS_GUEST_TR_ADDR               0x0014
-#define VMCS_GUEST_INTR_STATUS           0x0009
+/* P8.5: guest interrupt status 真实编码为 0x0810（16-bit guest-state），
+ * 旧值 0x0009 是 posted-interrupt 描述符区域，属于错误编码。 */
+#define VMCS_GUEST_INTR_STATUS           0x0810
 #define VMCS_IO_BITMAP_A                 0x2000
 #define VMCS_IO_BITMAP_B                 0x2002
 #define VMCS_MSR_BITMAP                  0x2004
@@ -54,15 +49,22 @@
 
 /* Read-only data fields */
 #define VMCS_GUEST_PHYSICAL_ADDR         0x2400
+#define VMCS_EXIT_INTR_INFO              0x4404
+#define VMCS_EXIT_INTR_ERROR_CODE        0x4406
 #define VMCS_EXIT_REASON                 0x4402
 #define VMCS_EXIT_QUALIFICATION          0x6400
-#define VMCS_IO_RCX                      0x6404
-#define VMCS_IO_RSI                      0x6406
-#define VMCS_IO_RDI                      0x6408
-#define VMCS_IO_RIP                      0x640A
+/* P8.5: IO RCX/RSI/RDI/RIP 真实编码为 0x6402/0x6404/0x6406/0x6408，
+ * 旧值整体右移了一格。guest-linear-address = 0x640A 不变。 */
+#define VMCS_IO_RCX                      0x6402
+#define VMCS_IO_RSI                      0x6404
+#define VMCS_IO_RDI                      0x6406
+#define VMCS_IO_RIP                      0x6408
 #define VMCS_GUEST_LINEAR_ADDR           0x640A
 #define VMCS_INSTRUCTION_LENGTH          0x440C
-#define VMCS_VMX_INSTRUCTION_ERROR       0x4406
+/* P8.5 关键修复：VM-instruction error 真实编码是 0x4400。
+ * 旧值 0x4406 是 "VM-exit interruption error code"，
+ * 导致 vmlaunch 失败后错误码永远读出 0。 */
+#define VMCS_VMX_INSTRUCTION_ERROR       0x4400
 
 /* Guest-state fields */
 #define VMCS_GUEST_ES_SELECTOR           0x0800
@@ -82,8 +84,8 @@
 #define VMCS_GUEST_LDTR_LIMIT            0x480C
 #define VMCS_GUEST_TR_LIMIT              0x480E
 #define VMCS_GUEST_CS_ACCESS             0x4816
-#define VMCS_GUEST_SS_ACCESS             0x481A
-#define VMCS_GUEST_DS_ACCESS             0x4818
+#define VMCS_GUEST_SS_ACCESS             0x4818
+#define VMCS_GUEST_DS_ACCESS             0x481A
 #define VMCS_GUEST_ES_ACCESS             0x4814
 #define VMCS_GUEST_FS_ACCESS             0x481C
 #define VMCS_GUEST_GS_ACCESS             0x481E
@@ -165,11 +167,13 @@
 #define VMCS_VM_EXIT_CONTROLS            0x400C
 #define VMCS_VM_ENTRY_CONTROLS           0x4012
 #define VMCS_VM_ENTRY_INTERRUPT_INFO     0x4016
+#define VMCS_VM_ENTRY_EXCEPTION_ERROR    0x4018
 #define VMCS_SECONDARY_VM_EXEC_CONTROL   0x401E
 
 /* ===== Pin-based controls ===== */
 #define PIN_EXT_INTERRUPT_EXITING        (1ULL << 0)
 #define PIN_NMI_EXITING                  (1ULL << 3)
+#define PIN_VIRTUAL_NMIS                 (1ULL << 5)
 #define PIN_VMX_PREEMPTION_TIMER         (1ULL << 6)
 
 /* ===== Primary processor-based controls ===== */
@@ -269,11 +273,23 @@ int vmx_vmcs_load(u64 phys);
 int vmx_vmcs_clear(u64 phys);  /* P8.4: VMCLEAR before VMLAUNCH */
 u64 vmx_vmcs_read(u64 field);
 void vmx_vmcs_write(u64 field, u64 value);
+/* P8.5: 带状态返回的 VMREAD。
+ * 返回 0 成功（CF=0 且 ZF=0）；-1 = VMfailValid/VMfailInvalid
+ * （此时 *value 未更新，多为 current-VMCS 无效）。 */
+int vmx_vmcs_read_checked(u64 field, u64 *value);
 int vmx_vmlaunch(void);
 int vmx_vmresume(void);
 
 u64 vmx_read_msr(u32 msr);
+/* Capability polarity used by KVM and verified under nested KVM:
+ * low bit=1 => must be 1; high bit=0 => must be 0.
+ * Formula: (desired | allowed0) & allowed1. */
+u64 vmx_adjust_control(u64 value, u32 msr);
 u64 vmx_get_host_cr3(void);
+/* Convert a pointer inside the linked UTSM kernel image to its physical
+ * address using Limine's kernel-address response.  Kernel-image mappings are
+ * distinct from the HHDM and must never be translated by subtracting HHDM. */
+u64 vmx_kernel_virt_to_phys(const void *address);
 
 /* ===== 虚拟中断注入（vmexit.c 实现） ===== */
 /* 向 guest 队列注入一个 ISA IRQ 向量（legacy PIC：vector = 0x30 + irq）。
@@ -281,9 +297,9 @@ u64 vmx_get_host_cr3(void);
  * 否则 arm interrupt-window exiting，待 guest 可接收时注入。 */
 void vmx_guest_queue_irq(u32 vector);
 
-/* VMX preemption timer：返回 1ms 对应的 timer 计数值（按 IA32_VMX_BASIC
- * bits[55:48] 的 scale 换算 TSC 频率）。 */
-u64 vmx_preemption_quantum_1ms(void);
+/* VMX preemption timer：返回 host polling 周期对应的 timer 计数值。
+ * 当前周期为 10ms，避免 nested KVM 在 1ms VM-exit 下失去前进性。 */
+u64 vmx_preemption_quantum(void);
 /* 检查 CPU 是否支持 VMX preemption timer。 */
 int vmx_preemption_timer_supported(void);
 

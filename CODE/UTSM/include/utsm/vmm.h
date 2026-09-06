@@ -88,5 +88,7 @@ int vmm_self_test(void);
 /* VMM 状态查询 */
 int vmm_is_ready(void);
 u64 vmm_get_eptp(void);
+/* P8.5: VMCS 物理地址（linux_launch 前 VMCLEAR+VMPTRLD 用） */
+u64 vmm_get_vmcs_phys(void);
 
 #endif

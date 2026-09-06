@@ -76,8 +76,9 @@ static u64 *ept_walk(u64 gpa, int alloc_missing) {
             if (!alloc_missing) return (u64 *)0;
             u64 new_phys = ept_alloc_page();
             if (new_phys == 0) return (u64 *)0;
-            /* 中间页表项：RWX + WB 内存类型 */
-            table[indices[level]] = new_phys | EPT_RWX | (EPT_MEMORY_TYPE_WB << 3);
+            /* 非叶 EPT 表项只含物理地址与 RWX。bits 5:3 在非叶项中
+             * 保留，写入 leaf memory type 会触发 EPT misconfiguration。 */
+            table[indices[level]] = new_phys | EPT_RWX;
             /* 切换到新分配的下一级页表 */
             table = (u64 *)phys_to_virt(new_phys);
         } else {
@@ -145,7 +146,7 @@ int ept_map_2m_page(u64 gpa, u64 hpa, u64 flags, u64 memtype) {
     if (!(entry & EPT_READ)) {
         u64 new_phys = ept_alloc_page();
         if (new_phys == 0) return -3;
-        table[pml4_idx] = new_phys | EPT_RWX | (EPT_MEMORY_TYPE_WB << 3);
+        table[pml4_idx] = new_phys | EPT_RWX;
         table = (u64 *)phys_to_virt(new_phys);
     } else {
         table = (u64 *)phys_to_virt(entry & 0x000FFFFFFFFFF000ULL);
@@ -156,7 +157,7 @@ int ept_map_2m_page(u64 gpa, u64 hpa, u64 flags, u64 memtype) {
     if (!(entry & EPT_READ)) {
         u64 new_phys = ept_alloc_page();
         if (new_phys == 0) return -4;
-        table[pdpt_idx] = new_phys | EPT_RWX | (EPT_MEMORY_TYPE_WB << 3);
+        table[pdpt_idx] = new_phys | EPT_RWX;
         table = (u64 *)phys_to_virt(new_phys);
     } else {
         table = (u64 *)phys_to_virt(entry & 0x000FFFFFFFFFF000ULL);
@@ -210,7 +211,7 @@ void ept_flush_ept(void) {
     int err;
     __asm__ volatile(
         "invept (%2), %1\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "mov $1, %0\n"
         "jmp 2f\n"
         "1:\n"
@@ -234,7 +235,7 @@ void ept_flush_vpid(u16 vpid) {
     int err;
     __asm__ volatile(
         "invvpid (%2), %1\n"
-        "jnc 1f\n"
+        "ja 1f\n"
         "mov $1, %0\n"
         "jmp 2f\n"
         "1:\n"
@@ -296,7 +297,8 @@ u64 ept_gpa_to_hpa(u64 gpa) {
 
 u64 ept_get_eptp(void) {
     if (!g_ept_ready) return 0;
-    /* EPTP: bits [5:0] = memtype, bits [7:6] = walk length-1 (3 for 4-level),
-     * bits [51:12] = PML4 HPA */
+    /* EPTP: bits [2:0]=memory type WB(6), bits [5:3]=walk length-1 (3 => 4-level).
+     * Nested KVM accepted WB (eptp=...1e) on the passing self-test; forcing UC
+     * after a misread of EPT_VPID_CAP bit 8 regressed to error 7. */
     return g_ept_pml4_phys | EPTP_WALK_LEN_4 | EPTP_MEMTYPE_WB;
 }

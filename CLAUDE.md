@@ -171,15 +171,13 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 
 当前 manifest 中 14 个外部 `.drv` 均已替换为真实 DKM 驱动并可加载执行。
 
-下一阶段优先路线：
-1. **内存与 MMIO 基础设施**: 实现物理页分配器、页表映射接口、低位/高位 PCI MMIO 映射，解决 NVMe 4G 以上 BAR 和后续 DMA 映射问题。
-2. **DMA 与块设备数据路径**: 建立 contiguous DMA buffer、cache/屏障约定、PRDT/队列内存管理，然后推进 AHCI IDENTIFY/READ 与 NVMe admin queue/identify。
-3. **IRQ 后端升级**: ~~APIC EOI/IOAPIC redirection~~（B7 已完成：UTSM EOI 钩子 + legacy IRQ1/12/11 持续投递，QEMU 全链路验证；tick 2x 定论 = PIT mode3 IOAPIC edge 双触发 ~200Hz）。剩余：vector allocator 规范化、设备 IRQ 从 PIC 默认全面迁移、MSI/MSI-X（e1000/NVMe）。
-4. **网络数据路径**: 在 DMA/IRQ 完成后推进 e1000 RX/TX ring 与 virtio-net feature negotiation/virtqueue/RX-TX。
-5. **VFS 与真实块设备接入**: 将 FAT32 从测试镜像迁移到 AHCI/NVMe block provider，完善挂载、读取、目录遍历和错误路径。
-6. **DKM 工程化收尾**: 统一驱动本地 ABI 头、清理 warning、补充自动化 QEMU 场景（e1000/virtio-net/nvme/ahci）。
-7. **FirstInit 完善**: ~~修复按键崩溃（fb_text 优化问题）~~（B6 已验证未复现）、~~实现鼠标光标移动~~（M1 已完成）、~~user.conf 写盘~~（已完成）、网络配置界面。
-8. ~~**鼠标输入驱动**: 从 mouseInit stub 升级为完整 PS/2 鼠标 IRQ12 + 包解码 + 光标移动~~（M1 已完成）。
+下一阶段优先路线（活跃路线 = `docs/ROADMAP_INSANE.md` 五期填补计划，任务编号 F/U/D/R/E；状态唯一来源 = `docs/STATUS.md`）：
+1. **一期 F 系列剩余**: F2 统一帧缓冲控制台抽象、F3 跨平台构建（Make/CMake）。（F1 莲花 panic / F4 boot 分级自检 / F5 skip_firstinit 已完成）
+2. **二期 U 系列**: UTRW Slow Path 真分支（slow_path.c 当前为 stub）、@sealed 段标记、密文页 dump、selftest 修 chacha20 KAT 间歇 FAIL。
+3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表、彩色日志。
+4. **四期 R 系列收尾**: `drr_emergency_pool_kb`/`drr_recovery_log_size` 接线、segment/system 级回滚验证、PCQ per-cpu 多核。
+5. **五期 E 系列**: 启动莲花动画、假想时光键彩蛋、提交信息规范、风味 ISO。
+6. **工程债（Phase 存档遗留）**: vector allocator/MSI-X、NVMe 高位 BAR、virtio-net virtqueue、DKM 零 warning。
 
 ## M1 里程碑完成状态（2026-07-29）
 

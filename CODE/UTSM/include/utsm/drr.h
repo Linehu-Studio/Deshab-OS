@@ -105,6 +105,8 @@ void drr_init(void);
 const u64 *drr_get_root_key(void);
 u64 drr_recovery_generation(void);
 void drr_report_fault(const char *reason);
+/* F1: 崩溃归档（crash_buf 写入；返回 0=已归档，-1=DRR 未初始化） */
+int drr_crash_archive(const char *symbol, const char *msg, const void *regs);
 void drr_log_write_intent(u32 segment_slot, u64 offset, u64 len);
 void drr_log_write_commit(u32 segment_slot, u64 offset, u64 len);
 

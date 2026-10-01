@@ -3,6 +3,7 @@
 #include <utsm/idt.h>
 #include <utsm/net.h>
 #include <utsm/mm.h>
+#include <utsm/panic.h>
 
 static void dkm_api_info(const char *msg) {
     log_info(msg);
@@ -17,7 +18,8 @@ static void dkm_api_error(const char *msg) {
 }
 
 static void dkm_api_panic(const char *msg) {
-    log_error(msg);
+    /* F1: 驱动 panic 统一走莲花崩溃屏（串口 dump + DRR 归档 + 帧缓冲） */
+    panic_full("DKM-PANIC", msg, 0);
     for (;;) {
         __asm__ volatile("cli; hlt");
     }

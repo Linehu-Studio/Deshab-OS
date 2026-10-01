@@ -472,21 +472,26 @@ void kernel_main(void) {
     dsm_load_by_manifest_ex(cfg);
     INSTR_TS_END(ts_dsm, "dsm_load_manifest");
 
-    /* === selftest — 可通过 FUCK [boot] selftest=0 跳过 === */
-    int run_selftest = ini_get_bool(cfg, "boot", "selftest", 1);
-    if (run_selftest) {
-        INSTR_TS_DECL(ts_self);
-        INSTR_TS_BEGIN(ts_self);
-        int result = utsm_selftest_run();
-        INSTR_TS_END(ts_self, "selftest");
-        if (result == 0) {
-            log_info("[UTSM] SELFTEST PASS");
-        } else {
-            log_error("[UTSM] SELFTEST FAIL");
-            arch_halt_forever();
+    /* === F4: 分级启动自检 — FUCK [boot] selftest=0|1|2 ===
+     * 0=关 / 1=快速（结构健全性） / 2=全量（+DMA 探针 + UTSM selftest） */
+    {
+        int self_level = ini_get_int(cfg, "boot", "selftest", 1);
+        extern int boot_selftest_run(int level);
+        extern void boot_panic_test(const ini_config *cfg);
+        boot_selftest_run(self_level);
+        boot_panic_test(cfg);
+        if (self_level >= 2) {
+            INSTR_TS_DECL(ts_self);
+            INSTR_TS_BEGIN(ts_self);
+            int result = utsm_selftest_run();
+            INSTR_TS_END(ts_self, "selftest");
+            if (result == 0) {
+                log_info("[UTSM] SELFTEST PASS");
+            } else {
+                log_error("[UTSM] SELFTEST FAIL");
+                arch_halt_forever();
+            }
         }
-    } else {
-        log_info("[UTSM] selftest skipped by FUCK config");
     }
 
     /* === SAS-R0-PCQ 调度器：demo 任务 + LAPIC tick 抢占启用（Phase 7） ===

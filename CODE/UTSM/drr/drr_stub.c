@@ -316,6 +316,30 @@ void drr_report_fault(const char *reason) {
     g_drr.recovery_generation++;
 }
 
+/* ---- F1: 崩溃归档（panic_full 调用；crash_buf 写 symbol+msg+rip 简表） ----
+ * 返回 0=已归档；-1=DRR 未初始化（crash_buf 不可用）。 */
+int drr_crash_archive(const char *symbol, const char *msg, const void *regs) {
+    if (!g_drr.initialized || !g_drr.crash_buf || g_drr.crash_buf_size == 0) {
+        return -1;
+    }
+    u64 i = 0;
+    u8 *b = g_drr.crash_buf;
+    u64 cap = g_drr.crash_buf_size - 1;
+    /* 头部标记 */
+    const char *magic = "CRASH1";
+    for (const char *s = magic; *s && i < cap; s++) b[i++] = (u8)*s;
+    b[i++] = '|';
+    for (const char *s = symbol ? symbol : "UNKNOWN"; *s && i < cap; s++) b[i++] = (u8)*s;
+    b[i++] = '|';
+    for (const char *s = msg ? msg : "-"; *s && i < cap; s++) b[i++] = (u8)*s;
+    b[i] = 0;
+    /* recovery generation 前进（归档计数） */
+    g_drr.recovery_generation++;
+    log_error("[DRR] crash archived");
+    log_hex64("[DRR]   generation=", g_drr.recovery_generation);
+    return 0;
+}
+
 /* ---- Recovery Log ---- */
 void drr_log_write_intent(u32 segment_slot, u64 offset, u64 len) {
     if (!g_drr.initialized || !g_drr.log_base) return;

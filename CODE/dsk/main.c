@@ -1798,6 +1798,8 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
     /* === 应用 DSK 配置 === */
     int show_logo   = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "dsk", "show_logo", 1)    : 1;
     int skip_login  = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "dsk", "skip_login", 0)   : 0;
+    /* F5: skip_firstinit=1 → 跳过首次启动向导与登录，直达 desktop */
+    int skip_firstinit = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "dsk", "skip_firstinit", 0) : 0;
     int load_mouse  = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "dsk", "mouse_init", 1)   : 1;
     int load_netman = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "dsk", "netman", 1)        : 1;
     int dev_mode    = dsk_cfg_ok ? dsk_ini_get_bool(&dsk_cfg, "boot", "dev_mode", 0)     : 0;
@@ -1880,6 +1882,14 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
     /* 合并 FUCK dev_mode 和 firstInit.txt dev_mode */
     if (firstinit_dev_mode) dev_mode = 1;
 
+    /* F5: skip_firstinit=1 → 直达 desktop（跳过向导与登录）。
+     * 优先级最高：即便 firstInit.txt 为 0（首次）也视作已完成。 */
+    if (skip_firstinit) {
+        logl("[DSK] skip_firstinit=1: direct to desktop (wizard+login skipped)");
+        is_first = 0;
+        firstinit_dev_mode = 0;
+    }
+
     /* 开发者模式:加载 shell.elf 自动测试命令序列（cp/mv/echo/ls/cat/rm） */
     if (dev_mode) {
         logl("[DSK:SCHED] decision: dev_mode -> shell.elf");
@@ -1903,8 +1913,8 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
         dsk_schedule_netman(ctx, load_netman);
         milestone_write(7, "netman loaded");
 
-        /* login — 可通过 skip_login=1 跳过 */
-        if (skip_login) {
+        /* login — 可通过 skip_login=1 跳过；skip_firstinit=1 时一并跳过（F5） */
+        if (skip_login || skip_firstinit) {
             logl("[DSK:SCHED] login skipped by FUCK config");
         } else {
             DSK_TS_DECL(login_phase);

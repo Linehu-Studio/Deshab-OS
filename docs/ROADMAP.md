@@ -1,6 +1,9 @@
-# Deshab-OS 开发路线图
+# Deshab-OS 开发路线图（Phase 0–9 历史存档）
 
-> 分阶段开发路线。✅已完成 · 🔶部分完成 · ⬜待实现
+> 本文档为**历史存档**：Phase 0–9 内核主线的任务清单与完成记录。
+> 当前活跃路线见 [ROADMAP_INSANE.md](./ROADMAP_INSANE.md)（五期填补计划，唯一任务编号 F/U/D/R/E）；
+> 子系统状态唯一来源见 [STATUS.md](./STATUS.md)。
+> ✅已完成 · 🔶部分完成 · ⬜待实现
 
 ---
 
@@ -23,10 +26,10 @@ Limine → utsm.elf → DKM 14驱动 → DSK(deshab.elf)
 | FAT32 | 🔶 | DKM只读；DSK读写(根目录) |
 | e1000 | ✅ | RX/TX+DHCP/ARP/UDP/DNS，polling |
 | 字体系统 | ✅ | DBF 16/24/32px，GB2312全覆盖 |
-| FirstInit | 🔶 | UI+输入+SHA256密码+写盘；B6按键崩溃修复中 |
+| FirstInit | 🔶 | UI+输入+SHA256密码+写盘；B6按键崩溃QEMU未复现；可跳过(skip_firstinit) ✅ |
 | 正常启动路径 | ✅ | login→desktop |
 | SAS-R0-PCQ | ✅ | O(1)位图调度+LAPIC tick+xv6式切换，selftest闭环 |
-| DRR | 🔶 | 看门狗/快照/回滚闭环（CRC64+AB双槽），MAC仍为占位 |
+| DRR | 🔶 | 看门狗/快照/回滚闭环；页MAC已升级BLAKE2b keyed MAC；segment/system级回滚待验证 |
 
 ---
 
@@ -111,8 +114,8 @@ Limine → utsm.elf → DKM 14驱动 → DSK(deshab.elf)
 
 | 任务 | 状态 | 验收标准 |
 |------|------|---------|
-| 按键崩溃修复(B6) | 🔶 | fb_text在-O2下稳定 |
-| 鼠标光标移动 | ⬜ | PS/2 IRQ12+包解码+光标 |
+| 按键崩溃修复(B6) | ✅ | QEMU复现测试未复现，全流程PASS |
+| 鼠标光标移动 | ✅ | PS/2 IRQ12+包解码+光标（M1完成） |
 | user.conf写盘 | ✅ | 重启后login可读取 |
 | 网络配置界面+时区/语言 | ⬜ | — |
 | 设置完成后跳转+正常启动路径 | ✅ | FirstInit返回→持久化→desktop |
@@ -146,8 +149,8 @@ selftest含runqueue O(1)、block/wake、看门狗负向测试（demo_fault=1检�
 | Page/Segment/System Rollback | 🔶 | page级回滚+verify PASS；segment/system级待真实加密后验证 |
 | 驱动recovery ops | ⬜ | quiesce/reset/reinit |
 
-注：快照区为静态区域（UTSM arena 内），页快照容量编译期 128 页；
-MAC 当前为 CRC64 占位（Phase 9 替换真实 MAC）。
+注：快照区经 dma_alloc_pages 分配，页快照容量编译期 129 页；
+页 MAC 已为 BLAKE2b keyed MAC + mac_root 链（Phase 9 早期成果）。
 风险：恢复路径禁用普通堆；Emergency Pool耗尽→system rollback。
 
 ---
@@ -211,5 +214,5 @@ MAC 当前为 CRC64 占位（Phase 9 替换真实 MAC）。
 - [BOOT_SEQUENCE.md](./BOOT_SEQUENCE.md)
 - [兼容层设计.md](./兼容层设计.md)
 - [桌面设计.md](./桌面设计.md)
-- [系统开发策划.md](./系统开发策划.md)
+- [ROADMAP_INSANE.md](./ROADMAP_INSANE.md)（当前活跃路线）
 - [CLAUDE.md](../CLAUDE.md)

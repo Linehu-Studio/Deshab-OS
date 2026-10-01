@@ -2,6 +2,7 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/instr.h>
+#include <utsm/panic.h>
 
 /* IDT gate descriptor (64-bit) */
 typedef struct __attribute__((packed)) {
@@ -628,29 +629,41 @@ void idt_handler(isr_frame *frame) {
             return;
         }
         /* CR2: #PF 的 fault 线性地址；CR3: 当前页表基址。
-         * 寄存器 dump 用于定位 fault 指令的操作数来源。 */
+         * 寄存器 dump 用于定位 fault 指令的操作数来源。
+         * F1: 异常统一走莲花崩溃屏（panic_full 内部保留串口 dump +
+         * DRR 归档 + 帧缓冲直绘，最后 halt——不返回）。 */
         u64 cr2, cr3;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        (void)cr3;
         INSTR_PROBE(EXCP, frame->vector, frame->error_code, frame->rip, 0);
-        log_error("[IDT] exception");
-        log_hex64("[IDT] vector=", frame->vector);
-        log_hex64("[IDT] err=", frame->error_code);
-        log_hex64("[IDT] rip=", frame->rip);
-        log_hex64("[IDT] cr2=", cr2);
-        log_hex64("[IDT] cr3=", cr3);
-        log_hex64("[IDT] rax=", frame->rax);
-        log_hex64("[IDT] rcx=", frame->rcx);
-        log_hex64("[IDT] rdx=", frame->rdx);
-        log_hex64("[IDT] rsi=", frame->rsi);
-        log_hex64("[IDT] rdi=", frame->rdi);
-        log_hex64("[IDT] r8=", frame->r8);
-        log_hex64("[IDT] r9=", frame->r9);
-        log_hex64("[IDT] r10=", frame->r10);
-        log_hex64("[IDT] r11=", frame->r11);
-        log_hex64("[IDT] cs=", frame->cs);
-        log_hex64("[IDT] rflags=", frame->rflags);
-        for (;;) { __asm__ volatile ("cli; hlt"); }
+        panic_regs pr;
+        pr.rip = frame->rip;
+        pr.rsp = 0;             /* isr_frame 不含 rsp（stub 内使用），置 0 */
+        pr.rflags = frame->rflags;
+        pr.cs = frame->cs;
+        pr.err = frame->error_code;
+        pr.vector = frame->vector;
+        pr.cr2 = cr2;
+        pr.rax = frame->rax;
+        pr.rcx = frame->rcx;
+        pr.rdx = frame->rdx;
+        pr.rsi = frame->rsi;
+        pr.rdi = frame->rdi;
+        pr.r8 = frame->r8;
+        pr.r9 = frame->r9;
+        pr.r10 = frame->r10;
+        pr.r11 = frame->r11;
+        char sym[16];
+        sym[0] = 'U'; sym[1] = 'T'; sym[2] = 'S'; sym[3] = 'M'; sym[4] = '-';
+        sym[5] = 'E'; sym[6] = 'X'; sym[7] = 'C';
+        u32 v = frame->vector;
+        u32 hi = (v >> 4) & 0xF, lo = v & 0xF;
+        sym[8] = (char)(hi < 10 ? '0' + hi : 'A' + hi - 10);
+        sym[9] = (char)(lo < 10 ? '0' + lo : 'A' + lo - 10);
+        sym[10] = 0;
+        panic_full(sym, "cpu exception", &pr);
+        for (;;) { __asm__ volatile ("cli; hlt"); }  /* 兜底（panic_full 不返回） */
     }
 
     /* PIC IRQ: vectors 0x20-0x2F (32-47)

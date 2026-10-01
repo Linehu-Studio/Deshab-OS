@@ -1,6 +1,7 @@
 # Deshab-OS 架构设计文档
 
 > 系统整体架构、核心子系统与关键技术约束。模块文档索引：[UTSM](../CODE/UTSM/README.md)、[DKM](../CODE/DKM/README.md)、[DSK](../CODE/dsk/README)。
+> 子系统实现状态唯一来源：[STATUS.md](./STATUS.md)。
 
 ---
 
@@ -48,6 +49,8 @@ kernel_main() → serial_init → idt_init → arena_init(16MB) → dma_init(Lim
 ---
 
 ## 3. 五大核心架构支柱
+
+> 每根支柱的**当前实现边界**：SAS-R0-PCQ — 调度器 BSP-only，per-cpu runqueue 结构就位未启用；任务加密上下文为结构预留。UTSM — 封缄段表/UUID ✅，加密原语 chacha20/KDF/BLAKE2b 已落，PCKC schedule 待接；全内存密文为设计意图，当前仅 selftest 路径覆盖。UTRW — Fast Path 真实现，Slow Path 为 stub。DRR — checkpoint/看门狗/Emergency Pool ✅（演示级），Emergency Pool 为编译期 64KB 静态池。DKM — 14 驱动能加载 ✅，无热卸载/无 capability/无符号版本协商。
 
 ### 3.1 SAS-R0-PCQ — 单地址空间Ring0调度模型
 
@@ -183,10 +186,11 @@ DBF格式8bpp灰度：simhei_16/24/32.dbf（GB2312 6763汉字+ASCII 32-126），
 ### 9.2 首次启动流程
 
 ```text
-DSK → 读FUCK配置(show_logo/skip_login/mouse_init/netman/dev_mode)
-  → 渐变背景+旋转加载环(comet-tail弧+TSC计时+show_logo=0可跳过)
+DSK → 读FUCK配置(show_logo/skip_login/skip_firstinit/mouse_init/netman/dev_mode)
+  → 静态Logo（渐变背景+Logo.png居中alpha混合，show_logo=0可跳过）
   → 读firstInit.txt("0|1\n0|1"，第二行dev_mode)
   → dev_mode=1: 加载shell.elf自动命令测试
+  → skip_firstinit=1: 直接跳 desktop（跳过向导与登录）
   → firstInit==0(首次): mouseInit→netman→FirstInit(偏好/账户/网络)→写USER.CONF+翻转firstInit.txt→desktop
   → firstInit!=0(正常): login.elf(USER.CONF+skip_login可跳)→desktop
 ```
@@ -211,10 +215,12 @@ DSK → 读FUCK配置(show_logo/skip_login/mouse_init/netman/dev_mode)
 | DSK | FAT32子目录遍历（`SYSTEM  /DESHAB64 /FUCK    `），block provider可用后 |
 
 ```ini
-[boot] vmm=1 linux_guest=1 selftest=1 dev_mode=0
+[boot] vmm=1 linux_guest=1 selftest=0|1|2 dev_mode=0   # selftest: 0=关 1=快速 2=全量
 [drivers] timer=1 apic=1 nvme=0   # 0=跳过
 [utsm] max_segments=1024 max_pckc_keys=8 dirty_shard_pages=1024 arena_size_mb=16
-[dsk] show_logo=1 skip_login=0 default_shell=desktop mouse_init=1 netman=1
+[sched] enable=1 tick_hz=100 timeslice_ms=10 demo_ms=0 demo_fault=0
+[drr] watchdog_enabled=1
+[dsk] show_logo=1 skip_login=0 skip_firstinit=0 default_shell=desktop mouse_init=1 netman=1
 ```
 
 缺失或空时用硬编码默认值。算法参数通过运行期全局变量覆盖编译期宏，静态数组大小仍用编译期上限。
@@ -223,13 +229,22 @@ DSK → 读FUCK配置(show_logo/skip_login/mouse_init/netman/dev_mode)
 
 ---
 
-## 11. 开放设计点
+## 11. 非目标（Non-Goals）
 
-1. **加密原语未指定**——KDF/hash/stream/MAC待定，当前占位XOR stream
-2. **kernel_api设计态vs实现态**——RE定义typed sub-struct指针，实现为const void*占位
-3. **block未作为独立子API**——走provider注册
-4. **log API签名分歧**——定参vs变参，统一方向待定
-5. **v1不追求**——RAM原地回滚/强安全隔离/设备副作用回滚
+Deshab 不假装是它不是的东西。以下为**明确不做**的目标（v1）：
+
+1. **不提供进程隔离** — SAS-R0 单地址空间 Ring0，无 per-process 页表、无 ring3。驱动 bug 即内核崩溃，这是接受的代价。
+2. **不是 TEE / 机密计算** — UTSM 无硬件信任根（无 IOMMU/MPK/TEE 撑腰），封缄防的是"自己手滑"，不是攻击者（本环境假设无攻击者）。
+3. **非形式化验证** — 0bug 靠 QEMU 演示证据 + DRR 回滚兜底，不靠证明。
+4. **DKM 不做故障隔离** — 同地址空间插件，"能加载"≠"能安全卸载"；热卸载为 ROADMAP_INSANE D1 待办。
+5. **不追求多用户强安全** — 见 CLAUDE.md 设计约束 3。
+6. **v1 不追求** — RAM 原地回滚 / 设备副作用回滚 / 生产级真机部署。
+
+## 11.5 开放设计点
+
+1. **kernel_api设计态vs实现态**——RE定义typed sub-struct指针，实现为const void*占位
+2. **block未作为独立子API**——走provider注册
+3. **log API签名分歧**——定参vs变参，统一方向待定
 
 ---
 
@@ -262,7 +277,9 @@ docs/  （本文档所在）
 | [RE/UTSM_算法记录.md](../RE/UTSM_算法记录.md) | UTSM核心算法 |
 | [RE/驱动模块ABI设计.md](../RE/驱动模块ABI设计.md) | DKM ABI详细设计 |
 | [docs/BOOT_SEQUENCE.md](./BOOT_SEQUENCE.md) | 启动路线设计 |
-| [docs/ROADMAP.md](./ROADMAP.md) | 开发路线图 |
-| [docs/系统开发策划.md](./系统开发策划.md) | 实现矩阵与里程碑策划 |
+| [docs/ROADMAP.md](./ROADMAP.md) | Phase 0-9 历史存档 |
+| [docs/ROADMAP_INSANE.md](./ROADMAP_INSANE.md) | 五期填补计划（当前活跃） |
+| [docs/STATUS.md](./STATUS.md) | 单一状态源 |
+| [docs/PHILOSOPHY.md](./PHILOSOPHY.md) | 疯圣典 |
 | [docs/兼容层设计.md](./兼容层设计.md) | Linux/PE兼容层 |
 | [docs/桌面设计.md](./桌面设计.md) | 桌面环境设计 |

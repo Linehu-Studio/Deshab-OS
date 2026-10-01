@@ -1,6 +1,7 @@
-# Deshab 启动路线设计
+# Deshab 启动路线设计（B0–B4 演示版）
 
 > 从上电到用户可交互的完整启动序列，带契约的分阶段唤醒过程。
+> 说明：本文为 QEMU 演示版——"契约/锚点/回退链"描述的是 QEMU 下的实际行为，非生产级承诺。状态见 [STATUS.md](./STATUS.md)。
 
 ---
 
@@ -29,7 +30,7 @@
 B0 Ignis: UEFI/BIOS → Limine(读limine.conf, 加载utsm.elf, 预加载17个boot module)
 B1 Sigillum: serial/IDT/arena/DMA → UTSM init+PCKC → DKM 4-stage 14驱动 → selftest锚点
 B2 Transitus: FAT32 block provider读deshab.elf(失败→Limine module) → ELF校验+PT_LOAD → 填充dsk_boot_context → 跳转DSK
-B3 Origo: 渐变背景+旋转环 → FAT32读firstInit.txt → 首次/正常分支
+B3 Origo: 渐变背景+静态Logo → FAT32读firstInit.txt → 首次/正常分支
 B4 Excitas(首次): mouseInit → netman → FirstInit → 写USER.CONF+firstInit.txt → desktop
 B4 Excitas(正常): login → desktop
 ```
@@ -119,13 +120,13 @@ dsk_entry(ctx):
   ③ 取block_read(api+0xA8)
   ④ 读FUCK配置(FAT32子目录)
   ⑤ 渐变背景(BG_TOP淡蓝→BG_BOTTOM深紫)
-  ⑥ 旋转加载环(show_logo=1时): comet-tail弧+双缓冲save/restore+TSC计时+33ms帧pacing
+  ⑥ 静态Logo(show_logo=1时): Logo.png居中alpha混合绘制于渐变背景（旋转加载环已移除）
   ⑦ 首次启动检测: FAT32读firstInit.txt("0|1\n0|1")，firstInit=='0'→首次
   ⑧ dev_mode=1→加载shell.elf自动命令测试
-  ⑨ 按首次/正常分支调度
+  ⑨ skip_firstinit=1→直达desktop；否则按首次/正常分支调度
 ```
 
-旋转环参数：SPIN_R=64, SPIN_THICK=3, SPIN_ARC=110/256≈155°, head_color=0xFFE8F2FC, 256项sin×127查表, base+=6顺时针。
+Logo绘制：居中 + alpha混合（B3 静态画面，取代原 comet-tail 旋转环）。
 
 **B3锚点**：`[DSK] FUCK config loaded` + `[DSK] firstInit=0`(或"!=0"/"not found")
 

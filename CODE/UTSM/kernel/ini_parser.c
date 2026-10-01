@@ -95,7 +95,7 @@ int ini_parse(const char *text, u32 size, ini_config *cfg) {
         }
 
         /* key=value 行 */
-        if (cfg->count >= 64) break;  /* 达到上限 */
+        if (cfg->count >= 128) break;  /* 达到上限 */
 
         ini_entry *e = &cfg->entries[cfg->count];
 

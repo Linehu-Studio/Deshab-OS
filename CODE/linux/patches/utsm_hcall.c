@@ -26,11 +26,22 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
+#include <asm/msr.h>
+
+#ifndef MSR_IA32_U_CET
+#define MSR_IA32_U_CET 0x000006a0
+#endif
+#ifndef MSR_IA32_S_CET
+#define MSR_IA32_S_CET 0x000006a2
+#endif
 
 /* Shared IPC protocol header (included via build.sh -I flag).
  * We provide our own hypercall wrappers, so skip the inline ones. */
 #define UTSM_NO_INLINE_HCALL
 #include <ipc_proto.h>
+#ifndef UTSM_HCALL_PARK
+#define UTSM_HCALL_PARK 0x0003
+#endif
 
 #define UTSM_DEV_NAME "utsm"
 
@@ -308,10 +319,12 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         umsg.data_len = msg.data_len;
         if (umsg.buf_size < msg.data_len)
             return -EINVAL;
-        if (msg.data_len > 0) {
-            if (copy_to_user(umsg.data, msg.data, msg.data_len))
-                return -EFAULT;
-        }
+        /* umsg is already a kernel copy of the ioctl arg. Do not
+         * copy_to_user(umsg.data) — that treats a kernel address as
+         * a userspace pointer and returns -EFAULT, so the daemon
+         * parks without seeing EXEC_REQUEST (linux_compat exec -4). */
+        if (msg.data_len > 0)
+            memcpy(umsg.data, msg.data, msg.data_len);
         if (copy_to_user((void __user *)arg, &umsg, sizeof(umsg)))
             return -EFAULT;
         return 0;
@@ -328,10 +341,8 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         memset(&msg, 0, sizeof(msg));
         msg.type = umsg.type;
         msg.data_len = min_t(u32, umsg.data_len, UTSM_IPC_MSG_DATA_SIZE);
-        if (msg.data_len > 0) {
-            if (copy_from_user(msg.data, umsg.data, msg.data_len))
-                return -EFAULT;
-        }
+        if (msg.data_len > 0)
+            memcpy(msg.data, umsg.data, msg.data_len);
 
         if (utsm_ipc_ring_push(&g_shm->linux_to_utsm, &msg) != 0) {
             pr_warn("[utsm] linux_to_utsm ring full\n");
@@ -341,20 +352,12 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     }
 
     case UTSM_IOCTL_PARK: {
-        /* Execute HLT to trigger VM-Exit → UTSM parks guest.
-         * Interrupts must be enabled so that on vmresume the guest
-         * can continue (HLT with interrupts disabled would hang).
-         *
-         * Flow:
-         *   1. daemon calls ioctl(PARK) → driver executes HLT
-         *   2. HLT → VM-Exit (CPU_BASED_HLT_EXITING) → UTSM handle_hlt
-         *   3. UTSM advances RIP past HLT, exits to host (park)
-         *   4. UTSM writes request + vmresume
-         *   5. Guest continues from after HLT → ioctl returns
-         *   6. Daemon re-checks ring for new EXEC_REQUEST
+        /* VMCALL park. Idle HLT must stay in the guest (wait for IRQ).
+         * idle=poll + HLT-as-park panicked in cpu_idle_poll (current=NULL).
          */
-        mb();  /* ensure prior ring writes are visible before HLT */
-        asm volatile("hlt" ::: "memory");
+        mb();
+        if (utsm_hcall(UTSM_HCALL_PARK, 0, 0, 0) != 0)
+            return -EIO;
         return 0;
     }
 
@@ -601,6 +604,17 @@ static int __init utsm_hcall_init(void)
 	int ret;
 
 	pr_info("[utsm] probing for UTSM monitor...\n");
+
+	/* Nested KVM leaks host U_CET (IBT+SHSTK) into L2. L1 cannot
+	 * WRMSR CET (CR4.CET=0). Clear it from the guest while the
+	 * WRMSR is not intercepted. */
+	{
+		u64 ucet = 0;
+		int rd = rdmsrl_safe(MSR_IA32_U_CET, &ucet);
+		int wr = wrmsrl_safe(MSR_IA32_U_CET, 0);
+		pr_info("[utsm] CET U_CET rd=%d val=0x%llx wr0=%d\n",
+			rd, ucet, wr);
+	}
 
 	/* 1. Ping UTSM to verify it's present */
 	ping_ret = utsm_hcall_ping();

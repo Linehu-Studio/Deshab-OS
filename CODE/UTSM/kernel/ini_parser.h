@@ -12,7 +12,7 @@ typedef struct {
 
 /* INI 配置集合（栈/静态分配，不依赖堆） */
 typedef struct {
-    ini_entry entries[64];  /* 最多 64 条配置项 */
+    ini_entry entries[128]; /* 最多 128 条配置项（M4: [sched]/[drr] 加入后 64 不够用） */
     u32 count;
 } ini_config;
 

@@ -22,6 +22,7 @@
 #define DESHAB_FAT32_IO_H
 
 #include "fat32_lfn.h"
+#include "fat32_part.h"
 
 /* ---- block 设备函数类型（与 shell/DSK 一致：index 参数固定 0） ---- */
 typedef int (*f32_block_read_fn)(u32 index, u64 lba, u32 count, void *buf);
@@ -60,27 +61,39 @@ static inline int f32_neq11(const char *a, const char *b) {
 #define F32_DATA_BYTES 262144
 #endif
 static u8 f32_disk[131072];      /* 256 扇区 BPB+FAT+根目录缓存 */
-static u8 f32_cluster[4096];     /* 单簇缓冲 */
+static u8 f32_cluster[FAT32_MAX_CLUSTER_BYTES]; /* 单簇缓冲：ESP>=4GiB 时为 32KiB */
 static u8 f32_data[F32_DATA_BYTES]; /* 文件数据缓冲 */
 static int f32_disk_loaded = 0;  /* f32_disk 是否已加载 BPB+FAT */
+static u32 f32_lba_base = 0;     /* GPT ESP start (0 for superfloppy / SATA) */
 
 /* 初始化：注入 block_read/block_write 函数指针 */
 static inline void f32_init(f32_block_read_fn rd, f32_block_write_fn wr) {
     f32_blk_read = rd;
     f32_blk_write = wr;
     f32_disk_loaded = 0;
+    f32_lba_base = 0;
 }
 
 static inline int f32_read_sectors(u32 lba, u32 count, u8 *out) {
-    return f32_blk_read ? f32_blk_read(0, lba, count, out) : -1;
+    return f32_blk_read ? f32_blk_read(0, (u64)lba + f32_lba_base, count, out) : -1;
 }
 static inline int f32_write_sectors(u32 lba, u32 count, const u8 *buf) {
-    return f32_blk_write ? f32_blk_write(0, lba, count, buf) : -1;
+    return f32_blk_write ? f32_blk_write(0, (u64)lba + f32_lba_base, count, buf) : -1;
+}
+
+static inline int f32_bpb_ok_at(u32 abs_lba) {
+    u8 sec[512];
+    const f32_bpb *bpb;
+    if (!f32_blk_read || f32_blk_read(0, abs_lba, 1, sec) != 0) return 0;
+    bpb = (const f32_bpb *)sec;
+    return (bpb->boot_sig == 0xAA55 && bpb->bps == 512 && bpb->spf != 0 && bpb->root_clus >= 2);
 }
 
 /* 确保 f32_disk 已加载 BPB+FAT+根目录（256 扇区） */
 static inline int f32_disk_load(void) {
     if (f32_disk_loaded) return 0;
+    f32_lba_base = (u32)fat32_part_probe(f32_blk_read, 0);
+    if (!f32_bpb_ok_at(f32_lba_base)) return -2;
     if (f32_read_sectors(0, 256, f32_disk) != 0) return -1;
     const f32_bpb *bpb = (const f32_bpb *)f32_disk;
     if (bpb->boot_sig != 0xAA55 || bpb->bps != 512) return -2;
@@ -177,7 +190,7 @@ static inline int f32_read_root_file(const char *name11, u8 **out_data, u32 *out
         if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             cb = f32_disk + (u64)lba * 512;
         else {
-            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            if (f32_read_sectors(lba, spc, f32_cluster) != 0) return -4;
             cb = f32_cluster;
         }
         if (f32_find_in_root(cb, spc, name11, &found_clus, &found_size, 0) == 0) { found = 1; break; }
@@ -197,7 +210,7 @@ static inline int f32_read_root_file(const char *name11, u8 **out_data, u32 *out
         if ((u64)fc_lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             fb = f32_disk + (u64)fc_lba * 512;
         else {
-            if (f32_read_sectors(fc_lba, 8, f32_cluster) != 0) return -7;
+            if (f32_read_sectors(fc_lba, spc, f32_cluster) != 0) return -7;
             fb = f32_cluster;
         }
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
@@ -662,7 +675,7 @@ static inline int f32_list_root(f32_list_cb emit, void *user_data) {
         if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             cb = f32_disk + (u64)lba * 512;
         else {
-            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            if (f32_read_sectors(lba, spc, f32_cluster) != 0) return -4;
             cb = f32_cluster;
         }
         const f32_dirent *dir = (const f32_dirent *)cb;
@@ -685,18 +698,7 @@ done:
 
 /* ---- 子目录遍历支持（Phase 2.2 fileman 扩展） ---- */
 
-/* 目录条目（供 fileman 等工具使用） */
-typedef struct {
-    char name[13];      /* 8.3 显示名 */
-    u32  clus;          /* 首簇号 */
-    u32  size;          /* 文件大小（目录为 0） */
-    u8   attr;
-    u8   is_dir;
-    u8   has_lfn;       /* 1=long_name 字段有效 */
-    char long_name[260]; /* LFN 长文件名（ASCII） */
-} f32_entry;
-
-typedef int (*f32_list_entry_cb)(const f32_entry *e, void *user_data);
+/* f32_entry / f32_list_entry_cb 定义已移至 fat32_lfn.h（本头包含之）。 */
 
 /* 列举指定目录簇的内容（含 LFN 长文件名）。
  * dir_clus = 0 表示根目录（自动从 BPB 取 root_clus）。
@@ -717,7 +719,7 @@ static inline int f32_list_dir(u32 dir_clus, f32_list_entry_cb emit, void *user_
         if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             cb = f32_disk + (u64)lba * 512;
         else {
-            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            if (f32_read_sectors(lba, spc, f32_cluster) != 0) return -4;
             cb = f32_cluster;
         }
         const u8 *entries = (const u8 *)cb;
@@ -781,7 +783,7 @@ static inline int f32_read_file_by_clus(u32 clus, u32 size, u8 *out_buf, u32 buf
         if ((u64)fc_lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             fb = f32_disk + (u64)fc_lba * 512;
         else {
-            if (f32_read_sectors(fc_lba, 8, f32_cluster) != 0) return -7;
+            if (f32_read_sectors(fc_lba, spc, f32_cluster) != 0) return -7;
             fb = f32_cluster;
         }
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
@@ -822,7 +824,7 @@ static inline int f32_find_in_dir_lfn(u32 dir_clus, const char *long_name,
         if ((u64)lba * 512 + (u64)spc * 512 <= 256ULL * 512)
             cb = f32_disk + (u64)lba * 512;
         else {
-            if (f32_read_sectors(lba, 8, f32_cluster) != 0) return -4;
+            if (f32_read_sectors(lba, spc, f32_cluster) != 0) return -4;
             cb = f32_cluster;
         }
         const u8 *entries = (const u8 *)cb;
@@ -958,6 +960,50 @@ static inline int f32_read_path_lfn(const char *path, u8 **out_data, u32 *out_si
     if (f32_read_file_by_clus(file_clus, file_size, f32_data, sizeof(f32_data)) != 0) return -5;
     *out_data = f32_data;
     *out_size = file_size;
+    return 0;
+}
+
+/* 按长路径读取文件到调用者指定缓冲（流式直读，绕过 f32_data 尺寸上限）。
+ *   path : '/' 分隔的长文件名路径（如 "system/font/simhei_16.dbf"）
+ *   dst  : 目标缓冲（如固定地址字库区）
+ *   cap  : 缓冲容量（字节）
+ *   out_size : 返回文件大小（可为 0）
+ * 返回 0 成功，负值失败（-4 = 文件超过 cap）。 */
+static inline int f32_read_path_lfn_to(const char *path, u8 *dst, u32 cap, u32 *out_size) {
+    if (!path || !dst) return -1;
+    if (f32_disk_load() != 0) return -1;
+
+    /* 分离目录部分与文件名 */
+    u32 path_len = 0;
+    while (path[path_len]) path_len++;
+    u32 last_slash = 0xFFFFFFFFu;
+    for (u32 i = 0; i < path_len; i++) {
+        if (path[i] == '/') last_slash = i;
+    }
+    const char *fname = (last_slash == 0xFFFFFFFFu) ? path : path + last_slash + 1;
+
+    /* 定位父目录簇 */
+    u32 dir_clus = 0;
+    if (last_slash == 0xFFFFFFFFu) {
+        const f32_bpb *bpb = (const f32_bpb *)f32_disk;
+        dir_clus = bpb->root_clus;
+    } else {
+        char dirpath[260];
+        u32 dn = last_slash;
+        if (dn >= sizeof(dirpath)) dn = sizeof(dirpath) - 1;
+        for (u32 i = 0; i < dn; i++) dirpath[i] = path[i];
+        dirpath[dn] = 0;
+        if (f32_find_path_dir_lfn(dirpath, &dir_clus) != 0) return -2;
+    }
+
+    /* 在父目录中查找文件 */
+    u32 file_clus = 0, file_size = 0;
+    if (f32_find_in_dir_lfn(dir_clus, fname, 0, &file_clus, &file_size) != 0) return -3;
+    if (file_size > cap) return -4;
+
+    /* 读取文件数据到目标缓冲 */
+    if (f32_read_file_by_clus(file_clus, file_size, dst, cap) != 0) return -5;
+    if (out_size) *out_size = file_size;
     return 0;
 }
 

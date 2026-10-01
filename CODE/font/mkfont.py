@@ -1,6 +1,16 @@
 """mkfont.py — Deshab Bitmap Font generator
-Usage: python mkfont.py <ttf_path> <size> <output.dbf>
-Renders GB2312 charset + ASCII to a packed bitmap font file (.dbf)
+Usage: python mkfont.py <ttf_path> <size> <output.dbf> [--charset charset.txt]
+
+Renders GB2312 charset + ASCII (default) or a custom charset file to a packed
+bitmap font file (.dbf).
+
+Index format (see dbf.h):
+  - Key is the Unicode BMP codepoint of the glyph (NOT the GB2312 byte pair).
+  - Index entries are sorted ascending by codepoint — required by the
+    binary-search reader dbf_lookup().
+
+--charset: UTF-8 text file; every unique character in it becomes a glyph
+(ASCII or CJK). Use to build small UI-subset fonts.
 """
 
 import struct
@@ -9,51 +19,60 @@ from PIL import Image, ImageFont, ImageDraw
 
 DBF_MAGIC = b"DBF\x10"
 
-# GB2312 codepoints for simplified Chinese (3755 level-1 + 3008 level-2)
-def gb2312_codepoints():
-    cps = []
-    # ASCII 32-126
-    for c in range(32, 127):
-        cps.append(c)
-    # GB2312 level 1: 0xB0A1 - 0xB0FE, ... , 0xD7F9
+
+def gb2312_chars():
+    """All GB2312 characters (level 1 + level 2) as a list of str."""
+    chars = []
+    # Level 1: 0xB0A1 - 0xD7F9 (pinyin ordered)
     for hi in range(0xB0, 0xD8):
-        for lo in range(0xA1, 0xFF):
-            cps.append((hi << 8) | lo)
-    # GB2312 level 2: skip duplicates, 0xD8A1 - 0xF7FE
-    for hi in range(0xD8, 0xF8):
         for lo in range(0xA1, 0xFF):
             if hi == 0xD7 and lo > 0xF9:
                 break
-            cps.append((hi << 8) | lo)
-    return cps
+            try:
+                chars.append(bytes([hi, lo]).decode("gb2312"))
+            except UnicodeDecodeError:
+                pass
+    # Level 2: 0xD8A1 - 0xF7FE
+    for hi in range(0xD8, 0xF8):
+        for lo in range(0xA1, 0xFF):
+            try:
+                chars.append(bytes([hi, lo]).decode("gb2312"))
+            except UnicodeDecodeError:
+                pass
+    return chars
 
 
-def render_font(ttf_path, size, output_path, bpp=8):
+def charset_from_file(path):
+    """Unique characters from a UTF-8 text file."""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    # 保留出现顺序去重；排序交给索引排序阶段
+    return list(dict.fromkeys(text))
+
+
+def render_font(ttf_path, size, output_path, charset=None, bpp=8):
     font = ImageFont.truetype(ttf_path, size)
-    cps = gb2312_codepoints()
 
-    # Build index and data
+    if charset is None:
+        # 默认：ASCII 32-126 + 全 GB2312
+        chars = [chr(c) for c in range(32, 127)] + gb2312_chars()
+    else:
+        chars = list(charset)
+        # 去重
+        chars = list(dict.fromkeys(chars))
+
     glyph_w = size
     glyph_h = size
-    data_parts = []
-    index_entries = []
-
     ascii_w = size * 3 // 4  # narrower for ASCII
 
-    for cp in cps:
-        if cp < 128:
-            # ASCII — use narrower glyph
-            ch = chr(cp)
-            w = ascii_w
-        else:
-            # GB2312 byte pair → Unicode
-            hi = (cp >> 8) & 0xFF
-            lo = cp & 0xFF
-            try:
-                ch = bytes([hi, lo]).decode("gb2312")
-            except:
-                continue
-            w = glyph_w
+    data_parts = []
+    index_entries = []  # (unicode_cp, width, offset, size)
+
+    for ch in chars:
+        cp = ord(ch)
+        if cp > 0xFFFF:
+            continue  # dbf index key is u16 — BMP only
+        w = ascii_w if cp < 128 else glyph_w
 
         img = Image.new("L", (w, glyph_h), 0)
         draw = ImageDraw.Draw(img)
@@ -82,25 +101,49 @@ def render_font(ttf_path, size, output_path, bpp=8):
         data_parts.append(glyph_data)
         index_entries.append((cp, w, offset, len(glyph_data)))
 
+    # 关键：按 Unicode 码点升序排序（dbf_lookup 二分查找的前提），
+    # 同码点去重（自定义字表可能重复包含同一字符）。
+    seen = {}
+    for cp, w, off, sz in index_entries:
+        if cp not in seen:
+            seen[cp] = (cp, w, off, sz)
+    index_entries = sorted(seen.values(), key=lambda e: e[0])
+
     # Write file
     total_data = sum(len(d) for d in data_parts)
+    # dbf.h 规范：data_offset 相对文件头（magic+header+index），写入时换算
+    data_start = 14 + len(index_entries) * 12
     print(f"Glyphs: {len(index_entries)}, Data: {total_data} bytes")
 
     with open(output_path, "wb") as f:
         f.write(DBF_MAGIC)
         f.write(struct.pack("<I", len(index_entries)))
         f.write(struct.pack("<HHH", glyph_w, glyph_h, bpp))
-        for cp, w, off, sz in index_entries:
-            f.write(struct.pack("<HHII", cp, w, off, sz))
+        for cp, w, rel_off, sz in index_entries:
+            f.write(struct.pack("<HHII", cp, w, data_start + rel_off, sz))
         for d in data_parts:
             f.write(d)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <ttf_path> <size> <output.dbf>")
+def main():
+    argv = sys.argv[1:]
+    charset_path = None
+    if "--charset" in argv:
+        i = argv.index("--charset")
+        if i + 1 >= len(argv):
+            print("--charset requires a file path")
+            sys.exit(1)
+        charset_path = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    if len(argv) != 3:
+        print(f"Usage: {sys.argv[0]} <ttf_path> <size> <output.dbf> [--charset file]")
         sys.exit(1)
-    ttf = sys.argv[1]
-    sz = int(sys.argv[2])
-    out = sys.argv[3]
-    render_font(ttf, sz, out)
+    ttf, size, out = argv[0], int(argv[1]), argv[2]
+    charset = charset_from_file(charset_path) if charset_path else None
+    if charset is not None:
+        print(f"Custom charset: {len(charset)} unique chars from {charset_path}")
+    render_font(ttf, size, out, charset=charset)
+
+
+if __name__ == "__main__":
+    main()

@@ -25,8 +25,8 @@ Limine → utsm.elf → DKM 14驱动 → DSK(deshab.elf)
 | 字体系统 | ✅ | DBF 16/24/32px，GB2312全覆盖 |
 | FirstInit | 🔶 | UI+输入+SHA256密码+写盘；B6按键崩溃修复中 |
 | 正常启动路径 | ✅ | login→desktop |
-| SAS-R0-PCQ | ⬜ | 设计完成 |
-| DRR | ⬜ | stub占位 |
+| SAS-R0-PCQ | ✅ | O(1)位图调度+LAPIC tick+xv6式切换，selftest闭环 |
+| DRR | 🔶 | 看门狗/快照/回滚闭环（CRC64+AB双槽），MAC仍为占位 |
 
 ---
 
@@ -123,11 +123,14 @@ Limine → utsm.elf → DKM 14驱动 → DSK(deshab.elf)
 
 | 任务 | 状态 | 验收标准 |
 |------|------|---------|
-| TCB+task_create | ⬜ | process_uuid+stack/heap段+cap table |
-| Per-CPU runqueue | ⬜ | 每CPU独立 |
-| O(1)位图调度器 | ⬜ | pick_next_task O(1) |
-| context_switch | ⬜ | 只加载crypto指针 |
+| TCB+task_create | 🔶 | 64槽TCB+entry/arg/stack；process_uuid/cap table待接 |
+| Per-CPU runqueue | 🔶 | 结构就位（8 CPU），当前BSP-only |
+| O(1)位图调度器 | ✅ | ready_bitmap ctz选 prio0最高，selftest PASS |
+| context_switch | ✅ | xv6式栈切换(switch.S)，只触碰crypto指针 |
 | task_kill crypto erase | ⬜ | key_epoch++, state=DESTROYED |
+
+tick源=LAPIC timer宿主自持(arch/x86_64/lapic_timer.c)；demo窗口含tick失速兜底；
+selftest含runqueue O(1)、block/wake、看门狗负向测试（demo_fault=1检出+回滚）。
 
 风险：切换路径禁止扫描capability/计算MAC/重加密。
 
@@ -137,12 +140,14 @@ Limine → utsm.elf → DKM 14驱动 → DSK(deshab.elf)
 
 | 任务 | 状态 | 验收标准 |
 |------|------|---------|
-| Emergency Pool+Watchdog+Recovery log | ⬜ | 独立内存池+独立调度器 |
-| Dirty Shard+Bitmap | 🔶 | 数据结构已设计 |
-| A/B Checkpoint双槽 | ⬜ | CRC+原子active slot切换 |
-| Page/Segment/System Rollback | ⬜ | 三级回滚 |
+| Emergency Pool+Watchdog+Recovery log | 🔶 | 看门狗register/kick/timeout闭环+负向测试PASS；独立调度器待做 |
+| Dirty Shard+Bitmap | ✅ | snapshot_dirty按shard位图收集dirty页 |
+| A/B Checkpoint双槽 | ✅ | ckpt_a/ckpt_b+CRC64+active slot切换 |
+| Page/Segment/System Rollback | 🔶 | page级回滚+verify PASS；segment/system级待真实加密后验证 |
 | 驱动recovery ops | ⬜ | quiesce/reset/reinit |
 
+注：快照区为静态区域（UTSM arena 内），页快照容量编译期 128 页；
+MAC 当前为 CRC64 占位（Phase 9 替换真实 MAC）。
 风险：恢复路径禁用普通堆；Emergency Pool耗尽→system rollback。
 
 ---

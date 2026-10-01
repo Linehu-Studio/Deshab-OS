@@ -156,6 +156,11 @@ typedef struct linux_compat_service {
      *        （-1=服务不可用, -2=IPC 发送失败, -3=linux_resume 失败,
      *         -4=无响应, -5=daemon 报告 spawn 失败）。 */
     int (*exec_async)(const char *path, int argc, const char *const *argv);
+
+    /* 不发送 IPC，只跑一段 Linux vCPU（HLT 或 preemption timeslice）。
+     * KDE/Plasma 全屏循环用这个唤醒 async 子进程，避免再 exec sleep。
+     * 返回 0 成功，负值同 linux_resume。 */
+    int (*run_slice)(void);
 } linux_compat_service;
 
 /* ===== UTSM 内部接口（不进服务表，供 hypercall.c 等内核代码使用） =====

@@ -58,6 +58,7 @@ typedef __u64 uint64_t;
 enum utsm_hcall_op {
     UTSM_HCALL_PING          = 0x0001,  /* Simple ping (returns PONG) */
     UTSM_HCALL_HELLO         = 0x0002,  /* Hello handshake */
+    UTSM_HCALL_PARK          = 0x0003,  /* Park vCPU back to DSK (not HLT) */
     UTSM_HCALL_SHM_INFO      = 0x0010,  /* Query shared memory GPA + size */
     UTSM_HCALL_CAP_VALIDATE  = 0x0020,  /* Capability validation */
     UTSM_HCALL_UTRW_READ     = 0x0030,  /* Sealed memory read (UTRW) */

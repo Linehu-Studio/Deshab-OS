@@ -46,10 +46,16 @@ static void *gpa_to_hva(u64 gpa) {
     return (void *)(hhdm + hpa);
 }
 
+static void *guest_ptr_to_hva(u64 guest_ptr) {
+    u64 gpa = vmx_guest_gva_to_gpa(guest_ptr);
+    if (gpa == 0) gpa = guest_ptr;
+    return gpa_to_hva(gpa);
+}
+
 /* Write a u64 to guest memory at the given GPA.
  * Returns 0 on success, -1 on failure. */
 static int guest_write_u64(u64 gpa, u64 value) {
-    void *hva = gpa_to_hva(gpa);
+    void *hva = guest_ptr_to_hva(gpa);
     if (!hva) return -1;
     *(volatile u64 *)hva = value;
     return 0;
@@ -58,14 +64,14 @@ static int guest_write_u64(u64 gpa, u64 value) {
 /* Copy bytes from guest memory (GVA=GPA) to host buffer.
  * Handles cross-page boundaries by translating each page separately.
  * Returns 0 on success, -1 on failure. */
-static int guest_read_buf(u64 gpa, void *host_dst, u64 len) {
+static int guest_read_buf(u64 gva, void *host_dst, u64 len) {
     u8 *dst = (u8 *)host_dst;
     u64 copied = 0;
     while (copied < len) {
-        void *hva = gpa_to_hva(gpa + copied);
+        void *hva = guest_ptr_to_hva(gva + copied);
         if (!hva) return -1;
-        u64 page_end = (gpa + copied + 4096) & ~0xFFFULL;
-        u64 chunk = page_end - (gpa + copied);
+        u64 page_off = (gva + copied) & 0xFFFULL;
+        u64 chunk = 4096 - page_off;
         if (chunk > len - copied) chunk = len - copied;
         const u8 *src = (const u8 *)hva;
         for (u64 i = 0; i < chunk; i++) {
@@ -111,6 +117,8 @@ static long hcall_shm_info(u64 a0, u64 a1, u64 a2) {
     /* Write results to guest memory */
     if (a0 != 0 && guest_write_u64(a0, shm_gpa) != 0) {
         log_error("[HCALL] SHM_INFO: failed to write gpa to guest");
+        log_hex64("[HCALL] SHM_INFO: a0=", a0);
+        log_hex64("[HCALL] SHM_INFO: walk=", vmx_guest_gva_to_gpa(a0));
         return UTSM_HCALL_INVAL;
     }
     if (a1 != 0 && guest_write_u64(a1, shm_size) != 0) {
@@ -311,6 +319,13 @@ int hypercall_handle(u64 guest_rax, u64 guest_rdi, u64 guest_rsi, u64 guest_rdx,
     case UTSM_HCALL_HELLO:
         result = hcall_hello(guest_rdi, guest_rsi, guest_rdx);
         break;
+    case UTSM_HCALL_PARK:
+        /* Daemon park: return to DSK. Idle HLT must not use this path. */
+        g_guest_regs.rax = (u64)UTSM_HCALL_OK;
+        vmx_vmcs_write(VMCS_GUEST_RIP, guest_rip + instr_len);
+        g_guest_parked = 1;
+        log_info("[HCALL] PARK - Linux guest parked");
+        return 0;
     case UTSM_HCALL_SHM_INFO:
         result = hcall_shm_info(guest_rdi, guest_rsi, guest_rdx);
         break;

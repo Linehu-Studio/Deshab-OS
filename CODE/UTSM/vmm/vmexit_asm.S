@@ -69,9 +69,10 @@ vmx_vm_exit_handler:
     movq  g_guest_regs + 104(%rip), %r14
     movq  g_guest_regs + 112(%rip), %r15
 
-    /* Step 4: Check terminate flag */
-    movl g_guest_terminated(%rip), %eax
-    testl %eax, %eax
+    /* Step 4: Check terminate flag without clobbering guest RAX.
+     * The old `movl g_guest_terminated, %eax` zeroed every IN/CPUID
+     * result and livelocked Linux earlyprintk on COM1 LSR (0x3FD). */
+    cmpl $0, g_guest_terminated(%rip)
     jnz .Lterminate
 
     /* Resume guest: GPRs are now restored (with any C modifications).

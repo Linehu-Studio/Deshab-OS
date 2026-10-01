@@ -13,7 +13,7 @@
 | 引导 | Limine（UEFI 优先，BIOS 兼容） |
 | 语言 | C11 freestanding + x86_64 asm |
 | 工链 | LLVM Clang + ld.lld（`-mcmodel=kernel -mno-sse -msoft-float`） |
-| 构建 | `build.ps1` → `ISO/deshab.img`（GPT+FAT32 ESP）→ QEMU UEFI |
+| 构建 | `build.ps1` → `ISO/deshab.img`（GPT：FAT32 ESP `/boot` + ext4 数据分区）→ QEMU UEFI |
 
 设计哲学：极高权限/效率优先（Ring0+O(1)热路径）；内存默认封缄（UTSM/UTRW）；恢复根独立（DRR Emergency Pool）；驱动与内核解耦（dkm_kernel_api）；先闭环再扩展。
 

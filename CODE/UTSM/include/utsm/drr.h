@@ -124,4 +124,55 @@ u64 drr_heartbeat_get(void);
 /* CRC64 */
 u64 drr_crc64(const void *data, u64 len);
 
+/* ===================================================================
+ *  Phase 8 扩展：真实脏页快照 / 页级回滚 / 看门狗 / system rollback
+ *  （尾部追加，不动既有结构与语义）
+ * =================================================================== */
+
+/* 快照区条目（快照区第 0 页：头(64B) + 条目数组顺序存放） */
+typedef struct {
+    u32 seg_slot;       /* utsm_get_segment 的 slot */
+    u32 page_index;     /* 段内页号 */
+    u64 cipher_vaddr;   /* 段内目标页虚拟地址（HHDM，回滚目标） */
+    u64 crc;            /* 快照数据 CRC64（drr_crc64，区域完整性） */
+    u32 region_idx;     /* 快照数据所在页序号（区域第 1+idx 页） */
+    u32 used;
+    /* Phase 9: 真实 MAC（keyed BLAKE2b，绑定 seg/page/epoch） */
+    u64 key_epoch;      /* 快照时刻段 key_epoch（MAC 上下文 + 防跨纪元重放） */
+    u64 mac;            /* 页 MAC（utsm_page_mac，截断 64 位） */
+} drr_ckpt_page_entry;
+
+/* 真实脏页快照：扫描全部 ACTIVE 段的 dirty shard 位图，逐脏页复制到
+ * 快照区（先快照后清位；区满则部分提交且不清位），随后走 A/B checkpoint
+ * 原子切换。O(dirty_shards + dirty_pages)。
+ * 返回快照页数（>=0）；负数失败（未初始化/快照区不可用）。 */
+int drr_ckpt_snapshot_dirty(void);
+
+/* 页级回滚：按 active slot 元数据 + 快照区逐页 CRC 校验后恢复密文页
+ * 并清除对应脏位；触碰段状态 RECOVERING → ACTIVE，CRC 失败段 POISONED。
+ * 返回恢复页数（>=0）；失败 -2（任一页 CRC 不符）。 */
+int drr_rollback_pages(void);
+
+/* 系统级回滚：crash 留痕 + 8042 复位（不返回）。
+ * Emergency Pool 耗尽 / 双槽皆坏 / 无任务可切换时调用。 */
+void drr_system_rollback(const char *reason);
+
+/* 统一 fault 入口：report_fault → 页级回滚 → sched fault 回调（可能不
+ * 返回）；回调缺失且 reboot 使能时 → system rollback。 */
+void drr_handle_task_fault(u32 task_slot, const char *reason);
+
+/* 看门狗（独立于调度器：由 tick handler 直接调用 check，非调度任务） */
+#define DRR_WATCHDOG_MAX 8
+int  drr_watchdog_register(u32 task_slot, u32 timeout_ticks);
+int  drr_watchdog_unregister(u32 task_slot);
+void drr_watchdog_kick(u32 task_slot);
+void drr_watchdog_check(void);
+
+/* 恢复行为控制：关闭后 fault 只留日志不真重启（selftest 用） */
+void drr_set_reboot_enabled(int enabled);
+
+/* 调度器 fault 回调（sched enable 时注入；缺失时 fault → system rollback）。
+ * DRR 独立性：对调度器只依赖这一个函数指针。 */
+void drr_set_sched_fault_cb(void (*cb)(u32 task_slot));
+
 #endif /* UTSM_DRR_H */

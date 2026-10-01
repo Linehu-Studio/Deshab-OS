@@ -40,6 +40,17 @@ if not exist "%IMG%" (
 )
 echo [qemu] Variant: %VARIANT%
 
+REM QEMU_SERIAL_LOG=path  : redirect serial to file instead of stdio.
+REM Windows console QuickEdit selection can block stdio serial output and
+REM freeze the whole VM mid-boot (appears as AHCI reads "stuck" at random LBA).
+set "SERIAL_ARGS=-serial stdio"
+if defined QEMU_SERIAL_LOG (
+    if exist "%QEMU_SERIAL_LOG%" del "%QEMU_SERIAL_LOG%"
+    set "SERIAL_ARGS=-serial file:%QEMU_SERIAL_LOG%"
+    echo [qemu] Serial log: %QEMU_SERIAL_LOG%
+)
+
+
 set "QEMU="
 for %%Q in (qemu-system-x86_64.exe qemu-system-x86_64) do (
     for /f "delims=" %%P in ('where %%Q 2^>nul') do (
@@ -142,10 +153,10 @@ set "OSDISK_OPTS=-drive if=none,id=osdisk,format=raw,file="%IMG%" -device virtio
 
 if exist "%SATA_IMG%" (
     echo [qemu] SATA:  %SATA_IMG%
-    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 12G -cpu %QEMU_CPU% %SERIAL_ARGS% -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
 ) else (
     echo [qemu] SATA image not found, booting without block device
-    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 2G -cpu %QEMU_CPU% -serial stdio -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 12G -cpu %QEMU_CPU% %SERIAL_ARGS% -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on
 )
 
 endlocal

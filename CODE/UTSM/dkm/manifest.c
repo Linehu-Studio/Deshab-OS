@@ -290,15 +290,20 @@ void dsm_load_by_manifest(void) {
     dsm_load_by_manifest_ex(NULL);
 }
 
-void dsm_load_by_manifest_ex(const ini_config *cfg) {
-    struct limine_module_response *rsp = g_module_request.response;
+static int dsm_ensure_manifest(void) {
+    struct limine_module_response *rsp;
+    struct limine_file *manifest_file;
+    u64 i;
+
+    if (g_stage_count) return 0;
+    rsp = g_module_request.response;
     if (!rsp) {
         log_warn("[DSM] no Limine module response");
-        return;
+        return -1;
     }
 
-    struct limine_file *manifest_file = 0;
-    for (u64 i = 0; i < rsp->module_count; i++) {
+    manifest_file = 0;
+    for (i = 0; i < rsp->module_count; i++) {
         struct limine_file *f = rsp->modules[i];
         if (f && f->path && f->cmdline && streq_static(f->cmdline, "dkm:manifest")) {
             manifest_file = f;
@@ -308,22 +313,33 @@ void dsm_load_by_manifest_ex(const ini_config *cfg) {
 
     if (!manifest_file) {
         log_warn("[DSM] manifest not found in boot modules");
-        return;
+        return -1;
     }
 
     log_info("[DSM] parsing manifest");
     dsm_parse_manifest((const char *)manifest_file->address, manifest_file->size);
     log_info("[DSM] manifest parsed");
     log_hex64("[DSM] stages=", (u64)g_stage_count);
+    return 0;
+}
+
+static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max_stage_id) {
+    if (dsm_ensure_manifest() != 0) return;
 
     for (u32 si = 0; si < g_stage_count; si++) {
         dsm_stage_entry *stage = &g_stages[si];
+        if (limit_stage && stage->id > max_stage_id) continue;
         log_info("[DSM] stage begin");
         log_info(stage->name);
         log_hex64("[DSM] driver count=", stage->driver_count);
 
         for (u32 di = 0; di < stage->driver_count; di++) {
             dsm_driver_entry *drv = &stage->drivers[di];
+            struct limine_file *f;
+            struct dkm_symbol_scan symbols;
+            int result;
+
+            if (drv->loaded) continue;
 
             /* === FUCK [drivers] 驱动开关检查 === */
             if (cfg) {
@@ -331,7 +347,7 @@ void dsm_load_by_manifest_ex(const ini_config *cfg) {
                 if (!enabled) {
                     log_info("[DSM] driver disabled by FUCK: ");
                     log_info(drv->name);
-                    continue;  /* 跳过此驱动 */
+                    continue;
                 }
             }
 
@@ -346,7 +362,7 @@ void dsm_load_by_manifest_ex(const ini_config *cfg) {
                 continue;
             }
 
-            struct limine_file *f = drv->boot_module;
+            f = drv->boot_module;
             log_info("[DSM] loading driver");
             log_info(drv->name);
 
@@ -355,13 +371,12 @@ void dsm_load_by_manifest_ex(const ini_config *cfg) {
                 continue;
             }
 
-            struct dkm_symbol_scan symbols;
             if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
                 log_error("[DSM] symbol scan failed");
                 continue;
             }
 
-            int result = dkm_load_elf_rel(f->address, f->size, &symbols);
+            result = dkm_load_elf_rel(f->address, f->size, &symbols);
             if (result != 0) {
                 log_error("[DSM] load failed");
                 if (drv->required && stage->required) {
@@ -374,4 +389,60 @@ void dsm_load_by_manifest_ex(const ini_config *cfg) {
         }
         log_info("[DSM] stage end");
     }
+}
+
+void dsm_load_by_manifest_upto(const ini_config *cfg, u32 max_stage_id) {
+    dsm_load_stage_range(cfg, 1, max_stage_id);
+}
+
+void dsm_load_named(const ini_config *cfg, const char *name) {
+    if (!name || dsm_ensure_manifest() != 0) return;
+
+    for (u32 si = 0; si < g_stage_count; si++) {
+        dsm_stage_entry *stage = &g_stages[si];
+        for (u32 di = 0; di < stage->driver_count; di++) {
+            dsm_driver_entry *drv = &stage->drivers[di];
+            struct limine_file *f;
+            struct dkm_symbol_scan symbols;
+            int result;
+
+            if (!streq_static(drv->name, name)) continue;
+            if (drv->loaded) return;
+            if (cfg && !ini_get_bool(cfg, "drivers", drv->name, 1)) {
+                log_info("[DSM] driver disabled by FUCK: ");
+                log_info(drv->name);
+                return;
+            }
+            drv->boot_module = dsm_find_boot_module(drv->path);
+            if (!drv->boot_module) {
+                log_warn("[DSM] named module not found");
+                log_info(name);
+                return;
+            }
+            f = drv->boot_module;
+            log_info("[DSM] loading named driver");
+            log_info(drv->name);
+            if (dkm_check_elf64(f->address, f->size) != 0) {
+                log_error("[DSM] ELF check failed");
+                return;
+            }
+            if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
+                log_error("[DSM] symbol scan failed");
+                return;
+            }
+            result = dkm_load_elf_rel(f->address, f->size, &symbols);
+            if (result != 0) {
+                log_error("[DSM] load failed");
+                return;
+            }
+            drv->loaded = 1;
+            return;
+        }
+    }
+    log_warn("[DSM] named driver not in manifest");
+    log_info(name);
+}
+
+void dsm_load_by_manifest_ex(const ini_config *cfg) {
+    dsm_load_stage_range(cfg, 0, 0);
 }

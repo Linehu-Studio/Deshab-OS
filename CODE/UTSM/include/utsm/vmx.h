@@ -16,6 +16,10 @@
 #define IA32_VMX_TRUE_PROCBASED_CTLS 0x48E
 #define IA32_VMX_TRUE_EXIT_CTLS      0x48F
 #define IA32_VMX_TRUE_ENTRY_CTLS     0x490
+#define IA32_VMX_CR0_FIXED0          0x486
+#define IA32_VMX_CR0_FIXED1          0x487
+#define IA32_VMX_CR4_FIXED0          0x488
+#define IA32_VMX_CR4_FIXED1          0x489
 
 /* ===== CR4 / CR0 bits ===== */
 #define CR4_VMXE_BIT                 13ULL
@@ -23,8 +27,15 @@
 #define CR4_PAE                      (1ULL << 5)
 #define CR4_PGE                      (1ULL << 7)
 #define CR4_PSE                      (1ULL << 4)
+#define CR4_OSFXSR                   (1ULL << 9)
+#define CR4_OSXMMEXCPT               (1ULL << 10)
+#define CR4_FSGSBASE                 (1ULL << 16)
+#define CR4_OSXSAVE                  (1ULL << 18)
+#define CR4_CET                      (1ULL << 23)
 
 #define CR0_PE                       (1ULL << 0)
+#define CR0_MP                       (1ULL << 1)
+#define CR0_ET                       (1ULL << 4)
 #define CR0_NE                       (1ULL << 5)
 #define CR0_WP                       (1ULL << 16)
 #define CR0_PG                       (1ULL << 31)
@@ -44,8 +55,14 @@
 #define VMCS_IO_BITMAP_A                 0x2000
 #define VMCS_IO_BITMAP_B                 0x2002
 #define VMCS_MSR_BITMAP                  0x2004
+#define VMCS_VM_EXIT_MSR_STORE_ADDR      0x2006
+#define VMCS_VM_EXIT_MSR_LOAD_ADDR       0x2008
+#define VMCS_VM_ENTRY_MSR_LOAD_ADDR      0x200A
 #define VMCS_TSC_OFFSET                  0x2010
 #define VMCS_EPT_POINTER                 0x201A
+#define VMCS_VM_EXIT_MSR_STORE_COUNT     0x400E
+#define VMCS_VM_EXIT_MSR_LOAD_COUNT      0x4010
+#define VMCS_VM_ENTRY_MSR_LOAD_COUNT     0x4014
 
 /* Read-only data fields */
 #define VMCS_GUEST_PHYSICAL_ADDR         0x2400
@@ -164,6 +181,10 @@
 #define VMCS_PIN_BASED_VM_EXEC_CONTROL   0x4000
 #define VMCS_CPU_BASED_VM_EXEC_CONTROL   0x4002
 #define VMCS_EXCEPTION_BITMAP            0x4004
+#define VMCS_CR0_GUEST_HOST_MASK         0x6000
+#define VMCS_CR4_GUEST_HOST_MASK         0x6002
+#define VMCS_CR0_READ_SHADOW             0x6004
+#define VMCS_CR4_READ_SHADOW             0x6006
 #define VMCS_VM_EXIT_CONTROLS            0x400C
 #define VMCS_VM_ENTRY_CONTROLS           0x4012
 #define VMCS_VM_ENTRY_INTERRUPT_INFO     0x4016
@@ -183,6 +204,8 @@
 #define CPU_BASED_MWAIT_EXITING          (1ULL << 10)
 #define CPU_BASED_RDPMC_EXITING          (1ULL << 11)
 #define CPU_BASED_RDTSC_EXITING          (1ULL << 12)
+#define CPU_BASED_CR3_LOAD_EXITING       (1ULL << 15)
+#define CPU_BASED_CR3_STORE_EXITING      (1ULL << 16)
 #define CPU_BASED_CR8_LOAD_EXITING       (1ULL << 19)
 #define CPU_BASED_CR8_STORE_EXITING      (1ULL << 20)
 #define CPU_BASED_MOV_DR_EXITING         (1ULL << 23)
@@ -194,6 +217,7 @@
 
 /* ===== Secondary processor-based controls ===== */
 #define SEC_EXEC_ENABLE_EPT              (1ULL << 1)
+#define SEC_EXEC_ENABLE_RDTSCP           (1ULL << 3)
 #define SEC_EXEC_ENABLE_VPID             (1ULL << 5)
 #define SEC_EXEC_UNRESTRICTED_GUEST      (1ULL << 7)
 
@@ -204,11 +228,21 @@
 #define VM_EXIT_ACK_INTR_ON_EXIT         (1ULL << 15)
 #define VM_EXIT_SAVE_GUEST_EFER          (1ULL << 20)
 #define VM_EXIT_LOAD_HOST_EFER           (1ULL << 21)
+#define VM_EXIT_SAVE_CET_STATE           (1ULL << 28)
+#define VM_EXIT_LOAD_CET_STATE           (1ULL << 29)
 
 /* ===== VM-entry controls ===== */
 #define VM_ENTRY_LOAD_DEBUG_CONTROLS     (1ULL << 2)
 #define VM_ENTRY_IA32E_MODE_GUEST        (1ULL << 9)
 #define VM_ENTRY_LOAD_GUEST_EFER         (1ULL << 15)
+#define VM_ENTRY_LOAD_CET_STATE          (1ULL << 20)
+
+#define VMCS_GUEST_S_CET                 0x2828
+#define VMCS_GUEST_SSP                   0x282A
+#define VMCS_GUEST_INTR_SSP_TABLE        0x282C
+#define VMCS_HOST_S_CET                  0x2C28
+#define VMCS_HOST_SSP                    0x2C2A
+#define VMCS_HOST_INTR_SSP_TABLE         0x2C2C
 
 /* ===== Exit reasons ===== */
 #define EXIT_EXCEPTION_NMI               0
@@ -220,6 +254,8 @@
 #define EXIT_INVD                        13
 #define EXIT_RDMSR                       31
 #define EXIT_WRMSR                       32
+#define EXIT_ENTRY_FAIL_GUEST_STATE      33
+#define EXIT_ENTRY_FAIL_MSR_LOADING      34
 #define EXIT_MONITOR                     39
 #define EXIT_MWAIT                       36
 #define EXIT_VMCALL                      18
@@ -240,6 +276,8 @@
 #define EXIT_INVLPG                      14
 #define EXIT_EPT_VIOLATION               48
 #define EXIT_EPT_MISCONFIG               49
+#define EXIT_WBINVD                      54
+#define EXIT_XSETBV                      55
 #define EXIT_VMX_PREEMPTION_TIMER        52
 #define EXIT_APIC_ACCESS                 44
 
@@ -259,6 +297,7 @@
 #define EPT_WRITE                        (1ULL << 1)
 #define EPT_EXECUTE                      (1ULL << 2)
 #define EPT_RWX                          (EPT_READ | EPT_WRITE | EPT_EXECUTE)
+#define EPT_IGNORE_PAT                   (1ULL << 6)
 #define EPT_LARGE_PAGE                   (1ULL << 7)
 
 /* ===== VMX instruction errors ===== */
@@ -281,6 +320,7 @@ int vmx_vmlaunch(void);
 int vmx_vmresume(void);
 
 u64 vmx_read_msr(u32 msr);
+void vmx_write_msr(u32 msr, u64 value);
 /* Capability polarity used by KVM and verified under nested KVM:
  * low bit=1 => must be 1; high bit=0 => must be 0.
  * Formula: (desired | allowed0) & allowed1. */
@@ -290,6 +330,13 @@ u64 vmx_get_host_cr3(void);
  * address using Limine's kernel-address response.  Kernel-image mappings are
  * distinct from the HHDM and must never be translated by subtracting HHDM. */
 u64 vmx_kernel_virt_to_phys(const void *address);
+
+/* Nested KVM leaks host CET into L2 unless VMCS switches CET state. */
+extern int g_linux_cet_vmcs;
+extern int g_linux_cet_force;
+void linux_cet_vmcs_sync_host(void);
+void linux_cet_restore_host(void);
+void linux_cet_force_guest_off(void);
 
 /* ===== 虚拟中断注入（vmexit.c 实现） ===== */
 /* 向 guest 队列注入一个 ISA IRQ 向量（legacy PIC：vector = 0x30 + irq）。
@@ -302,5 +349,11 @@ void vmx_guest_queue_irq(u32 vector);
 u64 vmx_preemption_quantum(void);
 /* 检查 CPU 是否支持 VMX preemption timer。 */
 int vmx_preemption_timer_supported(void);
+/* linux_resume() 入口清零 timeslice 计数，避免上次 HLT 残留导致立刻归还。 */
+void vmx_linux_timeslice_reset(void);
+/* linux_resume() 返回后关闭 timeslice，避免 linux_launch 早期误归还。 */
+void vmx_linux_timeslice_disarm(void);
+/* linux_resume() vmresume 前：arm timer + 注入 pending virtio/PIT IRQ。 */
+void vmx_linux_prepare_entry(void);
 
 #endif

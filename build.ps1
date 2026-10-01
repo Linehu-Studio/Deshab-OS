@@ -18,12 +18,60 @@ $ReleaseImagePath = Join-Path $IsoDir 'deshab-release.img'
 $RealtestImagePath = Join-Path $IsoDir 'deshab-realtest.img'
 $BuildTmp = Join-Path $Root '.build_tmp'
 
-# VSCode integration: ESP capacity must accommodate Linux GUI stack libs + VSCode
-# tarball + Electron (~300MB). Default 2048MB; can be overridden by setting
-# $EspSizeMB in the calling shell before invoking build.ps1.
-if (-not (Get-Variable EspSizeMB -ErrorAction SilentlyContinue)) {
-    $EspSizeMB = 2048
+# Legacy single-FAT32 ESP size helper (New-GptFat32Image). Dual-partition
+# packing uses CODE/linux/pack_system_image.sh and sizes each partition
+# from SYSTEM/boot+EFI+limine vs the rest.
+function Get-EspSizeMBFromSystem([string]$SourceDir) {
+    $sum = (Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force |
+        Measure-Object -Property Length -Sum).Sum
+    if (-not $sum) { $sum = 0 }
+    $contentMB = [int][Math]::Ceiling($sum / 1MB)
+    $need = $contentMB + [int][Math]::Ceiling($contentMB * 0.15) + 256
+    if ($need -lt 2048) { $need = 2048 }
+    return $need
 }
+if ($env:ESP_SIZE_MB) {
+    $EspSizeMB = [int]$env:ESP_SIZE_MB
+} else {
+    $EspSizeMB = Get-EspSizeMBFromSystem $SystemDir
+}
+
+function ConvertTo-WslUnixPath([string]$WinPath) {
+    $full = [System.IO.Path]::GetFullPath($WinPath)
+    if ($full -match '^(?<d>[A-Za-z]):\\(?<rest>.*)$') {
+        $drive = $Matches['d'].ToLowerInvariant()
+        $rest = $Matches['rest'] -replace '\\', '/'
+        return "/mnt/$drive/$rest"
+    }
+    throw "Cannot map Windows path to WSL: $WinPath"
+}
+
+# GPT p1 FAT32 ESP (/EFI /limine /boot) + GPT p2 ext4 (rest of SYSTEM/).
+function New-GptFat32Ext4Image([string]$SourceDir, [string]$ImagePath) {
+    $scriptWin = Join-Path $Root 'CODE\linux\pack_system_image.sh'
+    if (-not (Test-Path -LiteralPath $scriptWin)) {
+        throw "Missing packer: $scriptWin"
+    }
+    if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
+        throw 'WSL is required to pack GPT FAT32+ext4 (mkfs.ext4).'
+    }
+
+    $imgDir = Split-Path -Parent $ImagePath
+    if (-not (Test-Path -LiteralPath $imgDir)) {
+        New-Item -ItemType Directory -Path $imgDir | Out-Null
+    }
+
+    $wslScript = ConvertTo-WslUnixPath $scriptWin
+    $wslSys = ConvertTo-WslUnixPath $SourceDir
+    $wslImg = "$(ConvertTo-WslUnixPath $imgDir)/$([System.IO.Path]::GetFileName($ImagePath))"
+
+    Write-Host '[build] Packing GPT: FAT32 ESP (/EFI /limine /boot) + ext4 data'
+    & wsl -u root -- bash $wslScript $wslSys $wslImg
+    if ($LASTEXITCODE -ne 0) {
+        throw "pack_system_image.sh failed ($LASTEXITCODE)"
+    }
+}
+
 # Optional persistent rw volume for Linux guest (Phase 4: overlayfs upperdir).
 # When SYSTEM/boot/linux-extra-rootfs.img is present, build.ps1 prints a notice;
 # limine.conf is expected to declare it as a boot module (added in Phase 4).
@@ -264,6 +312,7 @@ function New-GptHeader([UInt64]$CurrentLba, [UInt64]$BackupLba, [UInt64]$FirstUs
     return $header
 }
 
+# Legacy: whole SYSTEM/ on a single FAT32 ESP. Prefer New-GptFat32Ext4Image.
 function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB = 128) {
     $bytesPerSector = 512
     $totalSectors = [UInt64](($SizeMB * 1024 * 1024) / $bytesPerSector)
@@ -278,11 +327,11 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
     $partSectors = [UInt64]($partEnd - $partStart + 1)
     $partitionOffset = [Int64]($partStart * $bytesPerSector)
 
-    # P7.7: 4KB clusters (8 sectors) for faster packaging.
-    # 512B clusters on a 595MB SYSTEM tree caused ~1M Seek/Write calls
-    # and 18-minute packaging. 4KB clusters reduce this to ~150K calls.
-    # (32KB clusters would fail FAT32 min 65525 cluster count on 2GB.)
+    # 4KB clusters (8 sectors) on the 2GB default image; 32KB (64 sectors)
+    # when SYSTEM/ is large enough that 65525 clusters still fit.
+    # 32KB on a 2GB volume would drop below the FAT32 minimum cluster count.
     $sectorsPerCluster = 8
+    if ($SizeMB -ge 4096) { $sectorsPerCluster = 64 }
     $reservedSectors = 32
     $numFats = 2
     $fatSectors = 1
@@ -328,17 +377,22 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
     }
 
     function Write-FileContent($Stream, [string]$Path, [int]$FirstCluster) {
-        $bytes = [System.IO.File]::ReadAllBytes($Path)
-        $remaining = $bytes.Length
-        $srcOffset = 0
-        $cluster = $FirstCluster
-        while ($remaining -gt 0) {
-            $chunk = [Math]::Min($clusterSize, $remaining)
-            [void]$Stream.Seek((Get-ClusterOffset $cluster), [System.IO.SeekOrigin]::Begin)
-            $Stream.Write($bytes, $srcOffset, $chunk)
-            $srcOffset += $chunk
-            $remaining -= $chunk
-            if ($remaining -gt 0) { $cluster = $fat[$cluster] }
+        $input = [System.IO.File]::OpenRead($Path)
+        try {
+            $buf = [byte[]]::new($clusterSize)
+            $cluster = $FirstCluster
+            $remaining = $input.Length
+            while ($remaining -gt 0) {
+                $chunk = [int][Math]::Min([int64]$clusterSize, [int64]$remaining)
+                $n = $input.Read($buf, 0, $chunk)
+                if ($n -le 0) { break }
+                [void]$Stream.Seek((Get-ClusterOffset $cluster), [System.IO.SeekOrigin]::Begin)
+                $Stream.Write($buf, 0, $n)
+                $remaining -= $n
+                if ($remaining -gt 0) { $cluster = $fat[$cluster] }
+            }
+        } finally {
+            $input.Close()
         }
     }
 
@@ -367,6 +421,9 @@ function New-GptFat32Image([string]$SourceDir, [string]$ImagePath, [int]$SizeMB 
                 Add-DirectoryEntry $entries $item.Name 0x10 $childCluster 0 $used
                 Write-Directory $Stream $item.FullName $childCluster $SelfCluster $false
             } else {
+                if ($item.Length -ge 4GB) {
+                    throw "FAT32 cannot store $($item.FullName) ($([int]($item.Length / 1MB))MB). Keep SYSTEM files under 4GiB."
+                }
                 $fileSize = [uint32]$item.Length
                 $fileCluster = Allocate-Chain $item.Length
                 Add-DirectoryEntry $entries $item.Name 0x20 $fileCluster $fileSize $used
@@ -564,7 +621,7 @@ function ConvertTo-FixedVhd([string]$RawImage, [string]$VhdPath) {
 }
 
 # Build a single image variant (dev/release): inject FUCK + firstInit.txt from
-# build/configs/<variant>/ into SYSTEM/, then package via New-GptFat32Image.
+# build/configs/<variant>/ into SYSTEM/, then package via New-GptFat32Ext4Image.
 # If $ImagePath is $null, only injects config without packaging (used to
 # restore SYSTEM dir to dev config after dual-image build).
 # NOTE: configs/<variant> dir may be absent; then SYSTEM is packaged as-is.
@@ -588,9 +645,8 @@ function Build-ImageVariant([string]$VariantName, [string]$ImagePath) {
     }
 
     if ($ImagePath) {
-        # Phase 0: ESP enlarged from 768 to $EspSizeMB (default 2048) to fit
-        # VSCode + Electron + GUI stack libs (VSCode integration roadmap).
-        New-GptFat32Image $SystemDir $ImagePath $EspSizeMB
+        Write-Host '[build] Packaging SYSTEM/ as GPT: p1 FAT32 ESP (Limine) + p2 ext4 data'
+        New-GptFat32Ext4Image $SystemDir $ImagePath
         if ($Vhd) {
             $vhdPath = [System.IO.Path]::ChangeExtension($ImagePath, '.vhd')
             ConvertTo-FixedVhd $ImagePath $vhdPath
@@ -872,7 +928,7 @@ if (Test-Path $LegacyImg) {
     Write-Host "[build] Removed legacy image: $LegacyImg"
 }
 
-Write-Host '[build] Packaging SYSTEM to GPT + FAT32 IMG (dual variant)...'
+Write-Host '[build] Packaging SYSTEM to GPT images (p1 FAT32 ESP + p2 ext4, not a single FAT32 disk)...'
 if ($Variant -in @('dev','both')) {
     Write-Host '[build] === Building DEV image (QEMU test, dev_mode=1, debug on) ==='
     Build-ImageVariant 'dev' $DevImagePath
@@ -894,8 +950,8 @@ if ($Variant -eq 'both') {
     Build-ImageVariant 'dev' $null
 }
 
-# Rebuild SATA FAT32 disk image (DSK reads deshab.elf/FirstInit.elf/mouseInit.elf from here)
-Write-Host '[build] Rebuilding SATA FAT32 disk image...'
+# Sidecar AHCI test disk only. Not one of the ISO/*.img system images.
+Write-Host '[build] Rebuilding SATA FAT32 sidecar (.build_tmp/sata_fat32_dsk.img, not ISO/*.img)...'
 $BuildTmp = Join-Path $Root '.build_tmp'
 $MkFat32Ps = Join-Path $BuildTmp 'mkfat32.ps1'
 if (Test-Path $MkFat32Ps) {

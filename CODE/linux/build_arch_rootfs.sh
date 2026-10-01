@@ -25,7 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
 OUTPUT_IMG="$OUTPUT_DIR/linux-rootfs.img"
-IMG_SIZE_MB=${IMG_SIZE_MB:-512}
+# 768MB leaves room for distro CPython + stdlib on the virtio-blk rootfs.
+IMG_SIZE_MB=${IMG_SIZE_MB:-768}
+ARCH_INSTALL_PYTHON="${ARCH_INSTALL_PYTHON:-1}"
 
 # Work on native Linux FS for speed (NOT /mnt/d which is 9p — extremely slow).
 WORK_DIR="${ARCH_ROOTFS_WORK:-/root/arch_rootfs_work}"
@@ -282,6 +284,31 @@ if [ -f "$DAEMON_SRC" ]; then
     fi
 else
     echo "[arch-rootfs] WARNING: daemon source not found at $DAEMON_SRC"
+fi
+
+# 7.6 Distro CPython for guest userspace (Track C). Keep interpreter and
+# stdlib from the same Arch packages; do not overlay SYSTEM/lib libpython.
+if [ "$ARCH_INSTALL_PYTHON" = "1" ]; then
+    echo "[arch-rootfs] Installing Arch CPython into staging rootfs..."
+    mkdir -p "$ROOTFS_DIR"/{dev,proc,sys,tmp}
+    mount --bind /dev "$ROOTFS_DIR/dev" 2>/dev/null || true
+    mount --bind /proc "$ROOTFS_DIR/proc" 2>/dev/null || true
+    mount --bind /sys "$ROOTFS_DIR/sys" 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\n' > "$ROOTFS_DIR/tmp/resolv.conf"
+    if chroot "$ROOTFS_DIR" /usr/bin/pacman -Sy --noconfirm && \
+       chroot "$ROOTFS_DIR" /usr/bin/pacman -S --noconfirm python; then
+        mkdir -p "$ROOTFS_DIR/usr/local/share/deshab/python"
+        if [ -f "$PROJECT_ROOT/SYSTEM/user/python/hello.py" ]; then
+            install -m 0644 "$PROJECT_ROOT/SYSTEM/user/python/hello.py" \
+                "$ROOTFS_DIR/usr/local/share/deshab/python/hello.py"
+        fi
+        echo "[arch-rootfs] python: $(chroot "$ROOTFS_DIR" /usr/bin/python3 --version 2>/dev/null || true)"
+    else
+        echo "[arch-rootfs] WARNING: python install failed (network or pacman)"
+    fi
+    umount "$ROOTFS_DIR/dev" 2>/dev/null || true
+    umount "$ROOTFS_DIR/proc" 2>/dev/null || true
+    umount "$ROOTFS_DIR/sys" 2>/dev/null || true
 fi
 
 # 8. Create ext4 image on native FS, populate, then copy to /mnt/d.

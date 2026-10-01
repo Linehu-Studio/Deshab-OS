@@ -591,6 +591,26 @@ int irq_register(u8 vector, irq_handler_t handler) {
     return 0;
 }
 
+/* Phase7: 显式 EOI（调度器 tick 等"handler 内可能切换任务"的路径用）。
+ * 序列复刻 idt_handler 默认 EOI: 先 LAPIC 钩子再 8259（按向量范围）。
+ * spurious 0xFF 特判与 idt_handler 一致（空 ISR 不该有 EOI）。 */
+void idt_irq_eoi(u8 vector) {
+    if (vector < 16) vector = (u8)(0x20u + vector);
+    if (vector >= 32 && vector <= 47) {
+        if (g_apic_eoi_hook) g_apic_eoi_hook();
+        if (vector >= 0x28) outb(PIC2_CMD, 0x20);
+        outb(PIC1_CMD, 0x20);
+    } else if (vector >= 48 && vector != 0xFF) {
+        if (g_apic_eoi_hook) g_apic_eoi_hook();
+    }
+}
+
+/* Phase8: CPU 异常钩子（DRR 任务级 fault 接管）。 */
+static int (*g_exc_hook)(u64 vector, u64 err, u64 rip) = 0;
+void idt_set_exception_hook(int (*hook)(u64 vector, u64 err, u64 rip)) {
+    g_exc_hook = hook;
+}
+
 /* Stack frame pushed by isr_common in idt.S */
 typedef struct {
     u64 r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi;
@@ -601,6 +621,12 @@ typedef struct {
 
 void idt_handler(isr_frame *frame) {
     if (frame->vector < 32) {
+        /* Phase8: DRR 异常钩子最前——返回非 0 = 异常已被消费
+         * （fault 任务被杀/切换，控制权不回到日志+停机路径） */
+        if (g_exc_hook &&
+            g_exc_hook(frame->vector, frame->error_code, frame->rip)) {
+            return;
+        }
         /* CR2: #PF 的 fault 线性地址；CR3: 当前页表基址。
          * 寄存器 dump 用于定位 fault 指令的操作数来源。 */
         u64 cr2, cr3;

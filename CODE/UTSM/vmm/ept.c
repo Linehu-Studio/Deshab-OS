@@ -60,6 +60,14 @@ int ept_init(void) {
     return 0;
 }
 
+/* Leaf EPT entry: HPA + R/W/X + EPT memory type + Ignore PAT.
+ * Nested KVM combines guest PAT with EPT type unless bit 6 is set;
+ * WB+WC is reserved and VM-exits as EPT misconfiguration. */
+static u64 ept_make_leaf(u64 hpa, u64 flags, u64 memtype) {
+    return (hpa & 0x000FFFFFFFFFF000ULL) | (flags & 7ULL) |
+           ((memtype & 7ULL) << 3) | EPT_IGNORE_PAT;
+}
+
 /* 读取 EPT 表项指针，必要时分配中间页表。
  * level: 0=PT, 1=PD, 2=PDPT, 3=PML4 */
 static u64 *ept_walk(u64 gpa, int alloc_missing) {
@@ -81,10 +89,29 @@ static u64 *ept_walk(u64 gpa, int alloc_missing) {
             table[indices[level]] = new_phys | EPT_RWX;
             /* 切换到新分配的下一级页表 */
             table = (u64 *)phys_to_virt(new_phys);
+        } else if ((entry & EPT_LARGE_PAGE) && level == 1) {
+            /* PD 2MB leaf: split into 512×4K before installing a 4K PTE.
+             * Treating the 2MB HPA as a page-table pointer would write PTEs
+             * into guest RAM and leave the PD entry as a large page. */
+            if (!alloc_missing) return (u64 *)0;
+            u64 new_pt = ept_alloc_page();
+            if (new_pt == 0) return (u64 *)0;
+            u64 *pt = (u64 *)phys_to_virt(new_pt);
+            u64 hpa_2m = entry & 0x000FFFFFFFE00000ULL;
+            u64 page_flags = entry & 7ULL;
+            for (int i = 0; i < 512; i++) {
+                pt[i] = ept_make_leaf(hpa_2m + (u64)i * EPT_PAGE_SIZE,
+                                      page_flags, EPT_MEMORY_TYPE_WB);
+            }
+            table[indices[level]] = new_pt | EPT_RWX;
+            table = pt;
         } else {
-            /* 清除标志位取出物理地址 */
-            u64 child_phys = entry & 0x000FFFFFFFFFF000ULL;
-            table = (u64 *)phys_to_virt(child_phys);
+            /* Strip reserved memory-type / IPAT / PS bits from non-leaf
+             * table pointers. Those bits are only legal on page leaves. */
+            u64 cleaned = entry & ~0xF8ULL;
+            if (cleaned != entry)
+                table[indices[level]] = cleaned;
+            table = (u64 *)phys_to_virt(cleaned & 0x000FFFFFFFFFF000ULL);
         }
     }
     return &table[indices[0]];
@@ -107,7 +134,7 @@ int ept_map_range(u64 gpa, u64 hpa, u64 size, u64 flags) {
             log_error("[EPT] walk failed");
             return -3;
         }
-        *entry = cur_hpa | flags | (EPT_MEMORY_TYPE_WB << 3);
+        *entry = ept_make_leaf(cur_hpa, flags, EPT_MEMORY_TYPE_WB);
     }
     return 0;
 }
@@ -163,11 +190,12 @@ int ept_map_2m_page(u64 gpa, u64 hpa, u64 flags, u64 memtype) {
         table = (u64 *)phys_to_virt(entry & 0x000FFFFFFFFFF000ULL);
     }
 
-    /* PD：直接写 2MB 大页项 */
+    /* PD：直接写 2MB 大页项（Ignore PAT so nested KVM does not combine PAT） */
     u64 pd_entry = (hpa & 0x000FFFFFFFE00000ULL)  /* 物理地址（2MB 对齐） */
                  | flags                             /* R/W/X 权限 */
                  | EPT_LARGE_PAGE                    /* bit 7 = 大页标志 */
-                 | (memtype << 3);                   /* memory type */
+                 | ((memtype & 7ULL) << 3)           /* memory type */
+                 | EPT_IGNORE_PAT;
     table[pd_idx] = pd_entry;
     return 0;
 }
@@ -205,10 +233,12 @@ void ept_check_vpid_support(void) {
 /* 执行 INVEPT（EPT TLB 刷新）。真机要求在修改 EPT 后调用。 */
 void ept_flush_ept(void) {
     if (!g_invept_supported) return;
-    /* INVEPT 类型 2: all-context invalidate
-     * 操作数：{EPTP=0, reserved=0} 表示刷新所有 EPT 上下文 */
-    u64 desc[2] = {0, 0};
+    /* INVEPT 描述符必须 16 字节对齐；未对齐时指令失败，nested KVM
+     * 会一直用缓存里的坏 EPT 项，表现为同一 GPA 的 misconfig 死循环。 */
+    _Alignas(16) u64 desc[2];
     int err;
+    desc[0] = ept_get_eptp();
+    desc[1] = 0;
     __asm__ volatile(
         "invept (%2), %1\n"
         "ja 1f\n"
@@ -218,9 +248,25 @@ void ept_flush_ept(void) {
         "mov $0, %0\n"
         "2:\n"
         : "=r"(err)
-        : "r"((u64)2), "r"(desc)
+        : "r"((u64)1), "r"(desc)
         : "memory"
     );
+    if (err) {
+        desc[0] = 0;
+        desc[1] = 0;
+        __asm__ volatile(
+            "invept (%2), %1\n"
+            "ja 1f\n"
+            "mov $1, %0\n"
+            "jmp 2f\n"
+            "1:\n"
+            "mov $0, %0\n"
+            "2:\n"
+            : "=r"(err)
+            : "r"((u64)2), "r"(desc)
+            : "memory"
+        );
+    }
     if (err) {
         log_warn("[EPT] INVEPT failed (non-critical on QEMU)");
     }
@@ -292,7 +338,96 @@ u64 ept_gpa_to_hpa(u64 gpa) {
     entry = table[pt_idx];
     if (!(entry & EPT_READ)) return 0;
     u64 hpa = entry & 0x000FFFFFFFFFF000ULL;
+    if (hpa == 0 || hpa >= 0x100000000ULL) return 0;
     return hpa + offset;
+}
+
+int ept_repair_leaf(u64 gpa, u64 flags) {
+    if (!g_ept_ready) return -1;
+
+    u64 *table = (u64 *)g_ept_pml4_virt;
+    u64 pml4_idx = (gpa >> 39) & 0x1FF;
+    u64 pdpt_idx = (gpa >> 30) & 0x1FF;
+    u64 pd_idx   = (gpa >> 21) & 0x1FF;
+    u64 pt_idx   = (gpa >> 12) & 0x1FF;
+
+    u64 entry = table[pml4_idx];
+    if (!(entry & EPT_READ)) return -1;
+    {
+        u64 cleaned = entry & ~0xF8ULL;
+        if (cleaned != entry)
+            table[pml4_idx] = cleaned;
+        table = (u64 *)phys_to_virt(cleaned & 0x000FFFFFFFFFF000ULL);
+    }
+
+    entry = table[pdpt_idx];
+    if (!(entry & EPT_READ)) return -1;
+    if (entry & EPT_LARGE_PAGE) {
+        u64 hpa = entry & 0x000FFFFFC0000000ULL;
+        table[pdpt_idx] = hpa | (flags & 7ULL) | EPT_LARGE_PAGE |
+                          (EPT_MEMORY_TYPE_WB << 3) | EPT_IGNORE_PAT;
+        return 0;
+    }
+    {
+        u64 cleaned = entry & ~0xF8ULL;
+        if (cleaned != entry)
+            table[pdpt_idx] = cleaned;
+        table = (u64 *)phys_to_virt(cleaned & 0x000FFFFFFFFFF000ULL);
+    }
+
+    entry = table[pd_idx];
+    if (!(entry & EPT_READ)) return -1;
+    if (entry & EPT_LARGE_PAGE) {
+        u64 hpa = entry & 0x000FFFFFFFE00000ULL;
+        table[pd_idx] = hpa | (flags & 7ULL) | EPT_LARGE_PAGE |
+                        (EPT_MEMORY_TYPE_WB << 3) | EPT_IGNORE_PAT;
+        return 0;
+    }
+    {
+        u64 cleaned = entry & ~0xF8ULL;
+        if (cleaned != entry)
+            table[pd_idx] = cleaned;
+        table = (u64 *)phys_to_virt(cleaned & 0x000FFFFFFFFFF000ULL);
+    }
+
+    entry = table[pt_idx];
+    if (!(entry & 7ULL)) return -1;
+    {
+        u64 hpa = entry & 0x000FFFFFFFFFF000ULL;
+        /* DMA pool is low 4G. A 4K leaf with PS, execute-only, or an
+         * out-of-range HPA is leftover RAM interpreted as a PTE — keeping
+         * that HPA (0xa5000008000 on the last boot) loops EPT misconfig. */
+        if ((entry & EPT_LARGE_PAGE) || hpa == 0 || hpa >= 0x100000000ULL ||
+            (entry & 7ULL) == EPT_EXECUTE)
+            return -1;
+        table[pt_idx] = ept_make_leaf(hpa, flags, EPT_MEMORY_TYPE_WB);
+    }
+    return 0;
+}
+
+void ept_log_walk(u64 gpa) {
+    if (!g_ept_ready) return;
+    u64 *table = (u64 *)g_ept_pml4_virt;
+    u64 pml4_idx = (gpa >> 39) & 0x1FF;
+    u64 pdpt_idx = (gpa >> 30) & 0x1FF;
+    u64 pd_idx   = (gpa >> 21) & 0x1FF;
+    u64 pt_idx   = (gpa >> 12) & 0x1FF;
+    u64 e;
+    log_hex64("[EPT] walk gpa=", gpa);
+    e = table[pml4_idx];
+    log_hex64("[EPT] pml4e=", e);
+    if (!(e & EPT_READ)) return;
+    table = (u64 *)phys_to_virt(e & 0x000FFFFFFFFFF000ULL);
+    e = table[pdpt_idx];
+    log_hex64("[EPT] pdpte=", e);
+    if (!(e & EPT_READ) || (e & EPT_LARGE_PAGE)) return;
+    table = (u64 *)phys_to_virt(e & 0x000FFFFFFFFFF000ULL);
+    e = table[pd_idx];
+    log_hex64("[EPT] pde=", e);
+    if (!(e & EPT_READ) || (e & EPT_LARGE_PAGE)) return;
+    table = (u64 *)phys_to_virt(e & 0x000FFFFFFFFFF000ULL);
+    e = table[pt_idx];
+    log_hex64("[EPT] pte=", e);
 }
 
 u64 ept_get_eptp(void) {

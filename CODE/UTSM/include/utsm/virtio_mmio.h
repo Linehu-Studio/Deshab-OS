@@ -40,6 +40,14 @@
 #define VIRTIO_MMIO_QUEUE_DRIVER_HIGH 0x094  /* W  modern */
 #define VIRTIO_MMIO_QUEUE_DEVICE_LOW 0x0A0   /* W  modern */
 #define VIRTIO_MMIO_QUEUE_DEVICE_HIGH 0x0A4  /* W  modern */
+/* Shared-memory region (Virtio 1.1 §4.2.2). Linux virtio-gpu always probes
+ * VIRTIO_GPU_SHM_ID_HOST_VISIBLE. A missing region MUST report length=-1;
+ * length 0 is treated as a real window at address 0 and probe fails -EBUSY. */
+#define VIRTIO_MMIO_SHM_SEL          0x0AC   /* W  */
+#define VIRTIO_MMIO_SHM_LEN_LOW      0x0B0   /* R  */
+#define VIRTIO_MMIO_SHM_LEN_HIGH     0x0B4   /* R  */
+#define VIRTIO_MMIO_SHM_BASE_LOW     0x0B8   /* R  */
+#define VIRTIO_MMIO_SHM_BASE_HIGH    0x0BC   /* R  */
 #define VIRTIO_MMIO_CONFIG_GENERATION 0x0FC  /* R  modern */
 #define VIRTIO_MMIO_CONFIG           0x100   /* RW device-specific config */
 

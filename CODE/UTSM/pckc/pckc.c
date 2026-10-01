@@ -34,3 +34,13 @@ int utsm_pckc_get_or_derive(u32 segment_slot, utsm_segment_desc *desc, utsm_key_
     *out_key = entry->key;
     return UTSM_OK;
 }
+
+void utsm_pckc_invalidate_slot(u32 segment_slot) {
+    for (u32 i = 0; i < UTSM_MAX_PCKC_KEYS; i++) {
+        utsm_pckc_entry *entry = &g_pckc.entries[i];
+        if (entry->valid && entry->segment_slot == segment_slot) {
+            entry->valid = false;
+            entry->key = (utsm_key_material){ { 0, 0, 0, 0 } };  /* 擦除密钥材料 */
+        }
+    }
+}

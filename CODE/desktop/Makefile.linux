@@ -24,7 +24,9 @@ CFLAGS  := -DDESHAB_HOST -O2 -Wall -Wextra -g \
 LDFLAGS := $(SDL_LIBS) -lm
 
 TARGET  := desktop_host
-SRCS    := main.c host_main.c
+SRCS    := main.c input.c wm.c compositor.c apps_builtin.c appreg.c \
+           launcher.c lxc.c shell.c pages.c f32io.c ascii_font.c \
+           zhfont.c host_main.c
 OBJS    := $(SRCS:.c=.o)
 
 .PHONY: all run clean

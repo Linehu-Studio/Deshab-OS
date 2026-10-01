@@ -4,7 +4,7 @@
 #
 # Boot sequence (phase 2 — Arch rootfs via virtio-blk /dev/vdb):
 #   1. Mount essential filesystems (proc/sys/dev)
-#   2. Wait for /dev/vdb (Arch rootfs virtio-blk device) to appear
+#   2. Wait for /dev/vdb (Arch rootfs virtio-blk device) to appea
 #   3. Mount /dev/vdb as ext4 at /mnt/root
 #   4. Copy /dev nodes + daemon (already baked into rootfs) into /mnt/root
 #   5. switch_root /mnt/root /sbin/init
@@ -21,23 +21,30 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
+# Kernel printk is on ttyS0. Also write to kmsg so lines survive
+# interleaving with guest printk (userspace /dev/console is racy).
+klog() {
+    echo "$1"
+    echo "$1" >/dev/kmsg 2>/dev/null || true
+}
+
 # Mount essential filesystems
 mount -t proc none /proc 2>/dev/null
 mount -t sysfs none /sys 2>/dev/null
 mount -t devtmpfs none /dev 2>/dev/null
 
-echo "[utsm-linux] init started"
-echo "[utsm-linux] kernel: $(uname -r)"
+klog "[utsm-linux] init started"
+klog "[utsm-linux] kernel: $(uname -r)"
 
 # Verify /dev/utsm exists (driver is built-in, should be auto-created)
 if [ ! -e /dev/utsm ]; then
-    echo "[utsm-linux] WARNING: /dev/utsm not found — UTSM driver not loaded"
+    klog "[utsm-linux] WARNING: /dev/utsm not found — UTSM driver not loaded"
 fi
 
 # ===== Phase 2: switch_root to Arch rootfs on /dev/vdb =====
 # The rootfs is exposed as a memory-backed virtio-blk device (GPA 0xF4002000,
 # IRQ7). Wait up to ~5s for the kernel to discover it via devtmpfs.
-echo "[utsm-linux] waiting for /dev/vdb (Arch rootfs)..."
+klog "[utsm-linux] waiting for /dev/vdb (Arch rootfs)..."
 VDB_OK=0
 i=0
 while [ $i -lt 50 ]; do
@@ -51,61 +58,105 @@ while [ $i -lt 50 ]; do
 done
 
 if [ $VDB_OK -eq 1 ]; then
-    echo "[utsm-linux] /dev/vdb found, attempting ext4 mount..."
+    klog "[utsm-linux] /dev/vdb found, attempting ext4 mount..."
     mkdir -p /mnt/root
     # Try ext4 (preferred); fall back to ext2 if ext4 module absent.
     if mount -t ext4 -o ro /dev/vdb /mnt/root 2>/dev/null || \
        mount -t ext2 -o ro /dev/vdb /mnt/root 2>/dev/null; then
-        echo "[utsm-linux] rootfs mounted, verifying /sbin/init..."
-        if [ -x /mnt/root/sbin/init ]; then
-            echo "[utsm-linux] switch_root → Arch /sbin/init"
-            # Move dev/proc/sys into new root so the Arch init can re-mount them.
+        klog "[utsm-linux] rootfs mounted, verifying init..."
+        # systemd (Arch /sbin/init) SIGSEGV'd in glibc in this VMM
+        # (noapic/nosmp/hidden XSAVE). PID 1 must be the exec daemon so
+        # the host can still EXEC_REQUEST startplasma from extra-rootfs.
+        GUEST_INIT=""
+        if [ -x /mnt/root/usr/local/bin/utsm_exec_daemon ]; then
+            GUEST_INIT=/usr/local/bin/utsm_exec_daemon
+        elif [ -x /mnt/root/sbin/init ]; then
+            GUEST_INIT=/sbin/init
+        fi
+        if [ -n "$GUEST_INIT" ]; then
+            klog "[utsm-linux] switch_root → $GUEST_INIT"
+            # Mount /dev/vdc BEFORE moving /dev away. After mount --move,
+            # initramfs /dev is empty and [ -b /dev/vdc ] is always false.
+            j=0
+            while [ $j -lt 30 ] && [ ! -b /dev/vdc ]; do
+                sleep 0.1
+                j=$((j + 1))
+            done
+            if [ -b /dev/vdc ]; then
+                klog "[utsm-linux] /dev/vdc found, mounting persist read-only..."
+                # Never remount vdb/vdc rw: virtio writes dirty ext4 and
+                # later iget checksums fail (libreadline/grep/mkdir).
+                # /mnt exists on the Arch image; tmpfs covers it without rw.
+                # Persist looks writable via overlay+tmpfs upper so Xorg can
+                # write /etc/X11 and /var/log without touching vdc.
+                mkdir -p /mnt/persist
+                if [ -d /mnt/root/mnt ]; then
+                    mount -t tmpfs -o mode=755,size=64m tmpfs /mnt/root/mnt
+                fi
+                mkdir -p /mnt/root/mnt/persist-ro \
+                         /mnt/root/mnt/persist \
+                         /mnt/root/mnt/persist-ov
+                if mount -t ext4 -o ro,noload /dev/vdc /mnt/root/mnt/persist-ro || \
+                   mount -t ext2 -o ro /dev/vdc /mnt/root/mnt/persist-ro; then
+                    klog "[utsm-linux] /dev/vdc mounted ro at persist-ro"
+                    mount -t tmpfs -o mode=755,size=512m tmpfs \
+                        /mnt/root/mnt/persist-ov
+                    mkdir -p /mnt/root/mnt/persist-ov/upper \
+                             /mnt/root/mnt/persist-ov/work
+                    modprobe overlay 2>/dev/null
+                    if mount -t overlay overlay \
+                        -o lowerdir=/mnt/root/mnt/persist-ro,upperdir=/mnt/root/mnt/persist-ov/upper,workdir=/mnt/root/mnt/persist-ov/work \
+                        /mnt/root/mnt/persist; then
+                        klog "[utsm-linux] persist overlay rw (tmpfs upper, vdc still ro)"
+                    else
+                        mount -o bind /mnt/root/mnt/persist-ro \
+                            /mnt/root/mnt/persist 2>/dev/null || \
+                            mount --bind /mnt/root/mnt/persist-ro \
+                                /mnt/root/mnt/persist 2>/dev/null || true
+                        klog "[utsm-linux] persist overlay failed; bound persist-ro"
+                    fi
+                    if ! mount -o bind /mnt/root/mnt/persist /mnt/persist; then
+                        mount --bind /mnt/root/mnt/persist /mnt/persist 2>/dev/null || true
+                    fi
+                    for d in opt home root; do
+                        mkdir -p /mnt/root/mnt/persist-ov/$d/upper \
+                                 /mnt/root/mnt/persist-ov/$d/work \
+                                 /mnt/root/$d
+                        if mount -t overlay overlay \
+                            -o lowerdir=/mnt/root/$d,upperdir=/mnt/root/mnt/persist-ov/$d/upper,workdir=/mnt/root/mnt/persist-ov/$d/work \
+                            /mnt/root/$d 2>/dev/null; then
+                            klog "[utsm-linux] overlay: /$d rw (tmpfs)"
+                        fi
+                    done
+                    if [ -x /mnt/root/mnt/persist/usr/bin/startplasma-x11 ]; then
+                        klog "[utsm-linux] startplasma-x11 present on persist"
+                    else
+                        klog "[utsm-linux] WARNING: startplasma-x11 missing on persist"
+                    fi
+                else
+                    klog "[utsm-linux] WARNING: /dev/vdc mount failed (no persistence)"
+                fi
+            else
+                klog "[utsm-linux] WARNING: /dev/vdc missing"
+            fi
+
             mount --move /dev  /mnt/root/dev  2>/dev/null
             mount --move /proc /mnt/root/proc 2>/dev/null
             mount --move /sys  /mnt/root/sys  2>/dev/null
 
-            # ===== VSCode Phase 4: overlay 持久化（/dev/vdc extra-rootfs 可写卷）=====
-            # rootfs 以 ro 挂载；/opt（VSCode 安装位置）、/home、/root 通过
-            # overlayfs 获得可写层，upperdir/workdir 落在 /dev/vdc（virtio-blk
-            # slot6 可写后端，内容跨启动持久）。vdc 缺失时保持 ro，安全降级。
-            if [ -b /dev/vdc ]; then
-                echo "[utsm-linux] /dev/vdc found, setting up overlay persistence..."
-                modprobe overlay 2>/dev/null
-                mkdir -p /mnt/persist
-                if mount -t ext4 -o rw /dev/vdc /mnt/persist 2>/dev/null; then
-                    for d in opt home root; do
-                        mkdir -p /mnt/persist/overlay/$d/upper \
-                                 /mnt/persist/overlay/$d/work \
-                                 /mnt/root/$d
-                        if mount -t overlay overlay \
-                            -o lowerdir=/mnt/root/$d,upperdir=/mnt/persist/overlay/$d/upper,workdir=/mnt/persist/overlay/$d/work \
-                            /mnt/root/$d 2>/dev/null; then
-                            echo "[utsm-linux] overlay: /$d rw (persist)"
-                        else
-                            echo "[utsm-linux] WARNING: overlay /$d failed (stays ro)"
-                        fi
-                    done
-                    # persist 卷搬进新 root，switch_root 后可在 /mnt/persist 访问
-                    mkdir -p /mnt/root/mnt/persist
-                    mount --move /mnt/persist /mnt/root/mnt/persist 2>/dev/null
-                else
-                    echo "[utsm-linux] WARNING: /dev/vdc mount failed (no persistence)"
-                fi
-            fi
-
-            exec switch_root /mnt/root /sbin/init
+            exec switch_root /mnt/root "$GUEST_INIT"
             # switch_root does not return
         else
-            echo "[utsm-linux] WARNING: /mnt/root/sbin/init missing, not switching"
+            klog "[utsm-linux] WARNING: no daemon or /sbin/init on rootfs"
             umount /mnt/root 2>/dev/null
         fi
     else
-        echo "[utsm-linux] WARNING: ext4/ext2 mount of /dev/vdb failed"
-        echo "[utsm-linux] available block devices:"
+        klog "[utsm-linux] WARNING: ext4/ext2 mount of /dev/vdb failed"
+        klog "[utsm-linux] available block devices:"
         ls -l /dev/vd* /dev/sd* 2>/dev/null
     fi
 else
-    echo "[utsm-linux] /dev/vdb not found after 5s — phase-1 fallback"
+    klog "[utsm-linux] /dev/vdb not found after 5s — phase-1 fallback"
 fi
 
 # ===== Fallback: daemon directly from initramfs (phase 1) =====

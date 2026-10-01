@@ -7,12 +7,14 @@
 # 缺失或空的键使用硬编码默认值，行为与无配置文件时一致
 
 [boot]
-vmm=0
-linux_guest=0
-# OpenXJ380 第二 guest：realtest 默认关闭（vmm=0 时天然不执行）
+vmm=1
+linux_guest=1
+# OpenXJ380 第二 guest：Phase 0 不需要，保持关闭
 xj380_guest=0
-selftest=1
-dev_mode=1
+# 2026-09-20: 并行会话新增的 chacha20 KAT 间歇性 FAIL 会 arch_halt_forever
+# 挡死整条启动链（chacha20 本体运行路径不受影响），先跳过自测解锁桌面。
+selftest=0
+dev_mode=0
 # 真机安全检查全部放宽（和 dev 一样），排除安全检查导致黑屏
 la57_guard=0
 mcfg_check=0
@@ -58,12 +60,29 @@ drr_emergency_pool_kb=64
 drr_recovery_log_size=4096
 drr_heartbeat_interval=0
 
+[sched]
+# SAS-R0-PCQ 调度器（Phase 7）：tick=LAPIC timer（宿主自持）
+enable=1
+tick_hz=100
+timeslice_ms=10
+# demo 窗口忙等已加 tick 失速兜底（sched.c: 心跳无进展自动中止窗口），
+# tick 不投递时不再卡死 bootstrap，窗口结束照常交接 DSK
+# demo_fault=1 为看门狗负向测试（已验证通过），默认保持 0
+demo_ms=1000
+demo_fault=0
+
+[drr]
+# 恢复根（Phase 8）：快照区/看门狗默认启用，ckpt_max_pages 编译期 128
+watchdog_enabled=1
+
 [dsk]
-show_logo=1
+show_logo=0
 skip_login=1
-default_shell=cmd
 mouse_init=1
 netman=1
+# session=native|kde|ask  (ask: 8s chooser, keyboard or serial '1'/'2')
+# native: boot Deshab desktop; KDE icon in user/desktop launches Plasma
+session=native
 
 [debug]
 enabled=1

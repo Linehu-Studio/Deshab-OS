@@ -1,0 +1,17 @@
+#!/bin/sh
+# Return to the Deshab native desktop. Optional first argument is the
+# native app name (editor/fileman/browser/shell) for the host to launch.
+# Host polls /tmp/deshab-native (bind-mounted into the KDE chroot).
+APP="${1:-}"
+if [ -n "$APP" ]; then
+    printf '%s\n' "$APP" > /tmp/deshab-native-app
+else
+    rm -f /tmp/deshab-native-app
+fi
+touch /tmp/deshab-native
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f startplasma >/dev/null 2>&1 || true
+    pkill -f plasmashell >/dev/null 2>&1 || true
+    pkill -f kwin >/dev/null 2>&1 || true
+fi
+exit 0

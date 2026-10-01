@@ -8,9 +8,9 @@ ISO/deshab-release.img
 docs/workbuddy-planning/
 sata_fat32_dsk.img
 
-# Rust build artifacts
-CODE/Deaicup Software/src/target/
-CODE/Deaicup Software/pe/target/
+
 
 # Large binary images (regenerate from build)
 SYSTEM/boot/linux-rootfs.img
+
+SYSTEM/boot/linux-extra-rootfs.img

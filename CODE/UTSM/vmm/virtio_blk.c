@@ -19,6 +19,8 @@
 #include <utsm/block.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include "../../tools/fat32_lfn.h"
+#include "../../tools/fat32_part.h"
 
 /* virtio-blk 请求头（Virtio Spec 1.1 §5.2.6.2） */
 struct virtio_blk_outhdr {
@@ -42,20 +44,157 @@ struct virtio_blk_outhdr {
 #define VIRTIO_BLK_F_BLK_SIZE   6
 #define VIRTIO_BLK_F_FLUSH      9
 
-/* device config 空间（VIRTIO_MMIO_CONFIG 起） */
+/* device config 空间须与 Linux uapi virtio_blk.h 布局一致：
+ * capacity(8) + size_max(4) + seg_max(4) + geometry(4) + blk_size(4).
+ * 旧 u16 geometry[4] 把 blk_size 推到 offset 24，guest 读到 0 → -EINVAL. */
 struct virtio_blk_config {
     u64 capacity;       /* 总扇区数（512B） */
     u32 size_max;
     u32 seg_max;
-    u16 geometry[4];
+    u16 geometry_cylinders;
+    u8  geometry_heads;
+    u8  geometry_sectors;
     u32 blk_size;
-    /* ... 其余字段省略 */
 } __attribute__((packed));
+
+/* Virtio spec: size_max is the max single *segment* in *bytes*, not sectors.
+ * 128 made Linux split 512B reads into 128B fragments (or reject them). */
+#define VIRTIO_BLK_SIZE_MAX_BYTES 65535u
+#define VBLK_MAX_DATA_SEGS        32
 
 /* 后端状态 */
 static u64 g_blk_capacity;      /* 扇区数 */
 static u32 g_blk_sector_size = 512;
 static int g_blk_bound = -1;    /* 绑定的 UTSM block 设备索引 */
+static u32 g_vblk_ioerr_logs;
+
+static void vblk_memcpy(void *dst, const void *src, u64 n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    while (n--) *d++ = *s++;
+}
+
+static void vblk_memzero(u8 *p, u32 n) {
+    while (n--) *p++ = 0;
+}
+
+struct vblk_req {
+    struct virtio_blk_outhdr hdr;
+    u8 *status;
+    u8 *data[VBLK_MAX_DATA_SEGS];
+    u32 dlen[VBLK_MAX_DATA_SEGS];
+    int ndata;
+};
+
+/* Walk a split-virtqueue blk chain, including INDIRECT tables and
+ * multi-segment data. Layout: [hdr R] [data...] [status W, 1 byte]. */
+static int vblk_parse_req(struct virtq_desc *vq, u32 qnum, u16 head,
+                          struct vblk_req *out) {
+    u8 *raw = (u8 *)out;
+    u32 z;
+    for (z = 0; z < sizeof(*out); z++) raw[z] = 0;
+    if (!vq || head >= qnum) return -1;
+
+    struct virtq_desc *desc = vq;
+    u32 ntbl = qnum;
+    u16 cur = head;
+
+    if (vq[head].flags & VIRTQ_DESC_F_INDIRECT) {
+        u32 n = vq[head].len / (u32)sizeof(struct virtq_desc);
+        if (n == 0 || n > 256) return -1;
+        desc = (struct virtq_desc *)virtio_gpa_to_host(vq[head].addr);
+        if (!desc) return -1;
+        ntbl = n;
+        cur = 0;
+    }
+
+    u16 chain[VBLK_MAX_DATA_SEGS + 4];
+    u16 nchain = 0;
+    int hops = 0;
+    for (;;) {
+        if (cur >= ntbl) return -1;
+        if (nchain >= (u16)(sizeof(chain) / sizeof(chain[0]))) return -1;
+        chain[nchain++] = cur;
+        if (!(desc[cur].flags & VIRTQ_DESC_F_NEXT)) break;
+        cur = desc[cur].next;
+        if (++hops > 64) return -1;
+    }
+
+    int seen_hdr = 0;
+    for (u16 i = 0; i < nchain; i++) {
+        struct virtq_desc *d = &desc[chain[i]];
+        void *host = virtio_gpa_to_host(d->addr);
+        int wr = (d->flags & VIRTQ_DESC_F_WRITE) != 0;
+        int last = (i + 1 == nchain);
+
+        if (!wr && !seen_hdr) {
+            if (!host || d->len < sizeof(struct virtio_blk_outhdr)) return -1;
+            vblk_memcpy(&out->hdr, host, sizeof(out->hdr));
+            out->hdr.type &= 0xFFu; /* drop legacy T_BARRIER */
+            seen_hdr = 1;
+            continue;
+        }
+        if (last && wr && d->len <= 16) {
+            out->status = (u8 *)host;
+            continue;
+        }
+        if (!host) return -1;
+        if (out->ndata >= VBLK_MAX_DATA_SEGS) return -1;
+        out->data[out->ndata] = (u8 *)host;
+        out->dlen[out->ndata] = d->len;
+        out->ndata++;
+    }
+    return seen_hdr ? 0 : -1;
+}
+
+static void vblk_log_ioerr(const char *tag, const struct vblk_req *r, u64 why) {
+    if (g_vblk_ioerr_logs >= 8) return;
+    g_vblk_ioerr_logs++;
+    log_info(tag);
+    log_hex64("[VBLK] ioerr why=", why);
+    if (!r) return;
+    log_hex64("[VBLK] ioerr type=", r->hdr.type);
+    log_hex64("[VBLK] ioerr sector=", r->hdr.sector);
+    log_hex64("[VBLK] ioerr ndata=", (u64)(u32)r->ndata);
+}
+
+static u32 vblk_copy_from_image(const struct vblk_req *r, const u8 *img, u64 img_size) {
+    u64 offset = r->hdr.sector * 512ULL;
+    u64 pos = 0;
+    for (int i = 0; i < r->ndata; i++) {
+        u32 n = r->dlen[i];
+        u64 src = offset + pos;
+        u64 avail = (src < img_size) ? (img_size - src) : 0;
+        u32 copy = (avail >= (u64)n) ? n : (u32)avail;
+        if (copy) vblk_memcpy(r->data[i], img + src, copy);
+        if (copy < n) vblk_memzero(r->data[i] + copy, n - copy);
+        pos += n;
+    }
+    return (u32)pos;
+}
+
+static u32 vblk_copy_to_image(const struct vblk_req *r, u8 *img, u64 img_size) {
+    u64 offset = r->hdr.sector * 512ULL;
+    u64 pos = 0;
+    for (int i = 0; i < r->ndata; i++) {
+        u32 n = r->dlen[i];
+        u64 dst = offset + pos;
+        u64 avail = (dst < img_size) ? (img_size - dst) : 0;
+        u32 copy = (avail >= (u64)n) ? n : (u32)avail;
+        if (copy) vblk_memcpy(img + dst, r->data[i], copy);
+        pos += n;
+    }
+    return 0;
+}
+
+static void vblk_write_id(const struct vblk_req *r, const char *id) {
+    if (r->ndata == 0 || !r->data[0]) return;
+    u32 cap = r->dlen[0];
+    u32 i = 0;
+    if (cap == 0) return;
+    for (; id[i] && i < cap - 1; i++) r->data[0][i] = id[i];
+    r->data[0][i] = 0;
+}
 
 /* 读取 device config 空间 */
 static u32 blk_read_config(u32 offset, int width) {
@@ -65,7 +204,7 @@ static u32 blk_read_config(u32 offset, int width) {
     u8 *c = (u8 *)&cfg;
     for (u32 i = 0; i < sizeof(cfg); i++) c[i] = 0;
     cfg.capacity = g_blk_capacity;
-    cfg.size_max = 128;                 /* 单请求最大 128 扇区 */
+    cfg.size_max = VIRTIO_BLK_SIZE_MAX_BYTES;
     cfg.seg_max = 32;
     cfg.blk_size = g_blk_sector_size;
 
@@ -81,101 +220,68 @@ static u32 blk_read_config(u32 offset, int width) {
 
 /* 处理一个块请求描述符链。返回写入 guest 的字节数（用于 used.len）。 */
 static u32 blk_handle_chain(struct virtq_desc *desc, u16 head, u32 qnum) {
-    (void)qnum;
-    if (!desc) return 0;
-
-    /* 第一个描述符：请求头（driver→device，16 字节） */
-    struct virtio_blk_outhdr *hdr =
-        (struct virtio_blk_outhdr *)virtio_gpa_to_host(desc[head].addr);
-    if (!hdr) return 0;
-
-    u32 type = hdr->type;
-    u64 sector = hdr->sector;
-
-    /* 沿描述符链找到 data 与 status 描述符 */
-    u16 cur = head;
-    u16 data_idx = 0xFFFF, status_idx = 0xFFFF;
-    int hops = 0;
-    if (desc[cur].flags & VIRTQ_DESC_F_NEXT) {
-        data_idx = desc[cur].next;
-        cur = data_idx;
-        /* data 之后可能还有 status */
-        while ((desc[cur].flags & VIRTQ_DESC_F_NEXT) && hops < 16) {
-            cur = desc[cur].next;
-            hops++;
-        }
-        /* 最后一个是 status（device write，1 字节） */
-        status_idx = cur;
-    }
-
-    u8 *status = (u8 *)0;
-    if (status_idx != 0xFFFF && (desc[status_idx].flags & VIRTQ_DESC_F_WRITE)) {
-        status = (u8 *)virtio_gpa_to_host(desc[status_idx].addr);
+    struct vblk_req req;
+    if (vblk_parse_req(desc, qnum, head, &req) != 0) {
+        vblk_log_ioerr("[VBLK] sata parse fail", &req, 1);
+        return 0;
     }
 
     u32 bytes_done = 0;
     u8 result = VIRTIO_BLK_S_OK;
-
     const dkm_block_api *blk = block_get_api();
 
-    switch (type) {
-    case VIRTIO_BLK_T_IN: {  /* 读：块设备 → guest data buffer */
-        if (data_idx == 0xFFFF || g_blk_bound < 0 || !blk) {
+    switch (req.hdr.type) {
+    case VIRTIO_BLK_T_IN: {
+        if (req.ndata == 0 || g_blk_bound < 0 || !blk) {
             result = VIRTIO_BLK_S_IOERR;
+            vblk_log_ioerr("[VBLK] sata read ioerr", &req, 2);
             break;
         }
-        u8 *dbuf = (u8 *)virtio_gpa_to_host(desc[data_idx].addr);
-        u32 dlen = desc[data_idx].len;
-        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
-        u32 nsec = dlen / 512;
-        if (nsec == 0) nsec = 1;
-        if (blk->read((u32)g_blk_bound, sector, nsec, dbuf) != 0) {
-            result = VIRTIO_BLK_S_IOERR;
-        } else {
-            bytes_done = dlen;
-        }
-        break;
-    }
-    case VIRTIO_BLK_T_OUT: {  /* 写：guest data buffer → 块设备 */
-        if (data_idx == 0xFFFF || g_blk_bound < 0 || !blk) {
-            result = VIRTIO_BLK_S_IOERR;
-            break;
-        }
-        const u8 *dbuf = (const u8 *)virtio_gpa_to_host(desc[data_idx].addr);
-        u32 dlen = desc[data_idx].len;
-        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
-        u32 nsec = dlen / 512;
-        if (nsec == 0) nsec = 1;
-        if (blk->write((u32)g_blk_bound, sector, nsec, dbuf) != 0) {
-            result = VIRTIO_BLK_S_IOERR;
-        } else {
-            bytes_done = 0;  /* 写操作 used.len=0 */
-        }
-        break;
-    }
-    case VIRTIO_BLK_T_GET_ID: {
-        if (data_idx != 0xFFFF) {
-            char *idbuf = (char *)virtio_gpa_to_host(desc[data_idx].addr);
-            if (idbuf) {
-                const char *id = "DESHAB-VIRTIO-BLK";
-                u32 i = 0;
-                for (; id[i] && i < desc[data_idx].len - 1; i++) idbuf[i] = id[i];
-                idbuf[i] = 0;
-                bytes_done = i + 1;
+        u64 sector = req.hdr.sector;
+        for (int i = 0; i < req.ndata; i++) {
+            u32 nsec = req.dlen[i] / 512;
+            if (nsec == 0) nsec = 1;
+            if (blk->read((u32)g_blk_bound, sector, nsec, req.data[i]) != 0) {
+                result = VIRTIO_BLK_S_IOERR;
+                break;
             }
+            sector += nsec;
+            bytes_done += req.dlen[i];
         }
         break;
     }
+    case VIRTIO_BLK_T_OUT: {
+        if (req.ndata == 0 || g_blk_bound < 0 || !blk) {
+            result = VIRTIO_BLK_S_IOERR;
+            break;
+        }
+        u64 sector = req.hdr.sector;
+        for (int i = 0; i < req.ndata; i++) {
+            u32 nsec = req.dlen[i] / 512;
+            if (nsec == 0) nsec = 1;
+            if (blk->write((u32)g_blk_bound, sector, nsec, req.data[i]) != 0) {
+                result = VIRTIO_BLK_S_IOERR;
+                break;
+            }
+            sector += nsec;
+        }
+        bytes_done = 0;
+        break;
+    }
+    case VIRTIO_BLK_T_GET_ID:
+        vblk_write_id(&req, "DESHAB-VIRTIO-BLK");
+        bytes_done = (req.ndata > 0) ? req.dlen[0] : 0;
+        break;
     case VIRTIO_BLK_T_FLUSH:
-        result = VIRTIO_BLK_S_OK;  /* 无写缓存，直接成功 */
+        result = VIRTIO_BLK_S_OK;
         break;
     default:
         result = VIRTIO_BLK_S_UNSUPP;
         break;
     }
 
-    /* 写状态字节 */
-    if (status) *status = result;
+    __asm__ volatile("mfence" ::: "memory");
+    if (req.status) *req.status = result;
     return bytes_done;
 }
 
@@ -194,6 +300,7 @@ static void blk_queue_notify(u32 queue_idx) {
     }
 
     /* 处理自上次以来的所有新 avail 请求 */
+    __asm__ volatile("mfence" ::: "memory");
     u16 cur = g_blk_last_avail;
     u16 used_idx = used->idx;
     while (cur != avail->idx) {
@@ -260,13 +367,6 @@ void virtio_blk_backend_init(void) {
  *
  * 读写直接操作内存（memcpy），无需块设备 API。 */
 
-/* byte-wise memcpy helper (freestanding, no libc) */
-static void rf_memcpy(void *dst, const void *src, u64 n) {
-    u8 *d = (u8 *)dst;
-    const u8 *s = (const u8 *)src;
-    while (n--) *d++ = *s++;
-}
-
 static const u8 *g_rootfs_data;     /* rootfs 镜像内存指针（HHDM 虚拟地址） */
 static u64 g_rootfs_size;           /* rootfs 镜像大小（字节） */
 static u64 g_rootfs_capacity;       /* rootfs 容量（扇区数，512B 单位） */
@@ -277,17 +377,17 @@ static u32 rootfs_blk_read_config(u32 offset, int width) {
     u8 *c = (u8 *)&cfg;
     for (u32 i = 0; i < sizeof(cfg); i++) c[i] = 0;
     cfg.capacity = g_rootfs_capacity;
-    cfg.size_max = 128;
+    cfg.size_max = VIRTIO_BLK_SIZE_MAX_BYTES;
     cfg.seg_max = 32;
     cfg.blk_size = 512;
     if (offset + 4 <= sizeof(cfg)) {
         u32 val = 0;
-        rf_memcpy(&val, c + offset, 4);
+        vblk_memcpy(&val, c + offset, 4);
         return val;
     }
     if (offset < sizeof(cfg)) {
         u32 val = 0;
-        rf_memcpy(&val, c + offset, 4);
+        vblk_memcpy(&val, c + offset, 4);
         return val;
     }
     return 0;
@@ -295,89 +395,48 @@ static u32 rootfs_blk_read_config(u32 offset, int width) {
 
 /* rootfs 请求处理：直接内存拷贝 */
 static u32 rootfs_blk_handle_chain(struct virtq_desc *desc, u16 head, u32 qnum) {
-    (void)qnum;
-    struct virtio_blk_outhdr hdr;
-    u8 *hptr = (u8 *)virtio_gpa_to_host(desc[head].addr);
-    if (!hptr) return 0;
-    rf_memcpy(&hdr, hptr, sizeof(hdr));
-
-    u32 type = hdr.type;
-    u64 sector = hdr.sector;
-
-    u16 data_idx = 0xFFFF;
-    u16 status_idx = 0xFFFF;
-    if (desc[head].flags & VIRTQ_DESC_F_NEXT) {
-        data_idx = desc[head].next;
-        u16 cur = data_idx;
-        int hops = 0;
-        while ((desc[cur].flags & VIRTQ_DESC_F_NEXT) && hops < 16) {
-            cur = desc[cur].next;
-            hops++;
-        }
-        status_idx = cur;
-    }
-
-    u8 *status = (u8 *)0;
-    if (status_idx != 0xFFFF && (desc[status_idx].flags & VIRTQ_DESC_F_WRITE)) {
-        status = (u8 *)virtio_gpa_to_host(desc[status_idx].addr);
+    struct vblk_req req;
+    if (vblk_parse_req(desc, qnum, head, &req) != 0) {
+        vblk_log_ioerr("[VBLK] rootfs parse fail", &req, 1);
+        return 0;
     }
 
     u32 bytes_done = 0;
     u8 result = VIRTIO_BLK_S_OK;
 
-    switch (type) {
-    case VIRTIO_BLK_T_IN: {  /* 读：rootfs 内存 → guest */
-        if (data_idx == 0xFFFF || !g_rootfs_data) {
+    switch (req.hdr.type) {
+    case VIRTIO_BLK_T_IN:
+        if (req.ndata == 0 || !g_rootfs_data) {
+            result = VIRTIO_BLK_S_IOERR;
+            vblk_log_ioerr("[VBLK] rootfs read ioerr", &req, 2);
+            break;
+        }
+        bytes_done = vblk_copy_from_image(&req, g_rootfs_data, g_rootfs_size);
+        break;
+    case VIRTIO_BLK_T_OUT:
+        /* Rootfs is a Limine module in RAM; allow writes so Linux can
+         * update the superblock after remount/errors. Ephemeral. */
+        if (req.ndata == 0 || !g_rootfs_data) {
             result = VIRTIO_BLK_S_IOERR;
             break;
         }
-        u8 *dbuf = (u8 *)virtio_gpa_to_host(desc[data_idx].addr);
-        u32 dlen = desc[data_idx].len;
-        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
-        u64 offset = sector * 512ULL;
-        if (offset + dlen > g_rootfs_size) {
-            /* 超出范围：截断或填零 */
-            u64 avail = (offset < g_rootfs_size) ? (g_rootfs_size - offset) : 0;
-            if (avail > 0) {
-                rf_memcpy(dbuf, g_rootfs_data + offset, avail);
-            }
-            /* 剩余部分填零 */
-            if (dlen > avail) {
-                u8 *p = dbuf + avail;
-                u32 rem = dlen - (u32)avail;
-                while (rem--) *p++ = 0;
-            }
-            bytes_done = dlen;
-        } else {
-            rf_memcpy(dbuf, g_rootfs_data + offset, dlen);
-            bytes_done = dlen;
-        }
-        break;
-    }
-    case VIRTIO_BLK_T_OUT:   /* 写：暂不支持（rootfs 只读） */
-        result = VIRTIO_BLK_S_IOERR;
+        bytes_done = vblk_copy_to_image(&req, (u8 *)g_rootfs_data, g_rootfs_size);
         break;
     case VIRTIO_BLK_T_GET_ID:
-        if (data_idx != 0xFFFF) {
-            char *idbuf = (char *)virtio_gpa_to_host(desc[data_idx].addr);
-            if (idbuf) {
-                const char *id = "DESHAB-ROOTFS";
-                u32 i = 0;
-                for (; id[i] && i < desc[data_idx].len - 1; i++) idbuf[i] = id[i];
-                idbuf[i] = 0;
-                bytes_done = i + 1;
-            }
-        }
+        vblk_write_id(&req, "DESHAB-ROOTFS");
+        bytes_done = (req.ndata > 0) ? req.dlen[0] : 0;
         break;
     case VIRTIO_BLK_T_FLUSH:
         result = VIRTIO_BLK_S_OK;
         break;
     default:
         result = VIRTIO_BLK_S_UNSUPP;
+        vblk_log_ioerr("[VBLK] rootfs unsupp", &req, 3);
         break;
     }
 
-    if (status) *status = result;
+    __asm__ volatile("mfence" ::: "memory");
+    if (req.status) *req.status = result;
     return bytes_done;
 }
 
@@ -396,6 +455,7 @@ static void rootfs_blk_queue_notify(u32 queue_idx) {
         return;
     }
 
+    __asm__ volatile("mfence" ::: "memory");
     u16 cur = g_rootfs_last_avail;
     u16 used_idx = used->idx;
     while (cur != avail->idx) {
@@ -453,19 +513,284 @@ void virtio_rootfs_blk_init(void) {
 
 /* ===== Extra rootfs virtio-blk 后端（VSCode Phase 4，可写持久卷） =====
  *
- * 第三个 virtio-blk 设备，后端为内存中的 linux-extra-rootfs.img
- * （Limine boot module，路径含 "extra"）。guest 看到 /dev/vdc，
- * 用作 overlayfs 的 rw 上层或 VSCode 数据卷。
- *
- * 与 rootfs（vdb 只读）不同，本后端支持 VIRTIO_BLK_T_OUT 真正写入内存
- * （易失：重启丢失；Phase 7 再做写回 FAT32 持久化）。
- *
- * 无 extra-rootfs module 时安全不注册（guest cmdline 无 slot6 参数）。 */
+ * guest /dev/vdc。优先用 Limine extra-rootfs boot module（内存后端）。
+ * 模块缺省时把 ESP 上的 boot/linux-extra-rootfs.img 按 FAT32 簇映射到
+ * AHCI：Limine 不必把 ~4GiB 打进 RAM（6G WSL QEMU 会在加载该 module 时死）。
+ */
 
 static u8 *g_xrootfs_data;
 static u64 g_xrootfs_size;
 static u64 g_xrootfs_capacity;
 static u16 g_xrootfs_last_avail;
+
+#define XROOTFS_MAX_CLUSTERS 131072u
+#define XROOTFS_FATWIN_SECS  256u
+
+static u32 g_xrootfs_spc;
+static u32 g_xrootfs_nclus;
+static u32 g_xrootfs_clus_lba[XROOTFS_MAX_CLUSTERS];
+static u8  g_xrootfs_dirbuf[FAT32_MAX_CLUSTER_BYTES] __attribute__((aligned(16)));
+static u8  g_xrootfs_fatwin[XROOTFS_FATWIN_SECS * 512u] __attribute__((aligned(16)));
+static u32 g_xrootfs_fat_abs;
+static u32 g_xrootfs_spf;
+static u32 g_xrootfs_fatwin_sec0;
+static int g_xrootfs_fatwin_valid;
+
+static int xrootfs_blk_rw(u32 index, u64 lba, u32 count, void *buf) {
+    const dkm_block_api *blk = block_get_api();
+    if (!blk || !buf || count == 0) return -1;
+    return blk->read(index, lba, count, buf);
+}
+
+static int xrootfs_blk_ww(u32 index, u64 lba, u32 count, const void *buf) {
+    const dkm_block_api *blk = block_get_api();
+    if (!blk || !buf || count == 0) return -1;
+    if (!blk->write) return -2;
+    return blk->write(index, lba, count, buf);
+}
+
+static u32 xrootfs_fat_next(u32 clus) {
+    u32 fat_byte, sec, off, win_secs, want;
+    if (clus < 2) return 0x0FFFFFFFu;
+    fat_byte = clus * 4u;
+    sec = fat_byte / 512u;
+    off = fat_byte % 512u;
+    if (sec >= g_xrootfs_spf) return 0x0FFFFFFFu;
+    if (!g_xrootfs_fatwin_valid ||
+        sec < g_xrootfs_fatwin_sec0 ||
+        sec >= g_xrootfs_fatwin_sec0 + XROOTFS_FATWIN_SECS) {
+        want = g_xrootfs_spf - sec;
+        win_secs = XROOTFS_FATWIN_SECS;
+        if (want < win_secs) win_secs = want;
+        if (win_secs == 0) return 0x0FFFFFFFu;
+        if (xrootfs_blk_rw(0, (u64)g_xrootfs_fat_abs + sec, win_secs,
+                           g_xrootfs_fatwin) != 0) {
+            return 0x0FFFFFFFu;
+        }
+        g_xrootfs_fatwin_sec0 = sec;
+        g_xrootfs_fatwin_valid = 1;
+    }
+    {
+        u32 idx = (sec - g_xrootfs_fatwin_sec0) * 512u + off;
+        const u8 *p = g_xrootfs_fatwin + idx;
+        return ((u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24))
+               & 0x0FFFFFFFu;
+    }
+}
+
+static int xrootfs_find_in_dir(u32 vol_lba, u32 data_start, u32 start_clus,
+                               const char *long_name, int is_dir,
+                               u32 *out_clus, u32 *out_size) {
+    fat32_lfn_buf lfn;
+    u32 clus = start_clus;
+    u32 spc = g_xrootfs_spc;
+    if (spc == 0 || spc * 512u > FAT32_MAX_CLUSTER_BYTES) return -1;
+    fat32_lfn_init(&lfn);
+    while (clus >= 2 && clus < 0x0FFFFFF8u) {
+        u32 lba = vol_lba + data_start + (clus - 2u) * spc;
+        const u8 *entries;
+        u32 entry_count, e;
+        if (xrootfs_blk_rw(0, lba, spc, g_xrootfs_dirbuf) != 0) return -3;
+        entries = g_xrootfs_dirbuf;
+        entry_count = (spc * 512u) / 32u;
+        for (e = 0; e < entry_count; e++) {
+            const u8 *entry = entries + e * 32u;
+            const u8 *de;
+            int is_short, entry_is_dir, matched;
+            if (entry[0] == 0) return -4;
+            if ((u8)entry[0] == 0xE5) {
+                fat32_lfn_init(&lfn);
+                continue;
+            }
+            de = entry;
+            is_short = fat32_lfn_process(&lfn, entry);
+            if (!is_short) continue;
+            if (de[11] & 0x08) {
+                fat32_lfn_init(&lfn);
+                continue;
+            }
+            entry_is_dir = (de[11] & 0x10) ? 1 : 0;
+            if (entry_is_dir != is_dir) {
+                fat32_lfn_init(&lfn);
+                continue;
+            }
+            matched = 0;
+            if (lfn.valid && long_name) {
+                char ascii[FAT32_LFN_MAX];
+                int n = fat32_lfn_to_ascii(&lfn, ascii, sizeof(ascii));
+                if (n >= 0 && fat32_lfn_streq_ci(ascii, long_name)) matched = 1;
+            }
+            if (!matched && long_name) {
+                char short_disp[13];
+                fat32_lfn_short_to_str(de, short_disp);
+                if (fat32_lfn_streq_ci(short_disp, long_name)) matched = 1;
+            }
+            if (matched) {
+                u16 clow = (u16)de[26] | ((u16)de[27] << 8);
+                u16 chigh = (u16)de[20] | ((u16)de[21] << 8);
+                *out_clus = (u32)clow | ((u32)chigh << 16);
+                *out_size = (u32)de[28] | ((u32)de[29] << 8) |
+                            ((u32)de[30] << 16) | ((u32)de[31] << 24);
+                return 0;
+            }
+            fat32_lfn_init(&lfn);
+        }
+        clus = xrootfs_fat_next(clus) & 0x0FFFFFFFu;
+    }
+    return -4;
+}
+
+static int xrootfs_map_esp_file(void) {
+    const dkm_block_api *blk = block_get_api();
+    u8 bpbsec[512] __attribute__((aligned(16)));
+    u64 vol;
+    u32 rsvd, fc, spf, spc, root, data_start, file_clus, file_size, nclus, i, fc_cur;
+    u32 boot_clus, dummy;
+    if (!blk || blk->device_count() == 0 || blk->sector_size(0) != 512) {
+        log_warn("[VBLK] extra-rootfs ESP map needs AHCI first");
+        return -1;
+    }
+    vol = fat32_part_probe(xrootfs_blk_rw, 0);
+    if (blk->read(0, vol, 1, bpbsec) != 0) return -2;
+    if (!fat32_part_bpb_ok(bpbsec)) return -3;
+    rsvd = (u32)bpbsec[14] | ((u32)bpbsec[15] << 8);
+    fc = bpbsec[16];
+    spc = bpbsec[13];
+    spf = (u32)bpbsec[36] | ((u32)bpbsec[37] << 8) |
+          ((u32)bpbsec[38] << 16) | ((u32)bpbsec[39] << 24);
+    root = (u32)bpbsec[44] | ((u32)bpbsec[45] << 8) |
+           ((u32)bpbsec[46] << 16) | ((u32)bpbsec[47] << 24);
+    if (spc == 0 || spc > 64 || spf == 0 || root < 2) return -4;
+    g_xrootfs_spc = spc;
+    g_xrootfs_spf = spf;
+    g_xrootfs_fat_abs = (u32)vol + rsvd;
+    g_xrootfs_fatwin_valid = 0;
+    data_start = rsvd + fc * spf;
+
+    boot_clus = 0;
+    dummy = 0;
+    if (xrootfs_find_in_dir((u32)vol, data_start, root, "boot", 1,
+                            &boot_clus, &dummy) != 0) {
+        log_warn("[VBLK] extra-rootfs: ESP /boot not found");
+        return -5;
+    }
+    file_clus = 0;
+    file_size = 0;
+    if (xrootfs_find_in_dir((u32)vol, data_start, boot_clus,
+                            "linux-extra-rootfs.img", 0,
+                            &file_clus, &file_size) != 0 ||
+        file_clus < 2 || file_size == 0) {
+        log_warn("[VBLK] extra-rootfs: linux-extra-rootfs.img not on ESP");
+        return -6;
+    }
+
+    nclus = (file_size + (spc * 512u) - 1u) / (spc * 512u);
+    if (nclus == 0 || nclus > XROOTFS_MAX_CLUSTERS) {
+        log_error("[VBLK] extra-rootfs cluster map too large");
+        log_hex64("[VBLK] nclus=", nclus);
+        return -7;
+    }
+
+    fc_cur = file_clus;
+    for (i = 0; i < nclus; i++) {
+        if (fc_cur < 2 || fc_cur >= 0x0FFFFFF8u) {
+            log_error("[VBLK] extra-rootfs FAT chain short");
+            return -8;
+        }
+        g_xrootfs_clus_lba[i] = (u32)vol + data_start + (fc_cur - 2u) * spc;
+        fc_cur = xrootfs_fat_next(fc_cur) & 0x0FFFFFFFu;
+    }
+
+    g_xrootfs_nclus = nclus;
+    g_xrootfs_data = 0;
+    g_xrootfs_size = file_size;
+    g_xrootfs_capacity = file_size / 512u;
+    if (file_size % 512u) g_xrootfs_capacity++;
+    log_info("[VBLK] extra-rootfs-blk backend bound (esp file)");
+    log_hex64("[VBLK] extra-rootfs size=", file_size);
+    log_hex64("[VBLK] extra-rootfs nclus=", nclus);
+    log_hex64("[VBLK] extra-rootfs first_lba=", g_xrootfs_clus_lba[0]);
+    return 0;
+}
+
+static int xrootfs_disk_xfer(u64 img_sector, u32 nsec, u8 *buf, int is_write) {
+    const dkm_block_api *blk = block_get_api();
+    u32 spc = g_xrootfs_spc;
+    if (!blk || !buf || nsec == 0 || spc == 0) return -1;
+    while (nsec) {
+        u32 ci, off, chunk, c;
+        u64 disk;
+        if (img_sector / spc >= g_xrootfs_nclus) return -2;
+        ci = (u32)(img_sector / spc);
+        off = (u32)(img_sector % spc);
+        disk = g_xrootfs_clus_lba[ci] + off;
+        chunk = spc - off;
+        if (chunk > nsec) chunk = nsec;
+        c = ci;
+        while (chunk < nsec && (c + 1u) < g_xrootfs_nclus &&
+               g_xrootfs_clus_lba[c + 1u] == g_xrootfs_clus_lba[c] + spc) {
+            u32 add = spc;
+            if (add > nsec - chunk) add = nsec - chunk;
+            chunk += add;
+            c++;
+        }
+        if (is_write) {
+            if (xrootfs_blk_ww(0, disk, chunk, buf) != 0) return -3;
+        } else {
+            if (xrootfs_blk_rw(0, disk, chunk, buf) != 0) return -3;
+        }
+        buf += chunk * 512u;
+        img_sector += chunk;
+        nsec -= chunk;
+    }
+    return 0;
+}
+
+static int xrootfs_disk_xfer_bytes(u64 off, u32 n, u8 *buf, int is_write) {
+    static u8 bounce[512];
+    while (n) {
+        u64 sector = off / 512ULL;
+        u32 so = (u32)(off % 512ULL);
+        u32 chunk;
+        if (so == 0 && n >= 512u) {
+            u32 nsec = n / 512u;
+            if (xrootfs_disk_xfer(sector, nsec, buf, is_write) != 0)
+                return -1;
+            chunk = nsec * 512u;
+        } else {
+            chunk = 512u - so;
+            if (chunk > n)
+                chunk = n;
+            if (xrootfs_disk_xfer(sector, 1, bounce, 0) != 0)
+                return -1;
+            if (is_write) {
+                vblk_memcpy(bounce + so, buf, chunk);
+                if (xrootfs_disk_xfer(sector, 1, bounce, 1) != 0)
+                    return -1;
+            } else {
+                vblk_memcpy(buf, bounce + so, chunk);
+            }
+        }
+        buf += chunk;
+        off += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static u32 xrootfs_copy_disk(const struct vblk_req *r, int is_write) {
+    u64 offset = r->hdr.sector * 512ULL;
+    u32 pos = 0;
+    for (int i = 0; i < r->ndata; i++) {
+        u32 n = r->dlen[i];
+        if (n == 0)
+            continue;
+        if (xrootfs_disk_xfer_bytes(offset + pos, n, r->data[i], is_write) != 0)
+            return (u32)-1;
+        pos += n;
+    }
+    return is_write ? 0 : pos;
+}
 
 static u32 xrootfs_blk_read_config(u32 offset, int width) {
     (void)width;
@@ -473,110 +798,77 @@ static u32 xrootfs_blk_read_config(u32 offset, int width) {
     u8 *c = (u8 *)&cfg;
     for (u32 i = 0; i < sizeof(cfg); i++) c[i] = 0;
     cfg.capacity = g_xrootfs_capacity;
-    cfg.size_max = 128;
+    cfg.size_max = VIRTIO_BLK_SIZE_MAX_BYTES;
     cfg.seg_max = 32;
     cfg.blk_size = 512;
     if (offset < sizeof(cfg)) {
         u32 val = 0;
-        rf_memcpy(&val, c + offset, (offset + 4 <= sizeof(cfg)) ? 4 : (sizeof(cfg) - offset));
+        vblk_memcpy(&val, c + offset, (offset + 4 <= sizeof(cfg)) ? 4 : (sizeof(cfg) - offset));
         return val;
     }
     return 0;
 }
 
 static u32 xrootfs_blk_handle_chain(struct virtq_desc *desc, u16 head, u32 qnum) {
-    (void)qnum;
-    struct virtio_blk_outhdr hdr;
-    u8 *hptr = (u8 *)virtio_gpa_to_host(desc[head].addr);
-    if (!hptr) return 0;
-    rf_memcpy(&hdr, hptr, sizeof(hdr));
-
-    u32 type = hdr.type;
-    u64 sector = hdr.sector;
-
-    u16 data_idx = 0xFFFF;
-    u16 status_idx = 0xFFFF;
-    if (desc[head].flags & VIRTQ_DESC_F_NEXT) {
-        data_idx = desc[head].next;
-        u16 cur = data_idx;
-        int hops = 0;
-        while ((desc[cur].flags & VIRTQ_DESC_F_NEXT) && hops < 16) {
-            cur = desc[cur].next;
-            hops++;
-        }
-        status_idx = cur;
-    }
-
-    u8 *status = (u8 *)0;
-    if (status_idx != 0xFFFF && (desc[status_idx].flags & VIRTQ_DESC_F_WRITE)) {
-        status = (u8 *)virtio_gpa_to_host(desc[status_idx].addr);
+    struct vblk_req req;
+    if (vblk_parse_req(desc, qnum, head, &req) != 0) {
+        vblk_log_ioerr("[VBLK] xrootfs parse fail", &req, 1);
+        return 0;
     }
 
     u32 bytes_done = 0;
     u8 result = VIRTIO_BLK_S_OK;
 
-    switch (type) {
-    case VIRTIO_BLK_T_IN: {  /* 读：镜像内存 → guest */
-        if (data_idx == 0xFFFF || !g_xrootfs_data) {
+    switch (req.hdr.type) {
+    case VIRTIO_BLK_T_IN:
+        if (req.ndata == 0) {
             result = VIRTIO_BLK_S_IOERR;
+            vblk_log_ioerr("[VBLK] xrootfs read ioerr", &req, 2);
             break;
         }
-        u8 *dbuf = (u8 *)virtio_gpa_to_host(desc[data_idx].addr);
-        u32 dlen = desc[data_idx].len;
-        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
-        u64 offset = sector * 512ULL;
-        u64 avail = (offset < g_xrootfs_size) ? (g_xrootfs_size - offset) : 0;
-        u32 copied = 0;
-        if (avail > 0) {
-            u32 n = (dlen < avail) ? dlen : (u32)avail;
-            rf_memcpy(dbuf, g_xrootfs_data + offset, n);
-            copied = n;
-        }
-        /* 越界部分填零 */
-        while (copied < dlen) dbuf[copied++] = 0;
-        bytes_done = dlen;
-        break;
-    }
-    case VIRTIO_BLK_T_OUT: {  /* 写：guest → 镜像内存（可写卷） */
-        if (data_idx == 0xFFFF || !g_xrootfs_data) {
-            result = VIRTIO_BLK_S_IOERR;
-            break;
-        }
-        const u8 *dbuf = (const u8 *)virtio_gpa_to_host(desc[data_idx].addr);
-        u32 dlen = desc[data_idx].len;
-        if (!dbuf) { result = VIRTIO_BLK_S_IOERR; break; }
-        u64 offset = sector * 512ULL;
-        if (offset + dlen > g_xrootfs_size) {
-            /* 越界写：只写卷内部分，其余丢弃 */
-            u64 avail = (offset < g_xrootfs_size) ? (g_xrootfs_size - offset) : 0;
-            if (avail > 0) rf_memcpy(g_xrootfs_data + offset, dbuf, avail);
-        } else {
-            rf_memcpy(g_xrootfs_data + offset, dbuf, dlen);
-        }
-        bytes_done = 0;  /* 写操作 used.len=0 */
-        break;
-    }
-    case VIRTIO_BLK_T_GET_ID:
-        if (data_idx != 0xFFFF) {
-            char *idbuf = (char *)virtio_gpa_to_host(desc[data_idx].addr);
-            if (idbuf) {
-                const char *id = "DESHAB-EXTRA-ROOTFS";
-                u32 i = 0;
-                for (; id[i] && i < desc[data_idx].len - 1; i++) idbuf[i] = id[i];
-                idbuf[i] = 0;
-                bytes_done = i + 1;
+        if (g_xrootfs_data) {
+            bytes_done = vblk_copy_from_image(&req, g_xrootfs_data, g_xrootfs_size);
+        } else if (g_xrootfs_nclus) {
+            bytes_done = xrootfs_copy_disk(&req, 0);
+            if (bytes_done == (u32)-1) {
+                result = VIRTIO_BLK_S_IOERR;
+                bytes_done = 0;
+                vblk_log_ioerr("[VBLK] xrootfs disk read ioerr", &req, 2);
             }
+        } else {
+            result = VIRTIO_BLK_S_IOERR;
+            vblk_log_ioerr("[VBLK] xrootfs read ioerr", &req, 2);
         }
+        break;
+    case VIRTIO_BLK_T_OUT:
+        if (req.ndata == 0) {
+            result = VIRTIO_BLK_S_IOERR;
+            break;
+        }
+        if (g_xrootfs_data) {
+            bytes_done = vblk_copy_to_image(&req, g_xrootfs_data, g_xrootfs_size);
+        } else if (g_xrootfs_nclus) {
+            if (xrootfs_copy_disk(&req, 1) == (u32)-1)
+                result = VIRTIO_BLK_S_IOERR;
+        } else {
+            result = VIRTIO_BLK_S_IOERR;
+        }
+        break;
+    case VIRTIO_BLK_T_GET_ID:
+        vblk_write_id(&req, "DESHAB-EXTRA-ROOTFS");
+        bytes_done = (req.ndata > 0) ? req.dlen[0] : 0;
         break;
     case VIRTIO_BLK_T_FLUSH:
         result = VIRTIO_BLK_S_OK;
         break;
     default:
         result = VIRTIO_BLK_S_UNSUPP;
+        vblk_log_ioerr("[VBLK] xrootfs unsupp", &req, 3);
         break;
     }
 
-    if (status) *status = result;
+    __asm__ volatile("mfence" ::: "memory");
+    if (req.status) *req.status = result;
     return bytes_done;
 }
 
@@ -592,6 +884,7 @@ static void xrootfs_blk_queue_notify(u32 queue_idx) {
         return;
     }
 
+    __asm__ volatile("mfence" ::: "memory");
     u16 cur = g_xrootfs_last_avail;
     u16 used_idx = used->idx;
     while (cur != avail->idx) {
@@ -630,18 +923,23 @@ static struct virtio_backend g_xrootfs_blk_backend = {
 void virtio_extra_rootfs_blk_init(void) {
     u64 size = 0;
     void *img = linux_find_extra_rootfs_module(&size);
-    if (!img || size == 0) {
-        log_warn("[VBLK] no extra-rootfs module, slot6 backend not registered");
+
+    g_xrootfs_nclus = 0;
+    g_xrootfs_data = 0;
+    g_xrootfs_size = 0;
+    g_xrootfs_capacity = 0;
+
+    if (img && size != 0) {
+        g_xrootfs_data = (u8 *)img;
+        g_xrootfs_size = size;
+        g_xrootfs_capacity = size / 512;
+        if (size % 512) g_xrootfs_capacity++;
+        log_info("[VBLK] extra-rootfs-blk backend bound (rw module)");
+        log_hex64("[VBLK] extra-rootfs size=", size);
+    } else if (xrootfs_map_esp_file() != 0) {
+        log_warn("[VBLK] no extra-rootfs module or ESP file, slot6 not registered");
         return;
     }
-
-    g_xrootfs_data = (u8 *)img;
-    g_xrootfs_size = size;
-    g_xrootfs_capacity = size / 512;
-    if (size % 512) g_xrootfs_capacity++;
-
-    log_info("[VBLK] extra-rootfs-blk backend bound (rw)");
-    log_hex64("[VBLK] extra-rootfs size=", size);
 
     virtio_mmio_register(&g_xrootfs_blk_backend);
 }

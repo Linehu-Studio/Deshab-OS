@@ -7,7 +7,9 @@ OUT := $(ROOT)/SYSTEM/system/deshab64/desktop.elf
 CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fpie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -I../UTSM/include -O2
 LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
 
-C_SOURCES := main.c
+C_SOURCES := main.c input.c wm.c compositor.c apps_builtin.c appreg.c \
+             launcher.c lxc.c shell.c pages.c f32io.c ascii_font.c zhfont.c \
+             wallpaper.c taskbar.c textures.c
 OBJECTS := $(C_SOURCES:.c=.o)
 
 .PHONY: all clean

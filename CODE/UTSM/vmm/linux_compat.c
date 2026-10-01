@@ -73,32 +73,21 @@ static int lxc_is_available(void) {
 /* 前向声明：payload_pool 拷出助手（定义在文件传输段，exec 新协议复用） */
 static u64 lxc_pool_copyout(char *buf, u64 cap, u32 data_len);
 
-/* 等待 Linux daemon 的响应消息。
- * linux_resume() 返回后，daemon 已 park，所有响应消息应已在 ring 中。
- * 我们循环 pop 直到拿到 EXEC_EXIT 或 ring 空（超时保护）。
- *
- * 新协议（P3）：daemon 把 stdout 直写 payload_pool，EXEC_EXIT 为 16B
- * （exit_code + flags + stdout_len + stdout_total），flags&F_POOL 时
- * 从 pool 拷出；F_TRUNC/F_TIMEOUT 记串口日志。旧协议（8B exit_code）
- * 输出仍走 EXEC_STDOUT 内联，下方分支兼容。 */
-static int lxc_drain_responses(char *out_buf, u64 out_cap, u64 *out_len,
-                               u64 *exit_code) {
-    u64 written = 0;
+/* Consume already-queued EXEC_* messages. Returns 1 if EXEC_EXIT was
+ * seen, 0 if the ring is empty. stdout is accumulated across slices. */
+static int lxc_consume_exec_msgs(char *out_buf, u64 out_cap, u64 *written_inout,
+                                 u64 *exit_code) {
+    u64 written = written_inout ? *written_inout : 0;
     int got_exit = 0;
-    u64 exit_val = 0;
+    u64 exit_val = exit_code ? *exit_code : 0;
 
-    /* 最多消费 256 条消息（防止异常情况下死循环） */
     for (int i = 0; i < 256; i++) {
         struct utsm_ipc_msg msg;
-        if (ipc_shm_recv(&msg) != 0) {
-            /* ring 空 */
-            break;
-        }
+        if (ipc_shm_recv(&msg) != 0) break;
 
         switch (msg.type) {
         case UTSM_MSG_EXEC_STDOUT:
         case UTSM_MSG_EXEC_STDERR: {
-            /* 旧式内联输出（新协议下 stdout 走 pool，正常不会再收到） */
             u32 n = msg.data_len;
             if (out_buf && out_cap > written) {
                 u32 space = (u32)(out_cap - written);
@@ -114,7 +103,6 @@ static int lxc_drain_responses(char *out_buf, u64 out_cap, u64 *out_len,
                 my_memcpy(&ex, msg.data, sizeof(ex));
                 exit_val = ex.exit_code;
                 if (ex.flags & UTSM_EXEC_EXIT_F_POOL) {
-                    /* stdout 已 staged 在 payload_pool[0..stdout_len) */
                     written = lxc_pool_copyout(out_buf, out_cap,
                                                ex.stdout_len);
                     if (ex.flags & UTSM_EXEC_EXIT_F_TRUNC) {
@@ -125,7 +113,6 @@ static int lxc_drain_responses(char *out_buf, u64 out_cap, u64 *out_len,
                         log_warn("[LNXC] exec: child timed out, SIGKILLed");
                 }
             } else if (msg.data_len >= 8) {
-                /* 旧式 8B：exit_code + reserved */
                 u32 ec = 0;
                 my_memcpy(&ec, msg.data, 4);
                 exit_val = ec;
@@ -134,17 +121,39 @@ static int lxc_drain_responses(char *out_buf, u64 out_cap, u64 *out_len,
             break;
         }
         default:
-            /* 忽略其他消息（HELLO/PONG 等） */
             break;
         }
-
         if (got_exit) break;
     }
 
+    if (written_inout) *written_inout = written;
+    if (exit_code) *exit_code = exit_val;
+    return got_exit;
+}
+
+#define LXC_MAX_SLICES 256
+
+/* linux_resume() may return on a preemption timeslice before the daemon
+ * parks. Keep running slices until EXEC_EXIT (or the slice budget). */
+static int lxc_wait_exec_exit(char *out_buf, u64 out_cap, u64 *out_len,
+                              u64 *exit_code) {
+    u64 written = 0;
+    u64 exit_val = 0;
+    for (int slice = 0; slice < LXC_MAX_SLICES; slice++) {
+        int r = linux_resume();
+        if (r != 0) {
+            log_hex64("[LNXC] exec: linux_resume failed=", (u64)(i64)r);
+            return -3;
+        }
+        if (lxc_consume_exec_msgs(out_buf, out_cap, &written, &exit_val)) {
+            if (out_len) *out_len = written;
+            if (exit_code) *exit_code = exit_val;
+            return 0;
+        }
+    }
     if (out_len) *out_len = written;
     if (exit_code) *exit_code = exit_val;
-
-    return got_exit ? 0 : -4;  /* -4 = 超时无 exit 响应 */
+    return -4;
 }
 
 /* 构建并发送 EXEC_REQUEST，唤醒 guest，然后 drain 响应。
@@ -190,15 +199,13 @@ static int lxc_exec_internal(const char *path, int argc,
         return -2;
     }
 
-    /* 3. 唤醒 Linux guest 执行 */
-    int r = linux_resume();
-    if (r != 0) {
-        log_hex64("[LNXC] exec: linux_resume failed=", (u64)(i64)r);
-        return -3;
+    /* 3. 唤醒 Linux guest；timeslice 归还时继续 resume 直到 EXEC_EXIT */
+    int drc = lxc_wait_exec_exit(stdout_buf, stdout_cap, stdout_len, exit_code);
+    if (drc != 0) {
+        log_hex64("[LNXC] exec: no EXEC_EXIT after resume rc=", (u64)(i64)drc);
+        ipc_shm_dump_stats();
     }
-
-    /* 4. 读取响应（daemon 已再次 park，响应在 ring 中） */
-    return lxc_drain_responses(stdout_buf, stdout_cap, stdout_len, exit_code);
+    return drc;
 }
 
 static int lxc_exec(const char *path, int argc, const char *const *argv,
@@ -283,20 +290,20 @@ static int lxc_file_roundtrip(u32 msg_type, const char *path, u64 offset,
         return -2;
     }
 
-    int r = linux_resume();
-    if (r != 0) {
-        log_hex64("[LNXC] file: linux_resume failed=", (u64)(i64)r);
-        return -3;
-    }
-
-    /* 从 ring 中取 FILE_RESPONSE（忽略其间可能残留的 EXEC_* 消息） */
-    for (int i = 0; i < 256; i++) {
-        struct utsm_ipc_msg msg;
-        if (ipc_shm_recv(&msg) != 0) break;  /* ring 空 */
-        if (msg.type == UTSM_MSG_FILE_RESPONSE &&
-            msg.data_len >= sizeof(struct ipc_file_response)) {
-            my_memcpy(resp, msg.data, sizeof(*resp));
-            return 0;
+    for (int slice = 0; slice < LXC_MAX_SLICES; slice++) {
+        int r = linux_resume();
+        if (r != 0) {
+            log_hex64("[LNXC] file: linux_resume failed=", (u64)(i64)r);
+            return -3;
+        }
+        for (int i = 0; i < 256; i++) {
+            struct utsm_ipc_msg msg;
+            if (ipc_shm_recv(&msg) != 0) break;
+            if (msg.type == UTSM_MSG_FILE_RESPONSE &&
+                msg.data_len >= sizeof(struct ipc_file_response)) {
+                my_memcpy(resp, msg.data, sizeof(*resp));
+                return 0;
+            }
         }
     }
     return -4;  /* 无响应 */
@@ -569,6 +576,11 @@ static int lxc_gpu_get_scanout_info(struct linux_compat_scanout_info *out) {
     return 0;
 }
 
+static int lxc_run_slice(void) {
+    if (!lxc_is_available()) return -1;
+    return linux_resume();
+}
+
 /* ===== 服务表 ===== */
 
 static const linux_compat_service g_lxc_service = {
@@ -585,6 +597,7 @@ static const linux_compat_service g_lxc_service = {
     lxc_input_forward_mouse,
     lxc_gpu_get_scanout_info,
     lxc_exec_async,
+    lxc_run_slice,
 };
 
 const linux_compat_service *linux_compat_get_service(void) {
@@ -851,6 +864,7 @@ int lxc_vscode_install(void) {
         log_warn("[LNXC] vscode install: service not available");
         return -1;
     }
+    log_info("[LNXC] vscode: probe /opt/vscode/bin/code");
 
     /* 1. 已安装标记：overlay 持久化后二次启动直接跳过 */
     if (lxc_guest_path_exists("/opt/vscode/bin/code")) {

@@ -176,7 +176,7 @@ static struct limine_file *dsk_find_module(void) {
 
 /* ---- FAT32 block-provider file reader ---- */
 static u8 g_dsk_fat32_disk[131072]; /* 256-sector BPB+FAT+root dir buffer (与 DSK 端一致) */
-static u8 g_dsk_fat32_cluster[4096]; /* 8-sector cluster buffer */
+static u8 g_dsk_fat32_cluster[32768]; /* 32KiB: ESP>=4GiB uses 64 sectors/cluster */
 /* 实机要求: 文件缓冲区足够容纳 deshab.elf (~1.5MB) 及 SYSTEM/lib 下的
  * 大型 DLL（shell32.dll ~8MB, uiautomationcore.dll ~4.3MB） */
 static u8 g_dsk_fat32_filedata[10485760]; /* 10MB file data buffer */

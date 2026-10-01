@@ -51,7 +51,7 @@ u64 vmx_kernel_virt_to_phys(const void *address) {
     return response->physical_base + (virt - response->virtual_base);
 }
 
-static __attribute__((unused)) void vmx_write_msr(u32 msr, u64 value) {
+void vmx_write_msr(u32 msr, u64 value) {
     u32 lo = (u32)(value & 0xFFFFFFFFULL);
     u32 hi = (u32)(value >> 32);
     __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr));

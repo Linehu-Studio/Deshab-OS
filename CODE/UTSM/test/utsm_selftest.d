@@ -4,7 +4,8 @@ test/utsm_selftest.o: test\utsm_selftest.c include\utsm\utsm.h \
   include\utsm\segment.h include\utsm\dirty.h include\utsm\utrw.h \
   include\utsm\vmm.h include\utsm\linux_loader.h include\utsm\ipc_shm.h \
   ..\utsm-ipc\ipc_proto.h include\utsm\hypercall.h include\utsm\log.h \
-  include\utsm\arena.h
+  include\utsm\arena.h include\utsm\drr.h include\utsm\sched_ext.h \
+  include\utsm\sched.h
 include\utsm\utsm.h:
 include\utsm\types.h:
 include\utsm\status.h:
@@ -22,3 +23,6 @@ include\utsm\ipc_shm.h:
 include\utsm\hypercall.h:
 include\utsm\log.h:
 include\utsm\arena.h:
+include\utsm\drr.h:
+include\utsm\sched_ext.h:
+include\utsm\sched.h:

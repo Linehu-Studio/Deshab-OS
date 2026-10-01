@@ -91,4 +91,7 @@ u64 vmm_get_eptp(void);
 /* P8.5: VMCS 物理地址（linux_launch 前 VMCLEAR+VMPTRLD 用） */
 u64 vmm_get_vmcs_phys(void);
 
+/* Walk the current guest CR3 to translate GVA→GPA. Returns 0 if unmapped. */
+u64 vmx_guest_gva_to_gpa(u64 gva);
+
 #endif

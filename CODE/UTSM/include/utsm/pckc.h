@@ -26,4 +26,7 @@ typedef struct {
 void utsm_pckc_init(void);
 int utsm_pckc_get_or_derive(u32 segment_slot, struct utsm_segment_desc *desc, utsm_key_material *out_key);
 
+/* Phase 9: 失效某段全部缓存 key（key_epoch bump / task_kill crypto erase 用） */
+void utsm_pckc_invalidate_slot(u32 segment_slot);
+
 #endif

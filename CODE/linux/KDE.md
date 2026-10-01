@@ -10,12 +10,21 @@ No KDE packages are downloaded unless `KDE_FULL=1` is explicitly set.
 
 ## Build
 
-Run the full build from an Arch Linux environment with
-`arch-install-scripts`, working pacman mirrors, and a valid keyring:
+Preferred: an Arch Linux environment with `arch-install-scripts`.
+On WSL/Ubuntu the script falls back to the official Arch bootstrap
+tarball plus `chroot pacman`. Always keep the work directory on a
+native Linux disk (`EXTRA_ROOTFS_WORK`, default `/root/extra_rootfs_work`);
+do not extract the suite through `/mnt/d`.
 
 ```bash
+# Arch host:
 sudo pacman -S --needed arch-install-scripts
 sudo KDE_FULL=1 IMG_SIZE_MB=8192 \
+  bash CODE/linux/build_extra_rootfs.sh
+
+# WSL (Ubuntu) native disk, no pacstrap:
+sudo EXTRA_ROOTFS_WORK=/root/extra_rootfs_work \
+  KDE_FULL=1 IMG_SIZE_MB=8192 \
   bash CODE/linux/build_extra_rootfs.sh
 ```
 
@@ -50,10 +59,19 @@ ships the Wayland session in `plasma-workspace`; the obsolete
 
 ## Storage and attachment
 
-The output remains:
+The default output path is:
 
 ```text
 SYSTEM/boot/linux-extra-rootfs.img
+```
+
+For an 8 GiB KDE image keep the result on a native Linux disk:
+
+```bash
+sudo EXTRA_ROOTFS_WORK=/root/extra_rootfs_work \
+  EXTRA_ROOTFS_OUTPUT=/home/deshab/linux-extra-rootfs.img \
+  KDE_FULL=1 IMG_SIZE_MB=8192 \
+  bash CODE/linux/build_extra_rootfs.sh
 ```
 
 That path is the existing build staging convention, not a claim that the full

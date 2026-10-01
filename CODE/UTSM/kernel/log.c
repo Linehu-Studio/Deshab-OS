@@ -22,6 +22,10 @@ u32 log_get_length(void) {
 }
 
 static void log_emit(const char *s) {
+    /* Phase7: 日志行临界区——抢占可能把一行日志切成两半（串口与
+     * BOOTLOG 缓冲都会花），pushfq/popfq 保存并恢复本上下文的 IF。 */
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     serial_write(s);
     if (g_log_capture_on && s) {
         while (*s) {
@@ -30,6 +34,13 @@ static void log_emit(const char *s) {
             }
             s++;
         }
+    }
+    /* BUG-GP-IRET: 只恢复 IF，不做全量 popfq。全量 popfq 会把进入本
+     * 函数前 flags 里的历史污染位（如 NT=1）原样写回 RFLAGS 并在上下文
+     * 间传播（NT=1 时下一次 iretq 直接 #GP(0)）。本临界区的语义仅仅是
+     * "保存并恢复 IF"。 */
+    if (flags & (1ULL << 9)) {        /* 恢复进入前的 IF */
+        __asm__ volatile("sti" ::: "memory");
     }
 }
 

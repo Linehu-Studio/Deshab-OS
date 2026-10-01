@@ -2,6 +2,7 @@
 #include <utsm/arena.h>
 #include <utsm/utsm.h>
 #include <utsm/drr.h>
+#include <utsm/sched_ext.h>
 #include <utsm/dkm.h>
 #include <utsm/idt.h>
 #include <utsm/dsk.h>
@@ -21,6 +22,7 @@ extern volatile struct limine_module_request g_module_request;
 
 /* dkm/manifest.c: 带 FUCK [drivers] 过滤的 manifest 加载入口 */
 void dsm_load_by_manifest_ex(const ini_config *cfg);
+void dsm_load_named(const ini_config *cfg, const char *name);
 
 /* dsk_loader.c: 按路径读取 FAT32 文件到 g_dsk_fat32_filedata 静态缓冲。
  * Phase 1 已支持 LFN 长文件名 + 子目录遍历。 */
@@ -43,6 +45,7 @@ char g_compat_linux_guest_path[64]  = "/usr/lib/deshab";  /* Linux guest 内库�
 int  g_compat_linux_lib_sync        = 1;                  /* 启动时推送 .so 到 Linux guest */
 int  g_compat_pe_dll_search         = 1;                  /* PE 加载时从 FAT32 lib 搜索真实 DLL */
 int  g_compat_vscode_install        = 1;                  /* 启动时安装 VSCode tarball 到 guest /opt */
+int  g_sched_enabled_cfg            = 1;                  /* FUCK [sched] enable */
 
 /* 将 FUCK [compat] 区的配置应用到兼容层全局变量。
  * 必须在 utsm_apply_config 之后调用。 */
@@ -346,6 +349,24 @@ void kernel_main(void) {
     INSTR_TS_END(ts_utsm, "utsm_init");
     log_info("[UTSM] init ok");
 
+    /* === SAS-R0-PCQ 调度器：bootstrap 任务绑定（Phase 7） ===
+     * 只做 sched_init + cpu_init + bootstrap TCB（绑定当前 rsp），
+     * 不开中断、不碰定时器，对既有启动行为零影响。
+     * 抢占在 selftest 之后、demo 窗口内才启用。 */
+    {
+        u32 s_tick_hz  = (u32)ini_get_int(cfg, "sched", "tick_hz", 100);
+        u32 s_slice_ms = (u32)ini_get_int(cfg, "sched", "timeslice_ms", 10);
+        u32 s_demo_ms  = (u32)ini_get_int(cfg, "sched", "demo_ms", 1000);
+        int s_demo_fault = ini_get_bool(cfg, "sched", "demo_fault", 0);
+        g_sched_enabled_cfg = ini_get_bool(cfg, "sched", "enable", 1);
+        utsm_sched_config(s_tick_hz, s_slice_ms, s_demo_ms, s_demo_fault);
+        log_hex64("[SCHED] cfg enable=", (u64)g_sched_enabled_cfg);
+        log_hex64("[SCHED] cfg demo_ms=", s_demo_ms);
+        if (utsm_sched_bootstrap_init() < 0) {
+            log_warn("[UTSM] scheduler bootstrap failed (non-fatal)");
+        }
+    }
+
     INSTR_TS_DECL(ts_dkm);
     INSTR_TS_BEGIN(ts_dkm);
     dkm_init();
@@ -370,6 +391,12 @@ void kernel_main(void) {
         if (vmm_st == 0) {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
             log_info("[UTSM] VMM self-test PASS");
+
+            /* Only pci+ahci before linux_launch. Loading apic/stage0 first
+             * left the guest in an IDTR=0 VM-exit storm. Remaining DKM
+             * still loads after the guest parks. */
+            dsm_load_named(cfg, "pci");
+            dsm_load_named(cfg, "ahci");
 
             /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 === */
             int run_linux = ini_get_bool(cfg, "boot", "linux_guest", 1);
@@ -462,6 +489,14 @@ void kernel_main(void) {
         log_info("[UTSM] selftest skipped by FUCK config");
     }
 
+    /* === SAS-R0-PCQ 调度器：demo 任务 + LAPIC tick 抢占启用（Phase 7） ===
+     * 此刻 DKM 全部驱动加载完毕（timer.drv 的 PIT 校准已完成且此后无人
+     * 再用 PIT）、VMM/Linux/XJ380 guest 已 park/terminate —— LAPIC timer
+     * 接管 tick 源。demo 窗口内 bootstrap 被周期抢占，demo 任务交错运行。 */
+    if (g_sched_enabled_cfg) {
+        utsm_sched_demo_window();
+    }
+
     /* ---- 插桩: DSK 加载跳转前记录 ---- */
     INSTR_PROBE(DSK0, 0, 0, 0, 0);
 
@@ -476,9 +511,14 @@ void kernel_main(void) {
     {
         int disk_log = ini_get_bool(cfg, "boot", "disk_log", 0);
         if (disk_log) {
-            disk_log_flush();
+        disk_log_flush();
         }
     }
+
+    /* === 调度器静默（Phase 7/8 收尾） ===
+     * 停 LAPIC timer、注销 tick/异常 handler、杀 demo 任务——保证
+     * dsk_load_and_jump 的 DSK 交接路径与无调度器时逐字节一致。 */
+    utsm_sched_quiesce();
 
     if (dsk_load_and_jump() != 0) {
         log_error("[UTSM] DSK jump failed");
@@ -487,5 +527,5 @@ void kernel_main(void) {
     /* ---- 插桩: 启动总耗时（仅在 DSK 跳转失败时可见） ---- */
     INSTR_TS_END(boot_total, "boot_total");
 
-    arch_halt_forever();
+    arch_halt_forever();/*I LOVE YOU*/
 }

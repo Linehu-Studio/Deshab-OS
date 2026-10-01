@@ -1,0 +1,831 @@
+#!/usr/local/bin/utsm_run
+# Start Plasma on the UTSM virtio-gpu 2D device.
+# musl busybox.static PUSH-faults at address 0 (leaked SHSTK). Use bash.
+# Wayland/KWin DRM does not issue SET_SCANOUT, so the host never sees a
+# frame. Xfbdev/Xorg is the path that actually lights scanout; Plasma
+# then runs as an X11 client on DISPLAY=:0.
+printf '[deshab-kde] interpreter alive inside=pre\n' >/dev/kmsg 2>/dev/null || true
+# Persist must not abort the session. Do not remount / rw: that is vdb
+# (Arch rootfs) and dirtying it yields ext4 checksum errors.
+# Skip the probe when already inside the extra-rootfs chroot.
+set +e
+INSIDE=0
+for arg in "$@"; do
+    if [ "$arg" = "--inside" ]; then
+        INSIDE=1
+    fi
+done
+if [ "$INSIDE" -eq 0 ] && [ ! -e /etc/deshab-kde-root ]; then
+    printf '[deshab-kde] persist: probe\n' >/dev/kmsg 2>/dev/null || true
+    grep -E 'persist|vdc' /proc/mounts >/dev/kmsg 2>/dev/null || true
+    if [ -x /mnt/persist/usr/bin/startplasma-x11 ] || \
+       [ -x /mnt/persist/usr/bin/startplasma-wayland ]; then
+        printf '[deshab-kde] persist already has startplasma\n' >/dev/kmsg 2>/dev/null || true
+    elif grep -q ' /mnt/persist ' /proc/mounts 2>/dev/null; then
+        printf '[deshab-kde] persist mounted but startplasma missing\n' >/dev/kmsg 2>/dev/null || true
+    else
+        printf '[deshab-kde] remounting /dev/vdc ro on /mnt/persist\n' >/dev/kmsg 2>/dev/null || true
+        mkdir -p /mnt/persist 2>/dev/null || true
+        mount -t ext4 -o ro,noload /dev/vdc /mnt/persist
+        if [ ! -x /mnt/persist/usr/bin/startplasma-x11 ]; then
+            src=$(awk '$1 == "/dev/vdc" { print $2; exit }' /proc/mounts)
+            if [ -n "$src" ] && [ "$src" != /mnt/persist ]; then
+                printf '[deshab-kde] bind %s -> /mnt/persist\n' "$src" >/dev/kmsg 2>/dev/null || true
+                mount -o bind "$src" /mnt/persist 2>/dev/null || true
+            fi
+        fi
+        if [ ! -x /mnt/persist/usr/bin/startplasma-x11 ]; then
+            printf '[deshab-kde] persist remount failed\n' >/dev/kmsg 2>/dev/null || true
+        fi
+    fi
+    printf '[deshab-kde] persist check done\n' >/dev/kmsg 2>/dev/null || true
+fi
+set +e
+
+KDE_ROOT="${DESHAB_KDE_ROOT:-/mnt/persist}"
+SESSION_USER="${DESHAB_KDE_USER:-deshab}"
+SOFTWARE_RENDERING="${DESHAB_KDE_SOFTWARE_RENDERING:-1}"
+SEATD_PID=""
+XFBDEV_PID=""
+
+printf '[deshab-kde] interpreter alive inside=%s\n' "$INSIDE" > /dev/kmsg 2>/dev/null || true
+
+log() {
+    printf '[deshab-kde] %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true
+    printf '[deshab-kde] %s\n' "$*" > /dev/kmsg 2>/dev/null || true
+    printf '[deshab-kde] %s\n' "$*" > /dev/console 2>/dev/null || true
+    printf '[deshab-kde] %s\n' "$*" >&2
+}
+
+# /dev/kmsg drops bursts. Always also hit console via log().
+dump_file() {
+    local f="$1" max="${2:-40}" n=0
+    if [ ! -f "$f" ]; then
+        log "missing $f"
+        return 1
+    fi
+    log "file $f bytes=$(wc -c < "$f" 2>/dev/null || echo 0)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        [ "$n" -gt "$max" ] && break
+        log "$f:$line"
+    done < "$f"
+    return 0
+}
+
+cleanup_session() {
+    set +e
+    if [ -n "$SEATD_PID" ]; then
+        kill "$SEATD_PID" 2>/dev/null || true
+        wait "$SEATD_PID" 2>/dev/null || true
+    fi
+    if [ -n "$XFBDEV_PID" ]; then
+        kill "$XFBDEV_PID" 2>/dev/null || true
+        wait "$XFBDEV_PID" 2>/dev/null || true
+    fi
+    # persist /bin/umount SIGSEGVs in ld.so; overlay is discarded on reboot.
+}
+trap cleanup_session EXIT INT TERM
+
+start_xfbdev() {
+    if [ -S /tmp/.X11-unix/X0 ]; then
+        log "X socket already present"
+        return 0
+    fi
+    if ! command -v Xfbdev >/dev/null 2>&1; then
+        log "Xfbdev not on guest root; Xorg inside the KDE chroot will be used"
+        return 1
+    fi
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+    mkdir -p /tmp/.X11-unix
+    chmod 1777 /tmp /tmp/.X11-unix
+    log "starting Xfbdev :0 1024x768"
+    Xfbdev :0 -geometry 1024x768 -depth 32 >/dev/null 2>&1 &
+    XFBDEV_PID=$!
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -S /tmp/.X11-unix/X0 ]; then
+            log "Xfbdev socket ready"
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    log "WARNING: Xfbdev socket not seen yet, continuing"
+    return 0
+}
+
+if [ "$INSIDE" -eq 0 ] && [ ! -e /etc/deshab-kde-root ]; then
+    LOG_FILE="$KDE_ROOT/var/log/deshab-kde-session.log"
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[deshab-kde] ERROR: entering the KDE chroot requires root" >&2
+        exit 1
+    fi
+    printf '[deshab-kde] looking for startplasma in %s\n' "$KDE_ROOT" >/dev/kmsg 2>/dev/null || true
+    set +e
+    if [ ! -x "$KDE_ROOT/usr/bin/startplasma-x11" ] && \
+       [ ! -x "$KDE_ROOT/usr/bin/startplasma-wayland" ]; then
+        echo "[deshab-kde] ERROR: no prepared KDE root at $KDE_ROOT" >&2
+        printf '[deshab-kde] ERROR: no startplasma at %s\n' "$KDE_ROOT" >/dev/kmsg 2>/dev/null || true
+        exit 1
+    fi
+
+    # persist ld.so SIGSEGVs at 0 (SHSTK). vdb mount/libmount inodes fail
+    # checksum at runtime. Use the static helper that already matches the
+    # working daemon toolchain.
+    BINDMOUNT=/usr/local/bin/utsm_bindmount
+    PERSIST_LD=""
+    for ld in \
+        "$KDE_ROOT/usr/lib/ld-linux-x86-64.so.2" \
+        "$KDE_ROOT/lib64/ld-linux-x86-64.so.2" \
+        "$KDE_ROOT/lib/ld-linux-x86-64.so.2"; do
+        if [ -x "$ld" ]; then
+            PERSIST_LD="$ld"
+            break
+        fi
+    done
+    PERSIST_LIBS="$KDE_ROOT/usr/lib:$KDE_ROOT/lib:$KDE_ROOT/usr/lib64"
+    kde_mount() {
+        if [ -x "$BINDMOUNT" ]; then
+            if [ "$1" = --bind ] && [ -n "$2" ] && [ -n "$3" ]; then
+                "$BINDMOUNT" bind "$2" "$3"
+                return $?
+            fi
+            if [ "$1" = --make-slave ] && [ -n "$2" ]; then
+                "$BINDMOUNT" slave "$2"
+                return $?
+            fi
+            if [ "$1" = -o ] && [ "$2" = bind ] && [ -n "$3" ] && [ -n "$4" ]; then
+                "$BINDMOUNT" bind "$3" "$4"
+                return $?
+            fi
+            if [ "$1" = -t ] && [ "$3" = -o ] && [ -n "$5" ] && [ -n "$6" ]; then
+                "$BINDMOUNT" fstype "$2" "$5" "$6" "$4"
+                return $?
+            fi
+            if [ "$1" = -t ] && [ -n "$2" ] && [ -n "$3" ] && [ -n "$4" ]; then
+                "$BINDMOUNT" fstype "$2" "$3" "$4"
+                return $?
+            fi
+        fi
+        /bin/mount "$@"
+    }
+    log "bindmount=$BINDMOUNT persist_ld=$PERSIST_LD"
+    # Do not chmod persist bind targets: overlay copy-up of /dev then
+    # makes MS_BIND fail. Do not put vdb /usr/bin first on PATH while
+    # LD_LIBRARY_PATH is persist (vdb ls SIGSEGVs in ld.so).
+
+    mkdir -p "$KDE_ROOT/dev" "$KDE_ROOT/proc" "$KDE_ROOT/sys" \
+             "$KDE_ROOT/run" "$KDE_ROOT/tmp" "$KDE_ROOT/var/log"
+    touch "$LOG_FILE"
+    rm -f /tmp/deshab-native
+    log "entering KDE root at $KDE_ROOT"
+    start_xfbdev || true
+
+    # persist /dev /proc /sys /run are 0555 placeholders. rbind of /dev
+    # fails here (stderr is /dev/null from the async daemon). Use bind,
+    # chmod first, and keep going with a seeded /dev if needed.
+    bind_guest_fs() {
+        local name="$1"
+        local src="/$name"
+        local target="$KDE_ROOT/$name"
+        local err=""
+        if [ -L "$target" ]; then
+            rm -f "$target"
+        fi
+        mkdir -p "$target" 2>/dev/null || true
+        if grep -q " $target " /proc/mounts 2>/dev/null; then
+            return 0
+        fi
+        if [ ! -d "$src" ]; then
+            log "WARNING: $src missing"
+            return 1
+        fi
+        err=$(kde_mount --bind "$src" "$target" 2>&1)
+        if [ $? -eq 0 ]; then
+            kde_mount --make-slave "$target" 2>/dev/null || true
+            log "bound $src -> $target"
+            return 0
+        fi
+        err=$(kde_mount -o bind "$src" "$target" 2>&1)
+        if [ $? -eq 0 ]; then
+            log "bound -o bind $src -> $target"
+            return 0
+        fi
+        log "ERROR: bind $src -> $target failed: $err"
+        log "bind diag src=$(ls -ld "$src" 2>/dev/null) tgt=$(ls -ld "$target" 2>/dev/null)"
+        return 1
+    }
+
+    seed_dev() {
+        local target="$KDE_ROOT/dev"
+        local n
+        mkdir -p "$target"
+        chmod 0755 "$target" 2>/dev/null || true
+        for n in null zero urandom random tty tty0 console kmsg fb0; do
+            if [ -e "/dev/$n" ] && [ ! -e "$target/$n" ]; then
+                cp -a "/dev/$n" "$target/$n" 2>/dev/null || true
+            fi
+        done
+        for n in dri input pts shm; do
+            if [ -d "/dev/$n" ]; then
+                mkdir -p "$target/$n"
+                chmod 0755 "$target/$n" 2>/dev/null || true
+                if ! grep -q " $target/$n " /proc/mounts 2>/dev/null; then
+                    kde_mount --bind "/dev/$n" "$target/$n" 2>/dev/null || \
+                        kde_mount -o bind "/dev/$n" "$target/$n" 2>/dev/null || true
+                fi
+            fi
+        done
+        if [ ! -d "$target/pts" ]; then
+            mkdir -p "$target/pts"
+            kde_mount -t devpts devpts "$target/pts" 2>/dev/null || true
+        fi
+    }
+
+    for fs in dev proc sys; do
+        if ! bind_guest_fs "$fs"; then
+            if [ "$fs" = dev ]; then
+                log "seeding /dev into the KDE root after bind failure"
+                seed_dev
+            else
+                log "ERROR: could not bind /$fs into the KDE root"
+                exit 1
+            fi
+        fi
+    done
+    # vdb is mounted ro. Binding its /tmp or /run makes those
+    # directories read-only, so Xorg cannot create /tmp/.X11-unix
+    # and seatd cannot create /run/seatd.sock.
+    # BUG-XORG-SEGV 最终方案：不再让 chroot 自启 Xorg（vdb ld.so + persist
+    # 库组合在 ld.so 0x15ded NULL+8 segfault，即使换 ld.so/换库集都复现）。
+    # 改为把宿主 /tmp、/run bind 进 chroot：native 桌面的 Xorg 套接字
+    # /tmp/.X11-unix/X0 与 seatd.sock 直接可见，inner session 检测到
+    # socket 已存在就跳过自启 Xorg，Plasma 作为 X11 客户端直连活着的
+    # X server（-ac 无鉴权，协议层互通，与 Xorg 的加载器问题无关）。
+    for fs in tmp run; do
+        mkdir -p "$KDE_ROOT/$fs"
+        if kde_mount --bind "/$fs" "$KDE_ROOT/$fs"; then
+            log "bound host /$fs -> $KDE_ROOT/$fs"
+        elif kde_mount -t tmpfs tmpfs "$KDE_ROOT/$fs"; then
+            log "fallback tmpfs on $KDE_ROOT/$fs"
+        else
+            log "ERROR: mount $KDE_ROOT/$fs failed"
+        fi
+    done
+    chmod 1777 "$KDE_ROOT/tmp" 2>/dev/null || true
+    mkdir -p "$KDE_ROOT/tmp/.X11-unix" "$KDE_ROOT/run/user"
+    chmod 1777 "$KDE_ROOT/tmp/.X11-unix" 2>/dev/null || true
+    if [ -d /dev/pts ] && [ -d "$KDE_ROOT/dev/pts" ] && \
+       ! grep -q " $KDE_ROOT/dev/pts " /proc/mounts 2>/dev/null; then
+        kde_mount --bind /dev/pts "$KDE_ROOT/dev/pts" 2>/dev/null || \
+            kde_mount -t devpts devpts "$KDE_ROOT/dev/pts" 2>/dev/null || true
+    fi
+    mkdir -p "$KDE_ROOT/home/$SESSION_USER/Desktop"
+    mkdir -p /mnt/deshab-esp
+    if ! grep -q ' /mnt/deshab-esp ' /proc/mounts 2>/dev/null; then
+        if [ -e /dev/disk/by-label/DESHABBOOT ]; then
+            kde_mount -t vfat -o rw,utf8,shortname=mixed \
+                /dev/disk/by-label/DESHABBOOT /mnt/deshab-esp 2>/dev/null || \
+            kde_mount -t vfat -o rw /dev/disk/by-label/DESHABBOOT /mnt/deshab-esp \
+                2>/dev/null || true
+        fi
+        if ! grep -q ' /mnt/deshab-esp ' /proc/mounts 2>/dev/null; then
+            for d in /dev/vda1 /dev/sda1 /dev/vda /dev/sda; do
+                [ -b "$d" ] || continue
+                if kde_mount -t vfat -o rw,utf8,shortname=mixed "$d" /mnt/deshab-esp 2>/dev/null; then
+                    break
+                fi
+            done
+        fi
+    fi
+    if [ -d /mnt/deshab-esp/user/desktop ]; then
+        if ! grep -q " $KDE_ROOT/home/$SESSION_USER/Desktop " /proc/mounts 2>/dev/null; then
+            kde_mount --bind /mnt/deshab-esp/user/desktop \
+                "$KDE_ROOT/home/$SESSION_USER/Desktop" 2>/dev/null || true
+        fi
+        log "Plasma Desktop bound to ESP user/desktop"
+    fi
+    if [ ! -d "$KDE_ROOT/home/$SESSION_USER/Desktop" ] || \
+       [ -z "$(ls -A "$KDE_ROOT/home/$SESSION_USER/Desktop" 2>/dev/null)" ]; then
+        if [ -d /usr/local/share/deshab-desktop ]; then
+            cp -a /usr/local/share/deshab-desktop/. \
+                "$KDE_ROOT/home/$SESSION_USER/Desktop/" 2>/dev/null || true
+        elif [ -d "$KDE_ROOT/usr/local/share/deshab-desktop" ]; then
+            cp -a "$KDE_ROOT/usr/local/share/deshab-desktop/." \
+                "$KDE_ROOT/home/$SESSION_USER/Desktop/" 2>/dev/null || true
+        fi
+        log "Plasma Desktop filled from deshab-desktop copy (ESP bind unavailable)"
+    fi
+    chown -R "$SESSION_USER:$SESSION_USER" \
+        "$KDE_ROOT/home/$SESSION_USER/Desktop" 2>/dev/null || true
+
+    set +e
+    export DESHAB_KDE_USER="$SESSION_USER"
+    export DESHAB_KDE_SOFTWARE_RENDERING="$SOFTWARE_RENDERING"
+    export DISPLAY=:0
+    export GLIBC_TUNABLES=glibc.cpu.hwcaps=-IBT,-SHSTK,-AVX,-AVX2,-AVX512F
+    # persist ld.so SIGSEGVs at NULL+8 (offset 0x15ded) on Xorg/dbus/umount.
+    # persist bash survived that loader; other bins did not. Bind vdb's
+    # interpreter over persist's so new execs match the working pre-chroot
+    # path (vdb ld.so + persist libraries). Do not overlay vdb libc.
+    VDB_LD=/lib64/ld-linux-x86-64.so.2
+    mkdir -p "$KDE_ROOT/usr/local/bin" "$KDE_ROOT/usr/local/lib"
+    if [ -n "$PERSIST_LD" ]; then
+        cp -f "$PERSIST_LD" "$KDE_ROOT/usr/local/lib/ld-persist.so" 2>/dev/null || true
+        chmod 0755 "$KDE_ROOT/usr/local/lib/ld-persist.so" 2>/dev/null || true
+        log "saved persist ld.so to /usr/local/lib/ld-persist.so"
+    fi
+    if [ -x /usr/local/bin/deshab-kde-session ]; then
+        cp -f /usr/local/bin/deshab-kde-session \
+            "$KDE_ROOT/usr/local/bin/deshab-kde-session" 2>/dev/null || true
+        chmod 0755 "$KDE_ROOT/usr/local/bin/deshab-kde-session" 2>/dev/null || true
+        log "copied session onto persist overlay"
+    fi
+    if [ -x /usr/local/bin/utsm_bindmount ]; then
+        cp -f /usr/local/bin/utsm_bindmount \
+            "$KDE_ROOT/usr/local/bin/utsm_bindmount" 2>/dev/null || true
+        chmod 0755 "$KDE_ROOT/usr/local/bin/utsm_bindmount" 2>/dev/null || true
+    fi
+    if [ -x /usr/local/bin/utsm_run ]; then
+        cp -f /usr/local/bin/utsm_run \
+            "$KDE_ROOT/usr/local/bin/utsm_run" 2>/dev/null || true
+        chmod 0755 "$KDE_ROOT/usr/local/bin/utsm_run" 2>/dev/null || true
+    fi
+    if [ -x /usr/local/lib/Xorg.good ]; then
+        if kde_mount --bind /usr/local/lib/Xorg.good "$KDE_ROOT/usr/lib/Xorg"; then
+            log "bound vdb Xorg.good over persist /usr/lib/Xorg"
+        fi
+    fi
+    if [ -d /usr/local/lib/xorg-libs ]; then
+        mkdir -p "$KDE_ROOT/usr/local/lib/xorg-libs"
+        if kde_mount --bind /usr/local/lib/xorg-libs "$KDE_ROOT/usr/local/lib/xorg-libs"; then
+            log "bound xorg-libs ($(ls /usr/local/lib/xorg-libs | wc -l))"
+        fi
+    fi
+    # plasma-libs: Qt6/KF6 等新增好库。只给 Plasma 的 ldpath 用——Xorg 的
+    # 加载环境保持 12:18 验证过的纯 xorg-libs 集（扩大 overlay 会让
+    # vdb ld.so 在加载期 segfault，见 /tmp/xorg.err 为空的 rc=139）。
+    if [ -d /usr/local/lib/plasma-libs ]; then
+        mkdir -p "$KDE_ROOT/usr/local/lib/plasma-libs"
+        if kde_mount --bind /usr/local/lib/plasma-libs "$KDE_ROOT/usr/local/lib/plasma-libs"; then
+            log "bound plasma-libs ($(ls /usr/local/lib/plasma-libs | wc -l))"
+        fi
+    fi
+    # BUG-XORG-SEGV 根修：persist /usr/lib 有 140 个损坏库（ld.so 解析即
+    # NULL+8 segfault）。repair.txt（由注入管线生成）把每个坏实体的好副
+    # 本 bind 到 persist 路径上，ld.so 回落解析时命中的也全是好文件。
+    if [ -f /usr/local/lib/xorg-libs/repair.txt ] && [ -x "$BINDMOUNT" ]; then
+        ok=0; fail=0
+        while IFS='|' read -r src dst; do
+            [ -z "$src" ] && continue
+            # bindmount 在 chroot 外执行：src/dst 都要加 $KDE_ROOT 前缀
+            if [ -e "$KDE_ROOT$src" ] && kde_mount --bind "$KDE_ROOT$src" "$KDE_ROOT$dst" 2>/dev/null; then
+                ok=$((ok + 1))
+            else
+                fail=$((fail + 1))
+            fi
+        done < /usr/local/lib/xorg-libs/repair.txt
+        log "persist repair binds: ok=$ok fail=$fail"
+    fi
+    if [ -f /usr/local/lib/xorg/modules/drivers/modesetting_drv.so ]; then
+        mkdir -p "$KDE_ROOT/usr/local/lib/xorg/modules/drivers"
+        if kde_mount --bind /usr/local/lib/xorg/modules \
+            "$KDE_ROOT/usr/local/lib/xorg/modules"; then
+            log "bound xorg modules"
+        fi
+    fi
+    # BUG-XORG-SEGV 复盘：0x15ded 崩点=persist ld.so 已知 bug；12:18 好运行
+    # 中 vdb-ld bind 处于激活态（umount EBUSY=未卸载）且 Xorg 存活 → bind
+    # 是必需的。之前"过时论"判断有误，恢复默认启用。
+    if [ -x "$VDB_LD" ]; then
+        for dest in \
+            "$KDE_ROOT/lib64/ld-linux-x86-64.so.2" \
+            "$KDE_ROOT/usr/lib/ld-linux-x86-64.so.2" \
+            "$KDE_ROOT/lib/ld-linux-x86-64.so.2"; do
+            [ -e "$dest" ] || [ -L "$dest" ] || continue
+            if kde_mount --bind "$VDB_LD" "$dest"; then
+                log "bound vdb ld.so over $dest"
+            elif cp -f "$VDB_LD" "$dest"; then
+                log "copied vdb ld.so over $dest"
+            fi
+        done
+    fi
+    # BUG-CHROOT-127: 引导期 chroot 的 persist bash 必须只用 persist 自带
+    # 库。宿主侧继承的 LD_LIBRARY_PATH（xorg-libs overlay）会让 chroot 内
+    # 加载器优先吃 overlay 库，其中部分与 persist glibc 版本错位 → bash
+    # 加载失败 → status 127。Xorg/Plasma 阶段会显式重新设置该变量。
+    log "bootstrap ldpath=${LD_LIBRARY_PATH:-unset}"
+    unset LD_LIBRARY_PATH
+    if [ -x "$KDE_ROOT/usr/bin/bash" ]; then
+        log "preflight persist bash"
+        "$BINDMOUNT" chroot "$KDE_ROOT" /usr/bin/bash -c \
+            'printf "[deshab-kde] persist-bash-ok\n" >/dev/kmsg' || \
+            log "WARNING: persist bash preflight failed"
+    fi
+    if [ -x "$BINDMOUNT" ]; then
+        log "chroot via utsm_bindmount bash -c"
+        "$BINDMOUNT" chroot "$KDE_ROOT" /usr/bin/bash -c \
+            'printf "[deshab-kde] inside-bash\n" >/dev/kmsg; ls -l /usr/local/bin/deshab-kde-session /usr/bin/bash /etc/deshab-kde-root /usr/bin/startplasma-x11 >/dev/kmsg 2>&1; exec /usr/local/bin/deshab-kde-session --inside'
+        status=$?
+    else
+        chroot "$KDE_ROOT" /usr/bin/bash \
+            /usr/local/bin/deshab-kde-session --inside
+        status=$?
+    fi
+    set -e
+    log "chroot session exited with status $status"
+    exit "$status"
+fi
+
+LOG_FILE="/var/log/deshab-kde-session.log"
+set +e
+touch "$LOG_FILE"
+export GLIBC_TUNABLES=glibc.cpu.hwcaps=-IBT,-SHSTK,-AVX,-AVX2,-AVX512F
+export LIBSEAT_BACKEND=seatd
+export XDG_SEAT=seat0
+export XDG_VTNR=1
+log "inside setup begin"
+# Xorg 段错误取证：内核打印 fatal signal 现场（RIP 所在库+偏移），
+# 早于 Plasma 阶段的同名设置——Xorg 启动在先。
+echo 1 >/proc/sys/kernel/print-fatal-signals 2>/dev/null || true
+if ! touch /tmp/.deshab-w 2>/dev/null; then
+    log "WARNING: /tmp not writable, mounting tmpfs"
+    if [ -x /usr/local/bin/utsm_bindmount ]; then
+        /usr/local/bin/utsm_bindmount fstype tmpfs tmpfs /tmp || true
+    fi
+    mkdir -p /tmp/.X11-unix
+    chmod 1777 /tmp /tmp/.X11-unix 2>/dev/null || true
+fi
+if ! touch /run/.deshab-w 2>/dev/null; then
+    log "WARNING: /run not writable, mounting tmpfs"
+    if [ -x /usr/local/bin/utsm_bindmount ]; then
+        /usr/local/bin/utsm_bindmount fstype tmpfs tmpfs /run || true
+    fi
+fi
+log "tmp_w=$([ -w /tmp ] && echo y || echo n) run_w=$([ -w /run ] && echo y || echo n)"
+if [ "$(id -u)" -ne 0 ]; then
+    log "ERROR: session setup must start as root"
+    exit 1
+fi
+if ! id "$SESSION_USER" >/dev/null 2>&1; then
+    log "ERROR: session user does not exist: $SESSION_USER"
+    exit 1
+fi
+if [ ! -e /dev/dri/card0 ]; then
+    log "ERROR: /dev/dri/card0 is unavailable; leaving the fallback console intact"
+    exit 1
+fi
+
+if [ -w /etc ] || [ -w /etc/machine-id ]; then
+    dbus-uuidgen --ensure=/etc/machine-id >/tmp/dbus-uuidgen.out 2>&1 || \
+        log "dbus-uuidgen skipped (see /tmp/dbus-uuidgen.out)"
+fi
+if [ ! -s /etc/machine-id ]; then
+    printf '00000000000000000000000000000000\n' >/tmp/machine-id 2>/dev/null || true
+    if [ -w /etc ]; then
+        cp /tmp/machine-id /etc/machine-id 2>/dev/null || true
+    fi
+fi
+session_uid="$(id -u "$SESSION_USER")"
+session_gid="$(id -g "$SESSION_USER")"
+runtime_dir="/run/user/$session_uid"
+install -d -m 0700 -o "$session_uid" -g "$session_gid" "$runtime_dir"
+
+if command -v seatd >/dev/null 2>&1 && [ ! -S /run/seatd.sock ]; then
+    log "starting seatd for the non-systemd guest session"
+    seatd -g video >>"$LOG_FILE" 2>&1 &
+    SEATD_PID=$!
+    s=0
+    while [ ! -S /run/seatd.sock ] && [ "$s" -lt 10 ]; do
+        if [ -x /usr/local/bin/utsm_bindmount ]; then
+            /usr/local/bin/utsm_bindmount msleep 100
+        fi
+        s=$((s + 1))
+    done
+fi
+log "seatd_sock=$([ -S /run/seatd.sock ] && echo y || echo n) dri=$(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+[ -e /dev/tty0 ] || mknod /dev/tty0 c 4 0 2>/dev/null || true
+[ -e /dev/tty1 ] || mknod /dev/tty1 c 4 1 2>/dev/null || true
+log "tty=$(ls -l /dev/tty0 /dev/tty1 /dev/console 2>&1 | tr '\n' ' ')"
+
+# BUG-XORG-SEGV: 宿主 /tmp 已 bind 进 chroot（native 桌面的 Xorg 套接字
+# 共享可见）。native Xorg 可能比本会话晚一点起来——等待其套接字出现，
+# 出现即完全跳过 chroot 自启 Xorg（该路径在 ld.so 0x15ded 必崩）。
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+    w=0
+    while [ ! -S /tmp/.X11-unix/X0 ] && [ "$w" -lt 40 ]; do
+        if [ -x /usr/local/bin/utsm_bindmount ]; then
+            /usr/local/bin/utsm_bindmount msleep 300
+        fi
+        w=$((w + 1))
+    done
+    log "native Xorg socket wait: tries=$w found=$([ -S /tmp/.X11-unix/X0 ] && echo y || echo n)"
+fi
+
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+    mkdir -p /tmp/.X11-unix /etc/X11
+    chmod 1777 /tmp /tmp/.X11-unix
+    if command -v Xorg >/dev/null 2>&1; then
+        mkdir -p /etc/X11 /tmp /tmp/deshab-xorg-empty
+        cat > /tmp/deshab-xorg.conf <<'XORG_EOF'
+Section "Files"
+    ModulePath "/usr/local/lib/xorg/modules"
+    ModulePath "/usr/lib/xorg/modules"
+EndSection
+Section "ServerLayout"
+    Identifier "Layout0"
+    Screen 0 "Screen0"
+EndSection
+Section "ServerFlags"
+    Option "AutoAddDevices" "off"
+    Option "AutoEnableDevices" "off"
+    Option "AutoAddGPU" "false"
+    Option "AllowEmptyInput" "on"
+    Option "DontVTSwitch" "on"
+EndSection
+Section "Device"
+    Identifier "VirtioGPU"
+    Driver "modesetting"
+    Option "AccelMethod" "none"
+    Option "SWcursor" "on"
+    Option "kmsdev" "/dev/dri/card0"
+EndSection
+Section "Screen"
+    Identifier "Screen0"
+    Device "VirtioGPU"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1024x768"
+    EndSubSection
+EndSection
+XORG_EOF
+        if [ -w /etc/X11 ]; then
+            cp /tmp/deshab-xorg.conf /etc/X11/xorg.conf 2>/dev/null || true
+        fi
+        # /usr/bin/Xorg is a 271-byte sh wrapper that execs suid Xorg.wrap.
+        # The wrap exits immediately in this guest. Run the real server.
+        # persist /usr/lib/Xorg is 2.6MB but its ELF header is smashed
+        # (e_entry=0, 14KB .text). Bind the known-good Arch binary from vdb.
+        if [ -x /usr/local/lib/Xorg.good ]; then
+            if [ -x /usr/local/bin/utsm_bindmount ]; then
+                /usr/local/bin/utsm_bindmount bind /usr/local/lib/Xorg.good \
+                    /usr/lib/Xorg >/tmp/xorg.bind 2>&1 || \
+                    cp -f /usr/local/lib/Xorg.good /usr/lib/Xorg
+            else
+                cp -f /usr/local/lib/Xorg.good /usr/lib/Xorg
+            fi
+            log "using Xorg.good over /usr/lib/Xorg"
+        fi
+        if [ -x /usr/lib/Xorg ]; then
+            XORG_BIN=/usr/lib/Xorg
+        elif [ -x /usr/lib/xorg/Xorg ]; then
+            XORG_BIN=/usr/lib/xorg/Xorg
+        else
+            XORG_BIN="$(command -v Xorg)"
+        fi
+        log "Xorg bin=$XORG_BIN"
+        log "drivers=$(ls /usr/lib/xorg/modules/drivers 2>/dev/null | tr '\n' ' ')"
+        rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 /tmp/Xorg.0.log /tmp/xorg.er
+        # vdb ld.so + persist Xorg SIGSEGVs at Xorg+0 (error 15).
+        # Bash is already loaded; drop the vdb interpreter bind so Xorg's
+        # PT_INTERP is persist ld.so again. Do not exec ld.so as argv[0].
+        XORG_RUN="$XORG_BIN"
+        if [ -x /usr/local/bin/utsm_bindmount ]; then
+            for p in /lib64/ld-linux-x86-64.so.2 \
+                     /usr/lib/ld-linux-x86-64.so.2 \
+                     /lib/ld-linux-x86-64.so.2; do
+                /usr/local/bin/utsm_bindmount umount "$p" >/tmp/umount.ld 2>&1
+                log "umount $p rc=$? $(tr '\n' ' ' < /tmp/umount.ld)"
+            done
+        fi
+        XORG_VT=""
+        XORG_IN="/dev/null"
+        if [ -e /dev/tty1 ]; then
+            XORG_VT=vt1
+            XORG_IN=/dev/tty1
+        fi
+        export LD_LIBRARY_PATH=/usr/local/lib/xorg-libs
+        # 取证：ld.so 解析追踪进 stderr（/tmp/xorg.err），崩溃前最后
+        # 一个 "file=" 即毒库。内核 fatal-signal 转储已在会话开头打开。
+        export LD_DEBUG=libs
+        log "ldpath=$LD_LIBRARY_PATH xlibs=$(ls /usr/local/lib/xorg-libs 2>/dev/null | wc -l)"
+        log "starting Xorg :0 $XORG_VT bin=$XORG_RUN nsexec"
+        if [ -x /usr/local/bin/utsm_bindmount ]; then
+            /usr/local/bin/utsm_bindmount nsexec "$XORG_RUN" :0 $XORG_VT \
+                -nolisten tcp -noreset -ac -keeptty \
+                -novtswitch -sharevts -verbose 6 -logverbose 6 \
+                -config /tmp/deshab-xorg.conf \
+                -configdir /tmp/deshab-xorg-empty \
+                -logfile /tmp/Xorg.0.log \
+                <"$XORG_IN" >>/tmp/xorg.err 2>&1 &
+        else
+            "$XORG_RUN" :0 $XORG_VT -nolisten tcp -noreset -ac -keeptty \
+                -novtswitch -sharevts -verbose 6 -logverbose 6 \
+                -config /tmp/deshab-xorg.conf \
+                -configdir /tmp/deshab-xorg-empty \
+                -logfile /tmp/Xorg.0.log \
+                <"$XORG_IN" >>/tmp/xorg.err 2>&1 &
+        fi
+        XFBDEV_PID=$!
+        log "Xorg pid=$XFBDEV_PID"
+        i=0
+        while [ ! -S /tmp/.X11-unix/X0 ] && [ "$i" -lt 20 ]; do
+            if [ -x /usr/local/bin/utsm_bindmount ]; then
+                /usr/local/bin/utsm_bindmount yield
+                /usr/local/bin/utsm_bindmount msleep 200
+            fi
+            i=$((i + 1))
+            alive=n
+            [ -n "$XFBDEV_PID" ] && [ -d "/proc/$XFBDEV_PID" ] && alive=y
+            if [ "$alive" = n ] || [ $((i % 5)) -eq 0 ]; then
+                log "Xorg wait ${i}s socket=$([ -S /tmp/.X11-unix/X0 ] && echo y || echo n) parent=$alive"
+            fi
+            if [ "$alive" = n ] && [ "$i" -ge 2 ]; then
+                wait "$XFBDEV_PID" 2>/dev/null
+                log "Xorg parent exited rc=$?"
+                break
+            fi
+        done
+        if [ -S /tmp/.X11-unix/X0 ]; then
+            log "Xorg socket ready"
+        else
+            log "WARNING: Xorg socket not ready"
+            log "tmp=$(ls -la /tmp /tmp/.X11-unix /var/log 2>&1 | tr '\n' '|')"
+            dump_file /tmp/xorg.err 60
+            # LD_DEBUG 追踪很长，崩点在末尾——tail 60 行找最后一个 file=
+            if [ -x /usr/local/bin/utsm_bindmount ]; then
+                /usr/local/bin/utsm_bindmount tail /tmp/xorg.err 60 \
+                    > /tmp/xorg.err.tail 2>/dev/null || true
+                while IFS= read -r line; do
+                    log "xorg.err.tail:$line"
+                done < /tmp/xorg.err.tail
+            fi
+            dump_file /tmp/Xorg.0.log 60
+            dump_file /var/log/Xorg.0.log 40
+            dump_file "$LOG_FILE" 20
+        fi
+    else
+        log "WARNING: no Xorg/Xfbdev in KDE root"
+    fi
+fi
+
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+    log "ERROR: no X11 socket; not starting Plasma"
+    exit 3
+fi
+
+log "selecting Plasma launcher"
+PLASMA_BIN=""
+if [ -x /usr/bin/startplasma-x11 ]; then
+    PLASMA_BIN=/usr/bin/startplasma-x11
+elif command -v startplasma-x11 >/dev/null 2>&1; then
+    PLASMA_BIN="$(command -v startplasma-x11)"
+fi
+
+if [ -z "$PLASMA_BIN" ]; then
+    log "startplasma-x11 missing; Plasma Wayland will not light virtio-gpu 2D scanout"
+    if [ -x /usr/bin/startplasma-wayland ]; then
+        PLASMA_BIN=/usr/bin/startplasma-wayland
+    fi
+fi
+if [ -z "$PLASMA_BIN" ]; then
+    log "ERROR: no Plasma session binary is installed"
+    exit 1
+fi
+
+DBUS_LAUNCH=""
+if [ -x /usr/lib/plasma-dbus-run-session-if-needed ]; then
+    DBUS_LAUNCH=/usr/lib/plasma-dbus-run-session-if-needed
+elif command -v dbus-run-session >/dev/null 2>&1; then
+    DBUS_LAUNCH="$(command -v dbus-run-session)"
+else
+    log "ERROR: no Plasma D-Bus session launcher is installed"
+    exit 1
+fi
+
+if [ "$SOFTWARE_RENDERING" -eq 1 ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+    export QT_QUICK_BACKEND=software
+    log "software rendering fallback enabled (llvmpipe/lavapipe)"
+fi
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+# Plasma 先吃 plasma-libs（Qt6/KF6 好库），再回退 xorg-libs 验证集与 persist。
+export LD_LIBRARY_PATH="/usr/local/lib/plasma-libs:/usr/local/lib/xorg-libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The Plasma wrapper execs a bare "dbus-run-session". Call it by
+# absolute path so a stripped PATH cannot turn into status 127.
+# Do not ldd the closure here: that walk hangs this guest and the
+# verify marker must mean the child was actually exec'd.
+if [ -x /usr/bin/dbus-run-session ]; then
+    DBUS_LAUNCH=/usr/bin/dbus-run-session
+fi
+log "starting Plasma as $SESSION_USER via $PLASMA_BIN DISPLAY=:0"
+log "dbus=$DBUS_LAUNCH runuser=/usr/bin/runuser"
+echo 1 >/proc/sys/kernel/print-fatal-signals 2>/dev/null || true
+set +e
+if [ -x /usr/bin/runuser ]; then
+    if [ "$DBUS_LAUNCH" = "/usr/lib/plasma-dbus-run-session-if-needed" ]; then
+        /usr/bin/runuser --user "$SESSION_USER" -- /usr/bin/env \
+            -u DBUS_SESSION_BUS_ADDRESS \
+            HOME="/home/$SESSION_USER" \
+            USER="$SESSION_USER" \
+            LOGNAME="$SESSION_USER" \
+            DISPLAY=:0 \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_CLASS=user \
+            XDG_CURRENT_DESKTOP=KDE \
+            DESKTOP_SESSION=plasma \
+            KDE_FULL_SESSION=true \
+            QT_QPA_PLATFORM=xcb \
+            LIBSEAT_BACKEND=seatd \
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            LD_DEBUG=files \
+            PATH="$PATH" \
+            "$DBUS_LAUNCH" -- "$PLASMA_BIN" >>/tmp/deshab-plasma.err 2>&1
+    else
+        /usr/bin/runuser --user "$SESSION_USER" -- /usr/bin/env \
+            -u DBUS_SESSION_BUS_ADDRESS \
+            HOME="/home/$SESSION_USER" \
+            USER="$SESSION_USER" \
+            LOGNAME="$SESSION_USER" \
+            DISPLAY=:0 \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_CLASS=user \
+            XDG_CURRENT_DESKTOP=KDE \
+            DESKTOP_SESSION=plasma \
+            KDE_FULL_SESSION=true \
+            QT_QPA_PLATFORM=xcb \
+            LIBSEAT_BACKEND=seatd \
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            LD_DEBUG=files \
+            PATH="$PATH" \
+            "$DBUS_LAUNCH" -- "$PLASMA_BIN" >>/tmp/deshab-plasma.err 2>&1
+    fi
+else
+    log "runuser missing; starting Plasma as root so scanout can proceed"
+    if [ "$DBUS_LAUNCH" = "/usr/lib/plasma-dbus-run-session-if-needed" ]; then
+        /usr/bin/env \
+            -u DBUS_SESSION_BUS_ADDRESS \
+            HOME=/root \
+            USER=root \
+            DISPLAY=:0 \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            XDG_SESSION_TYPE=x11 \
+            XDG_CURRENT_DESKTOP=KDE \
+            QT_QPA_PLATFORM=xcb \
+            LIBSEAT_BACKEND=seatd \
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            LD_DEBUG=files \
+            PATH="$PATH" \
+            "$DBUS_LAUNCH" -- "$PLASMA_BIN" >>/tmp/deshab-plasma.err 2>&1
+    else
+        /usr/bin/env \
+            -u DBUS_SESSION_BUS_ADDRESS \
+            HOME=/root \
+            USER=root \
+            DISPLAY=:0 \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            XDG_SESSION_TYPE=x11 \
+            XDG_CURRENT_DESKTOP=KDE \
+            QT_QPA_PLATFORM=xcb \
+            LIBSEAT_BACKEND=seatd \
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            LD_DEBUG=files \
+            PATH="$PATH" \
+            "$DBUS_LAUNCH" -- "$PLASMA_BIN" >>/tmp/deshab-plasma.err 2>&1
+    fi
+fi
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+    log "Plasma failed with status $status sig=$((status > 128 ? status - 128 : 0))"
+    dump_file /tmp/deshab-plasma.err 8
+    # The head only shows dbus-run-session warmup. The crash site is at
+    # the END of the LD_DEBUG stream; dump the tail so kmsg shows which
+    # library/binary was being loaded when the signal hit.
+    if [ -x /usr/local/bin/utsm_bindmount ]; then
+        /usr/local/bin/utsm_bindmount tail /tmp/deshab-plasma.err 200 \
+            > /tmp/deshab-plasma-tail.txt 2>/dev/null || true
+        while IFS= read -r line; do
+            log "plasma-tail:$line"
+        done < /tmp/deshab-plasma-tail.txt
+        /usr/local/bin/utsm_bindmount tail /tmp/Xorg.0.log 80 > /tmp/deshab-xorg-tail.txt 2>/dev/null || true
+        /usr/local/bin/utsm_bindmount tail /tmp/xorg.err 20 > /tmp/deshab-xorg-err.txt 2>/dev/null || true
+        grep -E '\(EE\)|\(WW\)|Fatal|error|failed|Failed' /tmp/deshab-xorg-tail.txt /tmp/deshab-xorg-err.txt 2>/dev/null | head -n 12 | while IFS= read -r line; do
+            log "xorg: $line"
+        done
+    fi
+    dmesg 2>/dev/null | tail -n 40 > /tmp/deshab-dmesg.txt || true
+    grep -E 'segfault|Bus error|bus error|traps:|EXT4-fs|invalid ELF' /tmp/deshab-dmesg.txt 2>/dev/null | head -n 8 | while IFS= read -r line; do
+        log "dmesg: $line"
+    done
+else
+    log "Plasma session ended normally"
+fi
+exit "$status"

@@ -12,3 +12,4 @@
 VSCODE|VSCode|/opt/vscode/bin/code|--no-sandbox --disable-gpu --user-data-dir /root/.vscode-data
 VSCODE2|VSCode2|/opt/vscode/bin/code|--no-sandbox --disable-gpu --user-data-dir /root/.vscode-data2 /root/workspace2
 PYTHON|Python|/usr/bin/env|-u LD_LIBRARY_PATH /usr/bin/python3 /usr/local/share/deshab/python/hello.py
+KDE|KDE|/usr/local/bin/deshab-kde-session|

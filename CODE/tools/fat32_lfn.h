@@ -42,6 +42,19 @@ typedef struct {
     int  valid;                 /* 1=LFN 链完整且 checksum 与短名项匹配 */
 } fat32_lfn_buf;
 
+/* 目录条目（供 fileman / linux_compat 列举使用）。 */
+typedef struct {
+    char name[13];
+    u32  clus;
+    u32  size;
+    u8   attr;
+    u8   is_dir;
+    u8   has_lfn;
+    char long_name[260];
+} f32_entry;
+
+typedef int (*f32_list_entry_cb)(const f32_entry *e, void *user_data);
+
 /* 初始化/清空 LFN 缓冲 */
 static inline void fat32_lfn_init(fat32_lfn_buf *buf) {
     buf->count = 0;

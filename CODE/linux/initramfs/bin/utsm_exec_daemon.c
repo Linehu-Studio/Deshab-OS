@@ -29,6 +29,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sched.h>
+#include <poll.h>
 
 /* Shared IPC protocol — must match UTSM side */
 #include "../../../utsm-ipc/ipc_proto.h"
@@ -57,6 +59,7 @@ struct utsm_ioctl_pool {
 };
 
 static int g_utsm_fd = -1;
+static volatile sig_atomic_t g_async_live;
 
 /* pool_write 定义在文件传输段（下文），exec 同步路径复用同一通道 */
 static int pool_write(unsigned int offset, const void *buf, unsigned int len);
@@ -129,6 +132,48 @@ static void err_write(const char *s, unsigned int len)
     (void)n;
 }
 
+static void kmsg_write(const char *s)
+{
+    int fd;
+    if (!s) return;
+    fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    (void)write(fd, s, strlen(s));
+    close(fd);
+}
+
+static int path_needs_deshab_libs(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+    if (strstr(path, "deshab-kde-session"))
+        return 0;
+    if (strstr(path, "/bin/sh") || strstr(path, "/bin/bash") ||
+        strstr(path, "/usr/bin/bash") || strstr(path, "/usr/bin/env"))
+        return 0;
+    return 1;
+}
+
+/* Nested TSC is often marked unstable, so usleep() returns immediately
+ * and async children never run on the only vCPU. A yield loop also
+ * starves D-state I/O: PID 1 stays runnable and idle never runs.
+ * poll(POLLIN, 10ms) on /dev/utsm sleeps interruptibly so Plasma/session
+ * and virtio completions can run. Driver poll does not wait-queue, so
+ * a new EXEC_REQUEST is seen at the next timeout. */
+static void donate_cpu(void)
+{
+    struct pollfd pfd;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = g_utsm_fd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, 10) < 0) {
+        unsigned i;
+        for (i = 0; i < 64u; i++)
+            sched_yield();
+    }
+}
+
 /* ===== Exec request handler =====
  *
  * Fork a child to exec the requested program. Parent reads stdout/stderr
@@ -178,6 +223,7 @@ static void handle_exec_request(const struct ipc_exec_request *req)
             return;
         }
         if (pid == 0) {
+            char line[192];
             /* Child: new session, no controlling tty, stdio → /dev/null */
             setsid();
             int nullfd = open("/dev/null", O_RDWR);
@@ -187,13 +233,29 @@ static void handle_exec_request(const struct ipc_exec_request *req)
                 dup2(nullfd, STDERR_FILENO);
                 if (nullfd > STDERR_FILENO) close(nullfd);
             }
-            /* 与同步路径一致的库搜索路径；DISPLAY 指向 virtio-gpu X server */
-            setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
+            /* DISPLAY 指向 virtio-gpu X server。不要把 LD_LIBRARY_PATH
+             * 套到 bash/session：/usr/lib/deshab 会劫持 glibc。 */
+            if (path_needs_deshab_libs(req->path))
+                setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
             setenv("DISPLAY", ":0", 1);
+            snprintf(line, sizeof(line),
+                     "[deshab-kde] async exec %s\n", req->path);
+            kmsg_write(line);
             execv(req->path, argv);
+            snprintf(line, sizeof(line),
+                     "[deshab-kde] execv failed errno=%d path=%s\n",
+                     errno, req->path);
+            kmsg_write(line);
             _exit(127);  /* execv 仅失败时返回 */
         }
         /* Parent: report successful spawn immediately */
+        g_async_live = 1;
+        {
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "[deshab-kde] async spawn pid=%d\n", (int)pid);
+            kmsg_write(line);
+        }
         struct ipc_exec_exit ex = { .exit_code = 0, .flags = 0,
                                     .stdout_len = 0, .stdout_total = 0 };
         send_exit_msg(&ex);
@@ -227,8 +289,8 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
 
-        /* 设置 LD_LIBRARY_PATH，让 ld-linux.so 在 /usr/lib/deshab 查找 .so */
-        setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
+        if (path_needs_deshab_libs(req->path))
+            setenv("LD_LIBRARY_PATH", "/usr/lib/deshab", 1);
 
         execv(req->path, argv);
         /* execv only returns on failure */
@@ -587,6 +649,16 @@ int main(void)
                 handle_file_write((const struct ipc_file_request *)umsg.data);
             }
             /* Ignore other message types (HELLO, PING, etc.) */
+        }
+
+        /* Single vCPU: PARK/HLT freezes the whole VM, including async
+         * children and in-flight virtio-blk. Yields return immediately
+         * when the child is in D-state, so a yield-then-HLT loop parks
+         * before the virtio IRQ can be injected. Stay runnable; the
+         * host returns from linux_resume() on a preemption timeslice. */
+        if (g_async_live) {
+            donate_cpu();
+            continue;
         }
 
         /* Responses (if any) are already queued. Park to let UTSM read

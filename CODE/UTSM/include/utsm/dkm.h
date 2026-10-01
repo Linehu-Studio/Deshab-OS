@@ -63,6 +63,24 @@ typedef struct dkm_driver_desc {
 typedef int (*dkm_driver_init_fn)(const struct dkm_kernel_api *api, struct dkm_driver_handle *handle);
 typedef int (*dkm_driver_exit_fn)(struct dkm_driver_handle *handle);
 
+/* DRR 恢复根服务表（Phase8；驱动经 kernel_api->drr 使用） */
+typedef struct drr_recovery_api {
+    void (*report_fault)(const char *reason);
+    u64  (*heartbeat_get)(void);
+    void *(*emergency_alloc)(u64 size, u64 alignment);
+    int  (*ckpt_snapshot_dirty)(void);
+    int  (*rollback_pages)(void);
+} drr_recovery_api;
+
+/* SAS-R0-PCQ 调度器服务表（Phase7；驱动经 kernel_api->sched 使用） */
+typedef struct utsm_sched_api {
+    u64  (*uptime_ns)(void);
+    void (*yield)(void);
+    u32  (*current_task_slot)(void);
+    int  (*task_create)(u32 process_slot, u32 priority, void (*entry)(void *), void *arg);
+    void (*sleep_ms)(u32 ms);
+} utsm_sched_api;
+
 typedef struct dkm_log_api {
     void (*info)(const char *msg);
     void (*warn)(const char *msg);
@@ -84,7 +102,7 @@ typedef struct dkm_kernel_api {
     const void *vfs;
     const dkm_net_api *net;
     const void *timer;
-    const void *drr;
+    const drr_recovery_api *drr;   /* 恢复根服务（原占位 void* 改具体类型，布局不变） */
 
     const void *rsdp_address;   /* ACPI RSDP physical address */
     const void *fb_address;     /* framebuffer base */
@@ -111,6 +129,10 @@ typedef struct dkm_kernel_api {
      * 接口已接受向量命名空间，无需新注册 ABI）。 */
     int  (*irq_vector_alloc)(void);
     void (*irq_vector_free)(int vector);
+    /* M4/Phase7-8: 调度器服务（尾部追加，ABI 兼容；drr 服务见上方原占位字段）。
+     * 驱动可用：task_create/uptime/sleep/current_task_slot。
+     * DSK 以 api+0xA8 硬偏移读 block 的约定不受影响（仅尾部追加）。 */
+    const utsm_sched_api *sched;
 } dkm_kernel_api;
 
 typedef enum dkm_driver_state {
@@ -141,6 +163,10 @@ void dkm_scan_boot_modules(void);
 void dsm_load_by_manifest(void);
 void dkm_fill_platform_info(void);
 const dkm_kernel_api *dkm_get_kernel_api(void);
+
+/* 服务表实现（drr_stub.c / sched/sched.c 提供，fill 时挂入 kernel_api） */
+const struct drr_recovery_api *drr_get_recovery_api(void);
+const struct utsm_sched_api *utsm_sched_get_api(void);
 
 /* exposed for manifest parser */
 struct dkm_symbol_scan {

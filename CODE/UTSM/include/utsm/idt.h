@@ -45,4 +45,17 @@ void idt_register_apic_eoi(void (*eoi_fn)(void));
 int  irq_vector_alloc(void);
 void irq_vector_free(int vector);
 
+/* 显式 EOI（Phase7: 调度器 tick 等可能切换任务的中断路径用）。
+ * 在任何可能换栈的工作之前完成 EOI，防止 EOI 悬挂一个时间片。
+ * 序列与 idt_handler 默认路径一致: LAPIC 钩子 → 8259 EOI（按向量范围）。
+ * 参数兼容双命名空间（同 irq_register）: 0-15=ISA IRQ, 0x20+=向量。 */
+void idt_irq_eoi(u8 vector);
+
+/* CPU 异常钩子（Phase8: DRR 任务级 fault 接管）。
+ * 在 idt_handler 的 vector<32 分支最前调用: 返回非 0 = 异常已被消费
+ * （fault 任务被杀/切换，控制权不回到日志+停机路径）；返回 0 = 走原
+ * 全量日志 + cli;hlt 路径（DSK 阶段行为不变）。传 NULL 注销。 */
+typedef int (*idt_exception_hook_t)(u64 vector, u64 error_code, u64 rip);
+void idt_set_exception_hook(idt_exception_hook_t hook);
+
 #endif

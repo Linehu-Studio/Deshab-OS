@@ -121,21 +121,31 @@ ISO/run_qemu.bat
 已知说明：
 
 ```text
-SYSTEM/ 是打包为 IMG 后的系统根目录。
+SYSTEM/ 是唯一打包输入：build.ps1 只扫描 SYSTEM/，不从 /home 或其它路径取发行物。
+所有要进镜像的软件（utsm.elf、deshab.elf、.drv、bzImage/initrd、
+linux-rootfs.img、linux-extra-rootfs.img、Python/KDE 内容）必须先落到 SYSTEM/。
+打包成 GPT 双分区：p1 FAT32 ESP（SYSTEM/EFI + SYSTEM/limine + SYSTEM/boot
++ SYSTEM/driver + SYSTEM/system — Limine 10 不能读 ext4，boot(): 模块必须在 ESP），
+p2 ext4（其余 SYSTEM/，并保留 driver/system 副本）。由 WSL
+CODE/linux/pack_system_image.sh 执行 mkfs.vfat + mkfs.ext4。
+ext4 UUID 固定为 64657368-6162-4000-8000-000000000002。
+内核/驱动/DSK 一律走 boot(): （FAT32 ESP）。
+FAT32 单文件上限 4GiB-1 仍适用于 ESP 上的 /boot 文件，linux-extra-rootfs.img 必须小于 4GiB。
 SYSTEM/boot/ 存放启动模块，例如 utsm.elf。
 SYSTEM/driver/ 存放 ELF .drv 驱动模块和 manifest.json。
 CODE/UTSM/README.md: 编译到 SYSTEM/boot/utsm.elf
 build.bat: 调用 build.ps1，透传参数（如 -Variant dev）。
-build.ps1: 编译 UTSM/DSK/工具/驱动，产出两个镜像：
+build.ps1: 编译 UTSM/DSK/工具/驱动，把整个 SYSTEM/ 打成 GPT(FAT32 ESP + ext4) 镜像：
   - ISO/deshab-dev.img     开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项）
   - ISO/deshab-release.img 发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项）
   参数 -Variant dev|release|both（默认 both）。both 模式构建后恢复 SYSTEM 为 dev 配置。
   配置模板在 build/configs/{dev,release}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
 ISO/run_qemu.bat: 用 QEMU + UEFI 固件启动 ISO/deshab-dev.img，串口输出到 stdio。
+ISO/run_qemu_kvm.sh: 默认 12G 内存（Limine 会把 SYSTEM/boot 里的 rootfs 模块装进内存）。
 build.ps1 自动把 Git usr/bin 加入 PATH（sh.exe + mkdir），解决 make `mkdir -p` 在 cmd.exe 下失败的问题。
 ```
 
-当前 UTSM 已有首阶段内核代码骨架和构建脚本，可生成 utsm.elf 与 GPT + FAT32 ESP 镜像。早期启动要求：进入 C 前 `cli/cld`，early serial 不允许无限等待硬件 ready 位，未启用 FPU/SSE 前编译必须使用 `-mno-sse -mno-sse2 -mno-mmx -msoft-float`。DATA/BSS 段使用 PF_R|PF_W|PF_X（SAS-R0 下驱动模块内存需可执行）。
+当前 UTSM 已有首阶段内核代码骨架和构建脚本，可生成 utsm.elf 与 GPT（FAT32 引导分区 + ext4 数据分区）镜像。早期启动要求：进入 C 前 `cli/cld`，early serial 不允许无限等待硬件 ready 位，未启用 FPU/SSE 前编译必须使用 `-mno-sse -mno-sse2 -mno-mmx -msoft-float`。DATA/BSS 段使用 PF_R|PF_W|PF_X（SAS-R0 下驱动模块内存需可执行）。
 
 DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解析 + Limine boot module 预加载 + 4 stage 分阶段加载 + 全部 14 个外部 `.drv` ET_REL 装载（ELF64/SHT_NOBITS/R_X86_64_64/32/32S/PC32 relocation + driver_desc 校验 + driver_init 调用）。当前镜像额外预加载 `driver/test.fat32` 作为 FAT32 驱动测试镜像。
 
@@ -221,3 +231,48 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 - 严格遵守"任何单步失败只记日志继续执行，绝不阻塞或崩溃首次启动"准则
 - handler 存活性结论：镜像会被后续模块覆盖，IRQ12 保持屏蔽避免野指针执行
 - 后续集成路径：DKM 输入驱动 或 DSK 加载器增加"常驻"标志
+
+## M4 里程碑完成状态（2026-09-15）：SAS-R0-PCQ 调度器 + DRR 恢复根
+
+### 任务 A: SAS-R0-PCQ 调度器（ROADMAP Phase 7）
+**状态**: [COMPLETED]
+
+**实现内容**:
+1. **O(1) 位图调度器** (`CODE/UTSM/sched/sched.c`):
+   - 64 槽 TCB 表 + 8 CPU runqueue（当前 BSP-only），ready_bitmap ctz 选最高优先级（0 最高）
+   - 侵入式 O(1) FIFO runqueue（slot 索引非指针），冻结 ABI 9 API 真实现
+   - 任务栈从 arena 分配，entry/arg/stack_base 存 task_aux
+2. **xv6 式栈驱动切换** (`CODE/UTSM/sched/switch.S`):
+   - 抢占 = IRQ 帧落在被抢占任务自己的栈上，切换只换 rsp
+   - trampoline 跳 entry；schedule/yield/sleep/exit 全路径
+   - 切换路径只触碰 crypto_context 指针（禁止扫描 capability/MAC/checkpoint）
+3. **LAPIC timer tick** (`CODE/UTSM/arch/x86_64/lapic_timer.c`):
+   - MMIO 映射 + TSC 延时校准（10ms 逆计数法）+ 周期模式
+   - tick_hz/timeslice_ms 由 FUCK [sched] 配置（默认 100Hz/10ms）
+   - demo 窗口含 tick 失速兜底：心跳无进展自动中止窗口，不卡死 bootstrap
+4. **FUCK 配置**: `[sched] enable/tick_hz/timeslice_ms/demo_ms/demo_fault`
+
+**验证结果**:
+- selftest: runqueue O(1) PASS、block/wake PASS
+- demo 窗口: 3 任务（prio 1/20/40）按优先级交错运行并正常退出
+- 窗口结束 quiesce → timer stopped → 正常交接 DSK
+
+### 任务 B: DRR 恢复根（ROADMAP Phase 8）
+**状态**: [COMPLETED-MAC占位]
+
+**实现内容** (`CODE/UTSM/drr/drr_stub.c`):
+1. **快照区**: 静态区域（128 页容量，编译期），页条目含 seg_slot/page_index/crc
+2. **snapshot_dirty**: 遍历 ACTIVE 段 dirty_shard 位图收集脏页 → 拷贝+CRC64 → 清位图
+3. **A/B 双槽 checkpoint**: ckpt_a/ckpt_b + CRC + active slot 切换
+4. **rollback**: 页级回滚 + CRC verify；segment/system 级接口就位
+5. **看门狗**: register/kick/timeout 检测，任务退出自动注销；异常钩子接入 fault 路径
+6. **FUCK 配置**: `[drr] watchdog_enabled`；`[utsm] drr_emergency_pool_kb/drr_recovery_log_size`
+
+**验证结果（含负向测试 demo_fault=1）**:
+- ckpt snapshot ok（1 page）→ rollback done → rollback verify ok
+- 看门狗负向测试: fault 任务（slot 3）死循环 → `watchdog timeout task_slot=0x3` 检出 → 回滚执行 → demo 窗口正常结束
+- 证据: `.build_tmp/qemu_serial_sched_m4.log`
+
+**遗留**:
+- MAC 为 CRC64 占位（Phase 9 换真实加密）
+- task_kill crypto erase（key_epoch++）、Per-CPU 真启用、驱动 recovery ops 待做

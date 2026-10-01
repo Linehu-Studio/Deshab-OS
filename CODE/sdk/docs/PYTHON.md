@@ -30,7 +30,16 @@ pacman -S python
 
 当前 guest 把基础 rootfs 以只读方式挂载，所以不要在已启动 guest 中直接向
 `/usr` 安装软件包。应在 WSL/Linux 的可写 rootfs staging tree 中安装，然后
-重新打包。使用 `build_arch_rootfs.sh` 的默认工作目录时，可以执行：
+重新打包。`build_arch_rootfs.sh` 默认 `ARCH_INSTALL_PYTHON=1`，会在 staging
+里执行 `pacman -S python` 并写入 `hello.py`。也可单独跑：
+
+```sh
+sudo bash CODE/linux/install_guest_python.sh
+# 或指向 extra-rootfs 的 KDE 树：
+sudo ROOTFS=/root/extra_rootfs_work/mnt bash CODE/linux/install_guest_python.sh
+```
+
+使用 `build_arch_rootfs.sh` 的默认工作目录时，也可以手动执行：
 
 ```sh
 cd /mnt/d/Code/DEAICUP/Deshab

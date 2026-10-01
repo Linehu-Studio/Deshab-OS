@@ -14,7 +14,7 @@
 # Usage:
 #   sudo bash CODE/linux/build_extra_rootfs.sh
 #   sudo IMG_SIZE_MB=2048 bash CODE/linux/build_extra_rootfs.sh
-#   sudo KDE_FULL=1 IMG_SIZE_MB=8192 bash CODE/linux/build_extra_rootfs.sh
+#   sudo KDE_FULL=1 bash CODE/linux/build_extra_rootfs.sh   # 3900MB, FAT32-safe
 #
 # KDE_FULL=1 prerequisites:
 #   - An Arch Linux build environment with arch-install-scripts (pacstrap)
@@ -25,8 +25,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
-OUTPUT_IMG="$OUTPUT_DIR/linux-extra-rootfs.img"
+OUTPUT_DIR="${EXTRA_ROOTFS_OUTPUT_DIR:-$PROJECT_ROOT/SYSTEM/boot}"
+OUTPUT_IMG="${EXTRA_ROOTFS_OUTPUT:-$OUTPUT_DIR/linux-extra-rootfs.img}"
 
 KDE_FULL="${KDE_FULL:-0}"
 case "$KDE_FULL" in
@@ -39,7 +39,9 @@ esac
 
 if [ -z "${IMG_SIZE_MB+x}" ]; then
     if [ "$KDE_FULL" -eq 1 ]; then
-        IMG_SIZE_MB=8192
+        # FAT32 ESP cannot store a file >= 4GiB. SYSTEM/boot is the only
+        # pack input, so the extra-rootfs image must stay under that limit.
+        IMG_SIZE_MB=3900
     else
         IMG_SIZE_MB=1024
     fi
@@ -48,8 +50,9 @@ if ! [[ "$IMG_SIZE_MB" =~ ^[1-9][0-9]*$ ]]; then
     echo "[extra-rootfs] ERROR: IMG_SIZE_MB must be a positive integer" >&2
     exit 2
 fi
-if [ "$KDE_FULL" -eq 1 ] && [ "$IMG_SIZE_MB" -lt 8192 ]; then
-    echo "[extra-rootfs] WARNING: full KDE is expected to need at least 8192MB" >&2
+if [ "$KDE_FULL" -eq 1 ] && [ "$IMG_SIZE_MB" -ge 4096 ]; then
+    echo "[extra-rootfs] ERROR: IMG_SIZE_MB=$IMG_SIZE_MB >= 4GiB; FAT32 SYSTEM pack cannot store it" >&2
+    exit 2
 fi
 
 WORK_DIR="${EXTRA_ROOTFS_WORK:-/root/extra_rootfs_work}"
@@ -74,9 +77,11 @@ fi
 # plasma-wayland-session package on current Arch Linux.
 KDE_DESKTOP_PACKAGES=(
     plasma-meta
-    kde-applications-meta
     plasma-workspace
     sddm
+)
+KDE_APP_PACKAGES=(
+    kde-applications-meta
 )
 KDE_WAYLAND_PACKAGES=(
     wayland
@@ -104,11 +109,15 @@ KDE_SESSION_PACKAGES=(
     polkit
     pam
 )
+# noto-fonts-cjk is optional: the package is huge and Chinese mirrors
+# often stall. Install later with KDE_EXTRA_PACKAGES="noto-fonts-cjk".
 KDE_FONT_PACKAGES=(
     noto-fonts
-    noto-fonts-cjk
     noto-fonts-emoji
     ttf-dejavu
+)
+KDE_PYTHON_PACKAGES=(
+    python
 )
 KDE_BASE_PACKAGES=(
     base
@@ -124,6 +133,7 @@ KDE_PACKAGES=(
     "${KDE_GRAPHICS_PACKAGES[@]}"
     "${KDE_SESSION_PACKAGES[@]}"
     "${KDE_FONT_PACKAGES[@]}"
+    "${KDE_PYTHON_PACKAGES[@]}"
 )
 if [ -n "${KDE_EXTRA_PACKAGES:-}" ]; then
     read -r -a KDE_EXTRA_PACKAGE_ARRAY <<< "$KDE_EXTRA_PACKAGES"
@@ -139,16 +149,155 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "[extra-rootfs] ERROR: must run as root (loop mount required)" >&2
     exit 1
 fi
+# WSL/Ubuntu has no pacstrap. Fall back to an Arch bootstrap tarball
+# extracted onto the native Linux disk, then chroot pacman.
+KDE_BOOTSTRAP_TAR="${KDE_BOOTSTRAP_TAR:-$WORK_DIR/archlinux-bootstrap.tar.zst}"
+KDE_USE_BOOTSTRAP=0
 if [ "$KDE_FULL" -eq 1 ] && ! command -v "$KDE_PACSTRAP" >/dev/null 2>&1; then
-    echo "[extra-rootfs] ERROR: KDE_FULL=1 requires pacstrap" >&2
-    echo "[extra-rootfs] Install arch-install-scripts in an Arch build environment," >&2
-    echo "[extra-rootfs] or set KDE_PACSTRAP to its absolute path." >&2
-    exit 1
+    echo "[extra-rootfs] pacstrap not found; will use Arch bootstrap+chroot"
+    KDE_USE_BOOTSTRAP=1
 fi
 if [ -n "$KDE_PACMAN_CONF" ] && [ ! -r "$KDE_PACMAN_CONF" ]; then
     echo "[extra-rootfs] ERROR: KDE_PACMAN_CONF is not readable: $KDE_PACMAN_CONF" >&2
     exit 1
 fi
+
+kde_download_bootstrap() {
+    local url
+    if [ -f "$KDE_BOOTSTRAP_TAR" ]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$KDE_BOOTSTRAP_TAR")"
+    for url in \
+        "https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst" \
+        "https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst" \
+        "https://mirrors.aliyun.com/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+    do
+        echo "[extra-rootfs] Trying bootstrap: $url"
+        if curl -fL --retry 3 --connect-timeout 20 -o "$KDE_BOOTSTRAP_TAR" "$url"; then
+            return 0
+        fi
+        rm -f "$KDE_BOOTSTRAP_TAR"
+    done
+    echo "[extra-rootfs] ERROR: failed to download Arch bootstrap tarball" >&2
+    return 1
+}
+
+kde_configure_pacman() {
+    local root="$1"
+    mkdir -p "$root/etc/pacman.d"
+    cat > "$root/etc/pacman.d/mirrorlist" <<'MIRRORS'
+Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirrors.ustc.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirrors.aliyun.com/archlinux/$repo/os/$arch
+Server = https://mirrors.cloud.tencent.com/archlinux/$repo/os/$arch
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+MIRRORS
+    cat > "$root/etc/pacman.conf" <<'PACMANCONF'
+[options]
+HoldPkg = pacman glibc
+Architecture = auto
+SigLevel = Never
+LocalFileSigLevel = Never
+DisableDownloadTimeout
+XferCommand = /usr/bin/curl -C - -fL --retry 8 --retry-delay 3 --connect-timeout 60 -o %o %u
+[core]
+Include = /etc/pacman.d/mirrorlist
+[extra]
+Include = /etc/pacman.d/mirrorlist
+PACMANCONF
+    mkdir -p "$root/tmp/pacman/lib/sync" "$root/tmp/pacman/cache/pkg"
+    printf 'nameserver 1.1.1.1\n' > "$root/etc/resolv.conf"
+}
+
+kde_chroot_bind() {
+    local root="$1"
+    mkdir -p "$root"/{dev,proc,sys,run}
+    mount --bind /dev "$root/dev"
+    mount --bind /proc "$root/proc"
+    mount --bind /sys "$root/sys"
+    mount --bind /run "$root/run" 2>/dev/null || true
+}
+
+kde_unlock() {
+    rm -f "$1/var/lib/pacman/db.lck" "$1/tmp/pacman/lib/db.lck"
+}
+
+kde_pacman_wave() {
+    local root="$1"
+    shift
+    local attempt
+    echo "[extra-rootfs] pacman wave: $*"
+    for attempt in 1 2 3; do
+        kde_unlock "$root"
+        if chroot "$root" /usr/bin/pacman -S --noconfirm --needed --overwrite '*' "$@"; then
+            return 0
+        fi
+        echo "[extra-rootfs] wave failed (attempt $attempt), retrying..."
+        sleep 3
+    done
+    return 1
+}
+
+kde_install_full_suite() {
+    local hello_src="$PROJECT_ROOT/SYSTEM/user/python/hello.py"
+    if [ "$KDE_USE_BOOTSTRAP" -eq 0 ]; then
+        echo "[extra-rootfs] Installing full Arch/KDE suite with pacstrap..."
+        PACSTRAP_ARGS=(-K -c)
+        if [ -n "$KDE_PACMAN_CONF" ]; then
+            PACSTRAP_ARGS+=(-C "$KDE_PACMAN_CONF")
+        fi
+        "$KDE_PACSTRAP" "${PACSTRAP_ARGS[@]}" "$MNT_DIR" "${KDE_PACKAGES[@]}"
+        if [ "${KDE_SKIP_APPS:-1}" != "1" ]; then
+            echo "[extra-rootfs] Installing KDE applications meta (second pass)..."
+            if ! chroot "$MNT_DIR" /usr/bin/pacman -S --noconfirm --needed "${KDE_APP_PACKAGES[@]}"; then
+                echo "[extra-rootfs] WARNING: kde-applications-meta incomplete; Plasma/Wayland/Python remain"
+            fi
+        else
+            echo "[extra-rootfs] skipping kde-applications-meta (KDE_SKIP_APPS=1, FAT32-safe)"
+        fi
+    else
+        echo "[extra-rootfs] Installing Arch/KDE via bootstrap+chroot (native disk)..."
+        kde_download_bootstrap
+        if [ ! -x "$MNT_DIR/bin/bash" ] && [ ! -x "$MNT_DIR/usr/bin/bash" ]; then
+            echo "[extra-rootfs] Extracting bootstrap into extra-rootfs..."
+            tar --zstd -xf "$KDE_BOOTSTRAP_TAR" --strip-components=1 -C "$MNT_DIR"
+        fi
+        kde_configure_pacman "$MNT_DIR"
+        kde_chroot_bind "$MNT_DIR"
+        kde_unlock "$MNT_DIR"
+        chroot "$MNT_DIR" /usr/bin/pacman -Sy --noconfirm
+        if [ ! -x "$MNT_DIR/usr/bin/python3" ]; then
+            kde_pacman_wave "$MNT_DIR" "${KDE_BASE_PACKAGES[@]}" "${KDE_PYTHON_PACKAGES[@]}"
+        fi
+        kde_pacman_wave "$MNT_DIR" "${KDE_WAYLAND_PACKAGES[@]}" "${KDE_GRAPHICS_PACKAGES[@]}" \
+            || echo "[extra-rootfs] WARNING: wayland/graphics wave incomplete"
+        kde_pacman_wave "$MNT_DIR" "${KDE_SESSION_PACKAGES[@]}" "${KDE_FONT_PACKAGES[@]}" \
+            || echo "[extra-rootfs] WARNING: session/font wave incomplete"
+        if [ ! -x "$MNT_DIR/usr/bin/plasmashell" ]; then
+            kde_pacman_wave "$MNT_DIR" "${KDE_DESKTOP_PACKAGES[@]}" \
+                || echo "[extra-rootfs] WARNING: Plasma desktop wave incomplete"
+        fi
+        if [ "${KDE_SKIP_APPS:-1}" != "1" ]; then
+            echo "[extra-rootfs] Installing KDE applications meta (second pass)..."
+            if ! kde_pacman_wave "$MNT_DIR" "${KDE_APP_PACKAGES[@]}"; then
+                echo "[extra-rootfs] WARNING: kde-applications-meta incomplete; Plasma/Wayland/Python remain"
+            fi
+        else
+            echo "[extra-rootfs] skipping kde-applications-meta (KDE_SKIP_APPS=1, FAT32-safe)"
+        fi
+        umount -R "$MNT_DIR/dev" 2>/dev/null || umount "$MNT_DIR/dev" 2>/dev/null || true
+        umount "$MNT_DIR/proc" 2>/dev/null || true
+        umount "$MNT_DIR/sys" 2>/dev/null || true
+        umount "$MNT_DIR/run" 2>/dev/null || true
+    fi
+    if [ -f "$hello_src" ]; then
+        mkdir -p "$MNT_DIR/usr/local/share/deshab/python"
+        install -m 0644 "$hello_src" "$MNT_DIR/usr/local/share/deshab/python/hello.py"
+        echo "[extra-rootfs] installed hello.py"
+    fi
+}
 
 mkdir -p "$WORK_DIR" "$MNT_DIR" "$OUTPUT_DIR"
 
@@ -156,6 +305,10 @@ LOOP_DEV=""
 MOUNTED=0
 cleanup() {
     set +e
+    umount -R "$MNT_DIR/dev" 2>/dev/null || umount "$MNT_DIR/dev" 2>/dev/null || true
+    umount "$MNT_DIR/proc" 2>/dev/null || true
+    umount "$MNT_DIR/sys" 2>/dev/null || true
+    umount "$MNT_DIR/run" 2>/dev/null || true
     if [ "$MOUNTED" -eq 1 ]; then
         umount -R "$MNT_DIR" 2>/dev/null || umount "$MNT_DIR" 2>/dev/null || true
     fi
@@ -166,28 +319,37 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # 1. Allocate a sparse-friendly image and create its ext4 filesystem.
-echo "[extra-rootfs] Allocating ${IMG_SIZE_MB}MB image..."
-rm -f "$NATIVE_IMG"
-dd if=/dev/zero of="$NATIVE_IMG" bs=1M count=0 seek="$IMG_SIZE_MB" status=none
-
-echo "[extra-rootfs] mkfs.ext4..."
-mkfs.ext4 -q -F -N 1048576 -O ^has_journal -L deshab-persist "$NATIVE_IMG"
+# EXTRA_ROOTFS_RESUME=1 reuses an existing native image (failed pacman retry).
+if [ "${EXTRA_ROOTFS_RESUME:-0}" = "1" ] && [ -f "$NATIVE_IMG" ]; then
+    echo "[extra-rootfs] resume: reusing $NATIVE_IMG"
+else
+    echo "[extra-rootfs] Allocating ${IMG_SIZE_MB}MB image..."
+    rm -f "$NATIVE_IMG"
+    dd if=/dev/zero of="$NATIVE_IMG" bs=1M count=0 seek="$IMG_SIZE_MB" status=none
+    echo "[extra-rootfs] mkfs.ext4..."
+    mkfs.ext4 -q -F -N 1048576 -O ^has_journal -L deshab-persist "$NATIVE_IMG"
+fi
 
 # 2. Mount and populate the lightweight persistence skeleton.
 echo "[extra-rootfs] Populating directory skeleton..."
 LOOP_DEV="$(losetup --find --show "$NATIVE_IMG")"
 mount -t ext4 "$LOOP_DEV" "$MNT_DIR"
 MOUNTED=1
+rm -f "$MNT_DIR/var/lib/pacman/db.lck" "$MNT_DIR/tmp/pacman/lib/db.lck"
 mkdir -p "$MNT_DIR/opt" "$MNT_DIR/home" "$MNT_DIR/root" "$MNT_DIR/vscode"
 touch "$MNT_DIR/vscode/.keep"
 
 if [ "$KDE_FULL" -eq 1 ]; then
-    echo "[extra-rootfs] Installing full Arch/KDE suite with pacstrap..."
-    PACSTRAP_ARGS=(-K -c)
-    if [ -n "$KDE_PACMAN_CONF" ]; then
-        PACSTRAP_ARGS+=(-C "$KDE_PACMAN_CONF")
+    if [ "${KDE_FINALIZE_ONLY:-0}" = "1" ]; then
+        echo "[extra-rootfs] finalize-only: keeping installed Plasma/Wayland/Python"
+        hello_src="$PROJECT_ROOT/SYSTEM/user/python/hello.py"
+        if [ -f "$hello_src" ]; then
+            mkdir -p "$MNT_DIR/usr/local/share/deshab/python"
+            install -m 0644 "$hello_src" "$MNT_DIR/usr/local/share/deshab/python/hello.py"
+        fi
+    else
+        kde_install_full_suite
     fi
-    "$KDE_PACSTRAP" "${PACSTRAP_ARGS[@]}" "$MNT_DIR" "${KDE_PACKAGES[@]}"
 
     # The image is a complete chroot kept separate from the active minimal
     # guest root. A marker lets the launcher distinguish wrapper and chroot

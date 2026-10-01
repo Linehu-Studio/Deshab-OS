@@ -12,6 +12,7 @@
 #include <utsm/linux_loader.h>
 #include <utsm/ept.h>
 #include <utsm/vmx.h>
+#include <utsm/dma.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
@@ -52,6 +53,23 @@ static int g_vio_ready;
 
 void *virtio_gpa_to_host(u64 gpa) {
     u64 hpa = ept_gpa_to_hpa(gpa);
+    /* Guest CPU stores fault in and demand-map a page. virtio-blk READ
+     * buffers are often allocated but never stored by the vCPU first, so
+     * the EPT walk misses and the device must map the page itself.
+     * Skip GPA 0 (null) and MMIO (>= 0xF0000000). */
+    if (hpa == 0 && gpa >= 0x1000ULL && gpa < 0xF0000000ULL) {
+        u64 page = gpa & ~(EPT_PAGE_SIZE - 1);
+        static u32 demand_logs;
+        dkm_dma_buffer buf;
+        if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0, &buf) == 0 &&
+            ept_map_range(page, buf.phys, EPT_PAGE_SIZE, EPT_RWX) == 0) {
+            hpa = buf.phys + (gpa & (EPT_PAGE_SIZE - 1));
+            if (demand_logs < 8) {
+                demand_logs++;
+                log_hex64("[VIO] demand-map gpa=", gpa);
+            }
+        }
+    }
     if (hpa == 0) return (void *)0;
     u64 hhdm = g_hhdm_request.response ? g_hhdm_request.response->offset : 0;
     return (void *)(hhdm + hpa);
@@ -127,6 +145,13 @@ u64 virtio_mmio_read(u64 gpa, int width) {
     case VIRTIO_MMIO_QUEUE_READY:    return s->q[s->queue_sel].ready;
     case VIRTIO_MMIO_INTERRUPT_STATUS:return s->interrupt_status;
     case VIRTIO_MMIO_STATUS:         return s->status;
+    case VIRTIO_MMIO_SHM_LEN_LOW:
+    case VIRTIO_MMIO_SHM_LEN_HIGH:
+        /* No SHM windows. Linux treats (u64)-1 as "region absent". */
+        return 0xFFFFFFFFu;
+    case VIRTIO_MMIO_SHM_BASE_LOW:
+    case VIRTIO_MMIO_SHM_BASE_HIGH:
+        return 0;
     case VIRTIO_MMIO_CONFIG_GENERATION:return s->config_generation;
     default:
         /* device config 空间（0x100 起） */
@@ -154,6 +179,9 @@ void virtio_mmio_write(u64 gpa, u64 value, int width) {
     switch (off) {
     case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
         s->dev_features_sel = v32;
+        break;
+    case VIRTIO_MMIO_SHM_SEL:
+        /* No SHM regions; selector is ignored. Length reads stay -1. */
         break;
     case VIRTIO_MMIO_DRIVER_FEATURES:
         if (s->drv_features_sel == 0) {

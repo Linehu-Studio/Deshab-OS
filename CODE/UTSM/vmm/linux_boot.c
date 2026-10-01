@@ -6,13 +6,14 @@
  *   - RSP = guest stack top
  *   - CR3 = guest page tables GPA (identity-mapped 4GB)
  *   - GDT = guest GDT GPA (64-bit code/data/TSS)
- *   - EFER.LME | EFER.LMA | EFER.NXE
+ *   - EFER.SCE | EFER.LME | EFER.LMA | EFER.NXE
  *
  * After vmlaunch, the VM-Exit handler (vmexit.c) processes exits and
  * resumes the guest.
  */
 
 #include <utsm/linux_loader.h>
+#include <utsm/linux_xsave.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/vmm.h>
@@ -53,6 +54,43 @@ static inline u64 read_cr4_local(void) {
 
 /* MSR bitmap (4KB, all zeros = don't intercept any MSR) */
 static u8 g_linux_msr_bitmap[4096] __attribute__((aligned(4096)));
+
+int g_linux_cet_vmcs;
+int g_linux_cet_force;
+static u64 g_host_ucet;
+
+struct vmx_msr_entry {
+    u32 index;
+    u32 reserved;
+    u64 data;
+} __attribute__((packed));
+_Static_assert(sizeof(struct vmx_msr_entry) == 16, "VMX MSR entry is 16 bytes");
+
+static struct vmx_msr_entry g_linux_msr_entry_load[1] __attribute__((aligned(16)));
+static u32 g_linux_msr_entry_count;
+
+void linux_cet_restore_host(void) {
+    if (!g_linux_cet_force) return;
+    vmx_write_msr(0x6A0, g_host_ucet);
+}
+
+void linux_cet_force_guest_off(void) {
+    if (!g_linux_cet_force) return;
+    vmx_write_msr(0x6A0, 0);
+}
+
+void linux_cet_vmcs_sync_host(void) {
+    u64 scet, ist, ssp = 0;
+    if (!g_linux_cet_vmcs) return;
+    scet = vmx_read_msr(0x6A2);
+    ist = vmx_read_msr(0x6A8);
+    if (scet & 1ULL) {
+        __asm__ volatile(".byte 0xf3, 0x48, 0x0f, 0x1e, 0xc8" : "=a"(ssp));
+    }
+    vmx_vmcs_write(VMCS_HOST_S_CET, scet);
+    vmx_vmcs_write(VMCS_HOST_SSP, ssp);
+    vmx_vmcs_write(VMCS_HOST_INTR_SSP_TABLE, ist);
+}
 
 /* ===== VMCS host state (same as vmm.c, but for Linux guest) ===== */
 
@@ -113,6 +151,7 @@ static void linux_vmcs_setup_host_state(void) {
     /* Host RSP/RIP: VM-Exit handler */
     vmx_vmcs_write(VMCS_HOST_RSP, (u64)&g_host_stack[sizeof(g_host_stack) - 16]);
     vmx_vmcs_write(VMCS_HOST_RIP, (u64)vmx_vm_exit_handler);
+    linux_cet_vmcs_sync_host();
 }
 
 /* ===== VMCS guest state for Linux ===== */
@@ -121,10 +160,38 @@ static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
     /* CR0/CR3/CR4: long mode with paging.
      * P8.5: CR4 必须含 VMXE（IA32_VMX_CR4_FIXED0=0x2000 强制，
      * 旧代码漏掉会触发 VM-entry invalid guest state）。 */
-    vmx_vmcs_write(VMCS_GUEST_CR0, CR0_PE | CR0_NE | CR0_PG | CR0_WP);
+    /* ET/MP + OSFXSR so the decompressor/kernel can use FXSAVE/SSE
+     * before it programs CR0/CR4 itself. Missing OSFXSR is #UD with
+     * IDTR=0, which becomes a triple fault. */
+    u64 cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_PG | CR0_WP;
+    u64 cr4 = CR4_VMXE | CR4_PAE | CR4_PGE | CR4_PSE |
+              CR4_OSFXSR | CR4_OSXMMEXCPT;
+    if (linux_xsave_available())
+        cr4 |= CR4_OSXSAVE;
+    vmx_vmcs_write(VMCS_GUEST_CR0, cr0);
     /* CR3 points to guest PML4 (GPA) */
     vmx_vmcs_write(VMCS_GUEST_CR3, gi->pgt_gpa);
-    vmx_vmcs_write(VMCS_GUEST_CR4, CR4_VMXE | CR4_PAE | CR4_PGE | CR4_PSE);
+    vmx_vmcs_write(VMCS_GUEST_CR4, cr4);
+
+    vmx_vmcs_write(VMCS_GUEST_S_CET, 0);
+    vmx_vmcs_write(VMCS_GUEST_SSP, 0);
+    vmx_vmcs_write(VMCS_GUEST_INTR_SSP_TABLE, 0);
+
+    /* startup_64 writes CR4 = PAE|PGE and drops VMXE. In VMX non-root
+     * that is #GP; the decompressor IDT then #DFs. Own FIXED0 bits
+     * (VMXE) so the write updates the shadow only. */
+    {
+        u64 cr0_fixed0 = vmx_read_msr(IA32_VMX_CR0_FIXED0) & 0xFFFFFFFFULL;
+        u64 cr0_fixed1 = vmx_read_msr(IA32_VMX_CR0_FIXED1) & 0xFFFFFFFFULL;
+        u64 cr4_fixed0 = vmx_read_msr(IA32_VMX_CR4_FIXED0) & 0xFFFFFFFFULL;
+        u64 cr0_mask = cr0_fixed0 | (~cr0_fixed1 & 0xFFFFFFFFULL);
+        vmx_vmcs_write(VMCS_CR0_GUEST_HOST_MASK, cr0_mask);
+        vmx_vmcs_write(VMCS_CR0_READ_SHADOW, cr0);
+        vmx_vmcs_write(VMCS_CR4_GUEST_HOST_MASK, cr4_fixed0);
+        vmx_vmcs_write(VMCS_CR4_READ_SHADOW, cr4 & ~cr4_fixed0);
+        log_hex64("[LINUX] CR0 mask=", cr0_mask);
+        log_hex64("[LINUX] CR4 mask=", cr4_fixed0);
+    }
 
     /* Segment selectors from guest GDT */
     vmx_vmcs_write(VMCS_GUEST_CS_SELECTOR, 0x08);
@@ -187,7 +254,10 @@ static void linux_vmcs_setup_guest_state(const struct linux_guest_info *gi) {
     vmx_vmcs_write(VMCS_GUEST_RFLAGS, 0x2);  /* interrupts disabled */
 
     /* Guest EFER: long mode active */
-    vmx_vmcs_write(VMCS_GUEST_IA32_EFER, EFER_LME | EFER_LMA | EFER_NXE);
+    /* SCE must stay set across VM-exits or userspace SYSCALL #UDs
+     * (busybox musl arch_prctl). Combined with VM_EXIT_SAVE_GUEST_EFER. */
+    vmx_vmcs_write(VMCS_GUEST_IA32_EFER,
+                   EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE);
 
     /* Guest SYSENTER (unused but required by VMX) */
     vmx_vmcs_write(VMCS_GUEST_SYSENTER_CS, 0);
@@ -230,12 +300,15 @@ static void linux_vmcs_setup_controls(u64 eptp) {
             | CPU_BASED_ACTIVATE_SECONDARY
             | CPU_BASED_USE_MSR_BITMAPS
             | CPU_BASED_UNCOND_IO_EXITING
-            | CPU_BASED_INVLPG_EXITING;
+            | CPU_BASED_INVLPG_EXITING
+            | CPU_BASED_CR3_LOAD_EXITING
+            | CPU_BASED_CR3_STORE_EXITING;
     cpu = vmx_adjust_control(cpu, IA32_VMX_TRUE_PROCBASED_CTLS);
 
     /* Secondary: EPT + VPID（经 capability MSR 调整；
      * EPT 不可用则打日志——Linux guest 的 GPA 布局依赖 EPT）。 */
-    u64 cpu2 = SEC_EXEC_ENABLE_EPT | SEC_EXEC_ENABLE_VPID;
+    u64 cpu2 = SEC_EXEC_ENABLE_EPT | SEC_EXEC_ENABLE_VPID |
+               SEC_EXEC_ENABLE_RDTSCP;
     cpu2 = vmx_adjust_control(cpu2, IA32_VMX_PROCBASED_CTLS2);
     if (!(cpu2 & SEC_EXEC_ENABLE_EPT)) {
         log_warn("[LINUX] EPT not available (shadow paging) - guest GPA map disabled");
@@ -243,13 +316,29 @@ static void linux_vmcs_setup_controls(u64 eptp) {
 
     u64 exit_ctrl = VM_EXIT_SAVE_DEBUG_CONTROLS
                   | VM_EXIT_HOST_ADDR_SPACE_SIZE
-                  | VM_EXIT_LOAD_HOST_EFER;
+                  | VM_EXIT_SAVE_GUEST_EFER
+                  | VM_EXIT_LOAD_HOST_EFER
+                  | VM_EXIT_SAVE_CET_STATE
+                  | VM_EXIT_LOAD_CET_STATE;
     exit_ctrl = vmx_adjust_control(exit_ctrl, IA32_VMX_TRUE_EXIT_CTLS);
 
     u64 entry_ctrl = VM_ENTRY_LOAD_DEBUG_CONTROLS
                    | VM_ENTRY_IA32E_MODE_GUEST
-                   | VM_ENTRY_LOAD_GUEST_EFER;
+                   | VM_ENTRY_LOAD_GUEST_EFER
+                   | VM_ENTRY_LOAD_CET_STATE;
     entry_ctrl = vmx_adjust_control(entry_ctrl, IA32_VMX_TRUE_ENTRY_CTLS);
+
+    g_linux_cet_vmcs = 0;
+    if ((exit_ctrl & VM_EXIT_SAVE_CET_STATE) &&
+        (exit_ctrl & VM_EXIT_LOAD_CET_STATE) &&
+        (entry_ctrl & VM_ENTRY_LOAD_CET_STATE)) {
+        g_linux_cet_vmcs = 1;
+        log_info("[LINUX] VMCS CET state switch enabled");
+    } else {
+        exit_ctrl &= ~(VM_EXIT_SAVE_CET_STATE | VM_EXIT_LOAD_CET_STATE);
+        entry_ctrl &= ~VM_ENTRY_LOAD_CET_STATE;
+        log_warn("[LINUX] VMCS CET switch not offered by nested VMX");
+    }
 
     vmx_vmcs_write(VMCS_PIN_BASED_VM_EXEC_CONTROL, pin);
     vmx_vmcs_write(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu);
@@ -257,11 +346,60 @@ static void linux_vmcs_setup_controls(u64 eptp) {
     vmx_vmcs_write(VMCS_VM_EXIT_CONTROLS, exit_ctrl);
     vmx_vmcs_write(VMCS_VM_ENTRY_CONTROLS, entry_ctrl);
 
-    /* MSR bitmap */
+    /* MSR bitmap: intercept EFER (SCE must land in VMCS) and FS/GS bases
+     * (arch_prctl). Nested KVM does not apply un-intercepted WRMSR
+     * IA32_FS_BASE to GUEST_FS_BASE; ignoring those writes leaves TLS=0
+     * and every libc/musl process SIGSEGVs at address 0. */
     {
+        u32 efer_off = 0xC0000080u - 0xC0000000u;
+        u32 fs_off   = 0xC0000100u - 0xC0000000u;
+        u32 gs_off   = 0xC0000101u - 0xC0000000u;
+        u32 kgs_off  = 0xC0000102u - 0xC0000000u;
+        g_linux_msr_bitmap[0x400 + efer_off / 8] |= (u8)(1u << (efer_off & 7));
+        g_linux_msr_bitmap[0xC00 + efer_off / 8] |= (u8)(1u << (efer_off & 7));
+        g_linux_msr_bitmap[0x400 + fs_off / 8]   |= (u8)(1u << (fs_off & 7));
+        g_linux_msr_bitmap[0xC00 + fs_off / 8]   |= (u8)(1u << (fs_off & 7));
+        g_linux_msr_bitmap[0x400 + gs_off / 8]   |= (u8)(1u << (gs_off & 7));
+        g_linux_msr_bitmap[0xC00 + gs_off / 8]   |= (u8)(1u << (gs_off & 7));
+        g_linux_msr_bitmap[0xC00 + kgs_off / 8]  |= (u8)(1u << (kgs_off & 7));
+        g_linux_msr_bitmap[0x400 + kgs_off / 8]  |= (u8)(1u << (kgs_off & 7));
+        /* Do not intercept CET MSRs: L1 CR4.CET=0 so we cannot WRMSR
+         * them, but L2 hardware CET is on. The guest driver clears
+         * IA32_U_CET with a passthrough WRMSR. */
         u64 msr_bitmap_phys = vmx_kernel_virt_to_phys(g_linux_msr_bitmap);
         log_hex64("[LINUX] MSR bitmap phys=", msr_bitmap_phys);
         vmx_vmcs_write(VMCS_MSR_BITMAP, msr_bitmap_phys);
+    }
+
+    /* Nested KVM does not offer VMCS CET save/load, and it also hides
+     * CET from L1 CPUID/CR4. L0 U_CET still leaks into L2 (busybox PUSH
+     * to SSP=0). Always try a VM-entry MSR-load of IA32_U_CET=0; if
+     * nested rejects the list, linux_launch retries with count=0. */
+    {
+        u64 host_cr4 = read_cr4_local();
+        log_hex64("[LINUX] host CR4=", host_cr4);
+        g_host_ucet = 0;
+        g_linux_cet_force = 0;
+        if (host_cr4 & CR4_CET) {
+            g_host_ucet = vmx_read_msr(0x6A0);
+            g_linux_cet_force = 1;
+            log_hex64("[LINUX] host U_CET=", g_host_ucet);
+            log_info("[LINUX] CR4.CET set: WRMSR U_CET=0 on each L2 entry");
+        } else {
+            log_warn("[LINUX] CR4.CET=0: cannot WRMSR CET; MSR-load list only");
+        }
+
+        g_linux_msr_entry_load[0].index = 0x6A0;
+        g_linux_msr_entry_load[0].reserved = 0;
+        g_linux_msr_entry_load[0].data = 0;
+        /* Nested KVM reports EXIT_ENTRY_FAIL_MSR_LOADING (34) for CET
+         * MSRs. Do not arm the list; QEMU-process arch_prctl is the
+         * working way to keep leaked U_CET off. */
+        g_linux_msr_entry_count = 0;
+        vmx_vmcs_write(VMCS_VM_ENTRY_MSR_LOAD_COUNT, 0);
+        vmx_vmcs_write(VMCS_VM_EXIT_MSR_LOAD_COUNT, 0);
+        vmx_vmcs_write(VMCS_VM_EXIT_MSR_STORE_COUNT, 0);
+        log_info("[LINUX] CET MSR-load list not armed (nested rejects U_CET)");
     }
 
     if (cpu2 & SEC_EXEC_ENABLE_EPT) {
@@ -275,9 +413,12 @@ static void linux_vmcs_setup_controls(u64 eptp) {
         vmx_vmcs_write(VMCS_VPID, 0);
     }
 
-    /* Linux owns its IDT. Intercepting #PF here livelocks: the guest
-     * page-fault handler never runs, so early mm faults spin in VM-exit. */
-    vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, 0);
+    /* Linux owns #PF while it grows the identity map. Intercepting it
+     * plus serial dumps livelocks extract_kernel. Catch #UD/#GP/#DF only. */
+    /* #UD #DF #GP #CP(CET). User #GP currently does not nested-exit;
+     * still catch #CP if L0 delivers it to L1. */
+    vmx_vmcs_write(VMCS_EXCEPTION_BITMAP,
+                   (1ULL << 6) | (1ULL << 8) | (1ULL << 13) | (1ULL << 21));
 }
 
 /* ===== Global for passing RSI to launch asm ===== */
@@ -308,6 +449,7 @@ int linux_launch(void) {
     }
 
     log_info("[LINUX] launch begin");
+    linux_xsave_init();
 
     /* 注册 virtio-mmio 后端（block + net），guest 经 cmdline
      * virtio_mmio.device= 发现。幂等：重复调用直接返回。 */
@@ -365,7 +507,10 @@ int linux_launch(void) {
     log_hex64("[LINUX] eptp=", vmx_vmcs_read(VMCS_EPT_POINTER));
     log_hex64("[LINUX] msr_bitmap=", vmx_vmcs_read(VMCS_MSR_BITMAP));
     log_hex64("[LINUX] vpid=", vmx_vmcs_read(VMCS_VPID));
+    linux_cet_vmcs_sync_host();
+    linux_cet_force_guest_off();
     log_info("[LINUX] vmlaunch");
+    linux_xsave_load_guest();
 
     /* vmlaunch with RSI = boot_params.
      * Same control flow pattern as vmm_self_test:
@@ -413,6 +558,56 @@ int linux_launch(void) {
 
     int failed = g_linux_launch_failed;
     u64 vm_flags = g_linux_launch_flags;
+    if (failed && g_linux_msr_entry_count) {
+        u64 error = 0;
+        if (vm_flags & 0x40)
+            vmx_vmcs_read_checked(VMCS_VMX_INSTRUCTION_ERROR, &error);
+        log_warn("[LINUX] vmlaunch failed with CET MSR-load; retry without");
+        log_hex64("[LINUX] vmlaunch CET-load error=", error);
+        vmx_vmcs_write(VMCS_VM_ENTRY_MSR_LOAD_COUNT, 0);
+        g_linux_msr_entry_count = 0;
+        g_linux_launch_failed = 1;
+        g_linux_launch_flags = 0;
+        linux_cet_force_guest_off();
+        __asm__ volatile(
+            "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
+            "leaq 1f(%%rip), %%rax\n\t"
+            "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+            "xorl %%eax, %%eax\n\t"
+            "xorl %%ebx, %%ebx\n\t"
+            "xorl %%ecx, %%ecx\n\t"
+            "xorl %%edx, %%edx\n\t"
+            "xorl %%edi, %%edi\n\t"
+            "xorl %%ebp, %%ebp\n\t"
+            "xorl %%r8d, %%r8d\n\t"
+            "xorl %%r9d, %%r9d\n\t"
+            "xorl %%r10d, %%r10d\n\t"
+            "xorl %%r11d, %%r11d\n\t"
+            "xorl %%r12d, %%r12d\n\t"
+            "xorl %%r13d, %%r13d\n\t"
+            "xorl %%r14d, %%r14d\n\t"
+            "xorl %%r15d, %%r15d\n\t"
+            "movq g_linux_rsi(%%rip), %%rsi\n\t"
+            "vmlaunch\n\t"
+            "movl $1, g_linux_launch_failed(%%rip)\n\t"
+            "pushfq\n\t"
+            "popq g_linux_launch_flags(%%rip)\n\t"
+            "jmp 2f\n\t"
+            "1:\n\t"
+            "movl $0, g_linux_launch_failed(%%rip)\n\t"
+            "2:\n\t"
+            :
+            :
+            : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp",
+              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+              "cc", "memory"
+        );
+        failed = g_linux_launch_failed;
+        vm_flags = g_linux_launch_flags;
+    }
+    linux_cet_restore_host();
+    linux_xsave_save_guest();
+    linux_xsave_load_host();
     if (failed) {
         /* CF=1 → VMfailInvalid；ZF=1 → VMfailValid（error field 有效）。 */
         if (vm_flags & 0x1) {

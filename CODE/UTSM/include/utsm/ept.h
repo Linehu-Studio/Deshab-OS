@@ -31,6 +31,14 @@ int ept_identity_map(u64 gpa, u64 size, u64 flags);
  * Handles 4KB pages and 2MB large pages. */
 u64 ept_gpa_to_hpa(u64 gpa);
 
+/* Rewrite an existing EPT leaf (4K or 2MB) as RWX+WB+Ignore PAT.
+ * Returns 0 if a leaf was found and rewritten, -1 if unmapped.
+ * Used to recover from nested-KVM EPT misconfig (guest PAT vs EPT type). */
+int ept_repair_leaf(u64 gpa, u64 flags);
+
+/* Log PML4/PDPT/PD/PT entries for a GPA (misconfig diagnostics). */
+void ept_log_walk(u64 gpa);
+
 /* Map a 2MB large page in EPT (PD-level direct mapping).
  * GPA and HPA must be 2MB-aligned. memtype = EPT_MEMORY_TYPE_*.
  * Required for real hardware MTRR compliance. */

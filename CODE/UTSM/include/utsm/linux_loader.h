@@ -49,6 +49,9 @@ struct linux_setup_header {
 /* boot_params is 4096 bytes. The setup_header is at offset 0x1f1. */
 #define BOOT_PARAMS_SIZE        4096
 #define SETUP_HEADER_OFFSET     0x1f1
+#define BOOT_PARAMS_ACPI_RSDP_ADDR_OFF 0x070
+#define BOOT_PARAMS_RSDP_COPY_OFF      0x800
+#define BOOT_PARAMS_RSDP_COPY_SIZE     36
 
 /* Key field offsets within bzImage / boot_params */
 #define BZ_BOOT_FLAG_OFF        0x1fe
@@ -88,11 +91,10 @@ struct linux_setup_header {
 #define E820_TYPE_UNUSABLE      5
 #define E820_TYPE_PMEM          7
 
-/* e820_table entry in boot_params at offset 0x2e0 (actually 0x2d0 in older,
- * 0x2e0 in newer). We use 0x2e0 and the e820_entries count at 0x1e8.
- * Each entry is 20 bytes: u64 addr, u64 size, u32 type. */
+/* e820_table is at 0x2d0 in Linux 6.6 boot_params (arch/x86/include/uapi/asm/bootparam.h).
+ * e820_entries count is at 0x1e8. Each entry is 20 bytes: u64 addr, u64 size, u32 type. */
 #define E820_ENTRIES_OFFSET     0x1e8
-#define E820_TABLE_OFFSET       0x2e0
+#define E820_TABLE_OFFSET       0x2d0
 #define E820_MAX_ENTRIES        128
 #define E820_ENTRY_SIZE         20
 
@@ -215,10 +217,13 @@ void *linux_find_extra_rootfs_module(u64 *size_out);
  * Returns NULL when the module is absent (install skipped, non-fatal). */
 void *linux_find_vscode_module(u64 *size_out);
 
-/* Parse bzImage header and extract key parameters.
+/* Parse bzImage header and return the protected-mode image's file offset,
+ * load length, decompression allocation size, and startup_64 entry offset.
+ * The protected-mode image starts after setup sectors; setup_header's
+ * payload_offset instead locates compressed data inside that image.
  * Returns 0 on success, negative on error. */
 int linux_parse_bzimage(const void *bzimage, u64 size,
-                        u64 *payload_offset_out, u64 *payload_length_out,
+                        u64 *kernel_offset_out, u64 *kernel_length_out,
                         u64 *init_size_out, u64 *entry_offset_out);
 
 /* Initialize the Linux guest: parse bzImage, allocate guest memory,
@@ -249,9 +254,9 @@ void *linux_get_surface_vaddr(void);
 int linux_launch(void);
 
 /* Default Linux command line (can be overridden).
- * nohlt: prevent kernel idle loop from using HLT — only the exec daemon's
- *        explicit ioctl(PARK) HLT should trigger VM-Exit park, so that
- *        linux_launch() returns only after the daemon is ready.
+ * Daemon PARK is a VMCALL. Guest idle may HLT; that stays in the
+ *        guest (wait-for-IRQ). Do not use nohlt/idle=poll — poll idle
+ *        NULL-derefs current after the first real sleep.
  * noapic/nolapic/nosmp: UTSM VMM 只模拟 legacy PIC(8259) + PIT(8254)，
  *        不提供 LAPIC/IOAPIC；guest 走 XT-PIC 模式，IRQ vector = 0x30+irq。
  * virtio_mmio.device=: 向 guest 声明 virtio-mmio 设备（blk@0xF4000000 IRQ5,
@@ -259,12 +264,15 @@ int linux_launch(void);
  * VSCode Phase 2: kbd@0xF4003000 IRQ8, mouse@0xF4004000 IRQ9 (virtio-input)。
  * VSCode Phase 3: gpu@0xF4005000 IRQ10 (virtio-gpu 2D, /dev/dri/card0)。
  * VSCode Phase 4: xrootfs@0xF4006000 IRQ11 (可写 virtio-blk, /dev/vdc)。
- *        注：slot6 无对应 boot module 时后端不注册，guest 探测会超时跳过，
- *        不影响启动（virtio_mmio 对无响应设备只打一条 warn）。 */
+ *        注：无 extra-rootfs boot module 时，后端改映射 ESP 上的
+ *        boot/linux-extra-rootfs.img（AHCI+FAT32），避免 Limine 把 4GiB
+ *        打进 RAM。文件也没有则不注册，guest 探测超时跳过。 */
 #define LINUX_DEFAULT_CMDLINE \
-    "console=ttyS0,115200 earlyprintk=serial nokaslr " \
-    "no_timer_check loglevel=7 nohlt idle=poll " \
-    "noapic nolapic nosmp " \
+    "earlyprintk=serial,ttyS0,115200 console=ttyS0,115200 " \
+    "nokaslr debug loglevel=8 noinvpcid nopcid nopti pti=off nogbpages " \
+    "tsc_early_khz=2000000 lpj=4000000 i8042.nokbd i8042.noaux " \
+    "no_timer_check " \
+    "noapic nolapic nosmp ibt=off user_shstk=off " \
     "virtio_mmio.device=4K@0xF4000000:5 " \
     "virtio_mmio.device=4K@0xF4001000:6 " \
     "virtio_mmio.device=4K@0xF4002000:7 " \

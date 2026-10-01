@@ -10,7 +10,7 @@ LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
 # logo_data.c is #included directly into main.c (the DSK PIE loader only
 # handles R_X86_64_RELATIVE, so the logo array must be file-local to main.o
 # rather than a cross-unit symbol). Exclude it from standalone compilation.
-C_SOURCES := $(filter-out logo_data.c, $(wildcard *.c))
+C_SOURCES := $(filter-out logo_data.c dcp_logo_data.c xj_logo_data.c, $(wildcard *.c))
 OBJECTS := $(C_SOURCES:.c=.o)
 
 .PHONY: all clean

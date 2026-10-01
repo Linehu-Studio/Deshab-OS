@@ -24,6 +24,7 @@
 extern volatile struct limine_module_request g_module_request;
 extern volatile struct limine_hhdm_request g_hhdm_request;
 extern volatile struct limine_memmap_request g_memmap_request;
+extern volatile struct limine_rsdp_request g_rsdp_request;
 
 /* ===== Runtime helpers ===== */
 
@@ -186,7 +187,7 @@ struct __attribute__((packed)) e820_entry {
     u32 type;
 };
 
-static int setup_e820(void *bootparams_virt) {
+static int setup_e820(void *bootparams_virt, u64 ram_size) {
     u8 *bp = (u8 *)bootparams_virt;
 
     /* e820_entries count at offset 0x1e8 */
@@ -213,7 +214,10 @@ static int setup_e820(void *bootparams_virt) {
     table[n].type = E820_TYPE_RESERVED;
     n++;
 
-    /* Entry 3: 0x00400000-0x03FFFFFF: usable RAM (kernel + initrd + low RAM) */
+    /* Entry 3: 0x00400000-0x03FFFFFF: usable RAM (kernel + initrd + low RAM).
+     * Only scattered pages in this window are pre-mapped in EPT. virtio-blk
+     * READ buffers that land in the holes are demand-mapped in
+     * virtio_gpa_to_host (guest CPU never stores those pages first). */
     table[n].addr = 0x00400000;
     table[n].size = 0x03C00000;  /* 60MB */
     table[n].type = E820_TYPE_RAM;
@@ -233,11 +237,11 @@ static int setup_e820(void *bootparams_virt) {
     table[n].type = E820_TYPE_RESERVED;
     n++;
 
-    /* Entry 6: 0x05000000-0x5FFFFFFF: usable RAM (general RAM, ~1.4GB)
-     * VSCode integration Phase 1: expanded from 191MB to 1.4GB to fit
-     * VSCode + Electron + GUI stack (Xorg/modesetting + GTK + mesa). */
+    /* Entry 6: usable RAM at 0x05000000. Size MUST match the EPT mapping
+     * (may be 1.4GB / 1GB / 512MB). Advertising more than is mapped makes
+     * Linux put virtio-blk bounce buffers in a hole → I/O errors. */
     table[n].addr = LINUX_GUEST_RAM_GPA;
-    table[n].size = LINUX_GUEST_RAM_SIZE;  /* 1.4GB */
+    table[n].size = ram_size;
     table[n].type = E820_TYPE_RAM;
     n++;
 
@@ -353,6 +357,21 @@ void *linux_find_rootfs_module(u64 *size_out) {
         }
         if (!match) continue;
 
+        /* linux-extra-rootfs.img also contains "rootfs"; skip it so vdb
+         * binds to linux-rootfs.img and vdc keeps the extra volume. */
+        int extra = 0;
+        for (const char *s = p; *s; s++) {
+            if ((s[0] == 'e' || s[0] == 'E') &&
+                (s[1] == 'x' || s[1] == 'X') &&
+                (s[2] == 't' || s[2] == 'T') &&
+                (s[3] == 'r' || s[3] == 'R') &&
+                (s[4] == 'a' || s[4] == 'A')) {
+                extra = 1;
+                break;
+            }
+        }
+        if (extra) continue;
+
         if (size_out) *size_out = file->size;
         log_info("[LINUX] found rootfs module:");
         log_info(file->path);
@@ -447,7 +466,7 @@ void *linux_find_vscode_module(u64 *size_out) {
 /* ===== bzImage parser ===== */
 
 int linux_parse_bzimage(const void *bzimage, u64 size,
-                        u64 *payload_offset_out, u64 *payload_length_out,
+                        u64 *kernel_offset_out, u64 *kernel_length_out,
                         u64 *init_size_out, u64 *entry_offset_out) {
     const u8 *img = (const u8 *)bzimage;
 
@@ -486,36 +505,49 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
         return -5;
     }
 
-    /* Payload offset and length */
-    u32 payload_offset = *(u32 *)&img[BZ_PAYLOAD_OFFSET_OFF];
-    u32 payload_length = *(u32 *)&img[BZ_PAYLOAD_LENGTH_OFF];
-    log_hex64("[LINUX] payload_offset=", payload_offset);
-    log_hex64("[LINUX] payload_length=", payload_length);
-
-    if (payload_offset + payload_length > size) {
-        log_error("[LINUX] payload exceeds image size");
+    /* The bzImage's loadable protected-mode image starts after the setup
+     * sectors.  setup_header.payload_offset points to the compressed payload
+     * *inside* that image; it is not a file offset and must not be used as
+     * the source passed to startup_64. */
+    u8 setup_sects = img[0x1f1];
+    if (setup_sects == 0) setup_sects = 4;
+    u64 setup_size = ((u64)setup_sects + 1) * 512;
+    if (setup_size >= size) {
+        log_error("[LINUX] setup sectors exceed bzImage");
         return -6;
     }
 
+    u32 payload_offset = *(u32 *)&img[BZ_PAYLOAD_OFFSET_OFF];
+    u32 payload_length = *(u32 *)&img[BZ_PAYLOAD_LENGTH_OFF];
+    u64 payload_file_offset = setup_size + payload_offset;
+    if (payload_file_offset > size ||
+        payload_length > size - payload_file_offset) {
+        log_error("[LINUX] compressed payload exceeds bzImage");
+        return -7;
+    }
+    log_hex64("[LINUX] payload_offset(in protected image)=", payload_offset);
+    log_hex64("[LINUX] payload_file_offset=", payload_file_offset);
+    log_hex64("[LINUX] payload_length=", payload_length);
+
+    u64 kernel_length = size - setup_size;
+    log_hex64("[LINUX] protected kernel offset=", setup_size);
+    log_hex64("[LINUX] protected kernel length=", kernel_length);
+
     /* Init size (total memory needed for kernel init) */
     u32 init_size = *(u32 *)&img[BZ_INIT_SIZE_ACTUAL_OFF];
-    if (init_size == 0) init_size = payload_length;
+    if (init_size == 0) init_size = kernel_length;
     log_hex64("[LINUX] init_size=", init_size);
 
-    /* The 64-bit entry point is at offset 0x200 from the payload start.
-     * This is the "startup_64" symbol. */
-    u64 entry_offset = payload_offset + 0x200;
+    /* Linux x86 boot protocol: when the protected-mode image is loaded at
+     * code32_start/pref_address, its 64-bit entry startup_64 is at +0x200. */
+    u64 entry_offset = 0x200;
     log_hex64("[LINUX] entry_offset=", entry_offset);
 
-    /* Setup sectors (for real-mode header size) */
-    u8 setup_sects = img[0x1f1];
-    if (setup_sects == 0) setup_sects = 4;
-    u64 setup_size = (setup_sects + 1) * 512;
     log_hex64("[LINUX] setup_sects=", setup_sects);
     log_hex64("[LINUX] setup_size=", setup_size);
 
-    if (payload_offset_out) *payload_offset_out = payload_offset;
-    if (payload_length_out) *payload_length_out = payload_length;
+    if (kernel_offset_out) *kernel_offset_out = setup_size;
+    if (kernel_length_out) *kernel_length_out = kernel_length;
     if (init_size_out) *init_size_out = init_size;
     if (entry_offset_out) *entry_offset_out = entry_offset;
 
@@ -525,11 +557,10 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
 /* ===== Boot params setup ===== */
 
 static int setup_boot_params(void *bp_virt, u64 bp_gpa,
-                             u64 kernel_entry_gpa,
+                             u64 kernel_load_gpa,
                              u64 cmdline_gpa, u64 cmdline_len,
                              u64 initrd_gpa, u64 initrd_size,
-                             const void *bzimage) {
-    (void)bp_gpa;  /* GPA is used by EPT mapping, not needed here */
+                             const void *bzimage, u64 ram_size) {
     const u8 *img = (const u8 *)bzimage;
     u8 *bp = (u8 *)bp_virt;
 
@@ -539,10 +570,8 @@ static int setup_boot_params(void *bp_virt, u64 bp_gpa,
     /* Copy setup_header from bzImage (offset 0x1f1, length 0x1ef = 0x200 - 0x11) */
     /* The setup_header in boot_params starts at 0x1f1 and goes to 0x2xx.
      * We copy from bzImage offset 0x1f1 to boot_params offset 0x1f1. */
-    u64 hdr_copy_len = 0x210;  /* copy a generous chunk */
-    if (hdr_copy_len > BOOT_PARAMS_SIZE - SETUP_HEADER_OFFSET) {
-        hdr_copy_len = BOOT_PARAMS_SIZE - SETUP_HEADER_OFFSET;
-    }
+    /* Stop before edd_mbr_sig_buffer (0x290) / e820_table (0x2d0). */
+    u64 hdr_copy_len = 0x290 - SETUP_HEADER_OFFSET;
     mem_copy(&bp[SETUP_HEADER_OFFSET], &img[SETUP_HEADER_OFFSET], hdr_copy_len);
 
     /* Override key fields */
@@ -563,15 +592,32 @@ static int setup_boot_params(void *bp_virt, u64 bp_gpa,
         *(u32 *)&bp[BZ_RAMDISK_SIZE_OFF] = (u32)initrd_size;
     }
 
-    /* code32_start: set to kernel entry (informational) */
-    *(u32 *)&bp[BZ_CODE32_START_OFF] = (u32)kernel_entry_gpa;
+    /* code32_start is the base of the loaded protected-mode image.
+     * The 64-bit entry used by UTSM is code32_start + 0x200. */
+    *(u32 *)&bp[BZ_CODE32_START_OFF] = (u32)kernel_load_gpa;
+
+    /* The decompressor's ACPI fallback reads the legacy BDA at 0x40e, but
+     * modern Linux intentionally leaves the zero page unmapped.  Limine has
+     * already found a validated RSDP, so copy it into this guest-owned page
+     * and publish its GPA through boot_params.acpi_rsdp_addr (offset 0x70). */
+    if (g_rsdp_request.response && g_rsdp_request.response->address) {
+        mem_copy(&bp[BOOT_PARAMS_RSDP_COPY_OFF],
+                 g_rsdp_request.response->address,
+                 BOOT_PARAMS_RSDP_COPY_SIZE);
+        *(u64 *)&bp[BOOT_PARAMS_ACPI_RSDP_ADDR_OFF] =
+            bp_gpa + BOOT_PARAMS_RSDP_COPY_OFF;
+        log_hex64("[LINUX] guest RSDP GPA=",
+                  bp_gpa + BOOT_PARAMS_RSDP_COPY_OFF);
+    } else {
+        log_warn("[LINUX] Limine RSDP unavailable");
+    }
 
     /* Heap end pointer (offset 0x224): end of real-mode heap.
      * Not critical for 64-bit boot, but set a reasonable value. */
     *(u16 *)&bp[0x224] = 0xFE00;  /* heap ends at 0xFE00 */
 
     /* Set up e820 memory map */
-    int e820_count = setup_e820(bp_virt);
+    int e820_count = setup_e820(bp_virt, ram_size);
     log_hex64("[LINUX] e820 entries=", (u64)e820_count);
 
     return 0;
@@ -591,9 +637,9 @@ int linux_loader_init(void) {
     }
 
     /* 2. Parse bzImage header */
-    u64 payload_offset, payload_length, init_size, entry_offset;
+    u64 kernel_offset, kernel_length, init_size, entry_offset;
     if (linux_parse_bzimage(bzimage, bzimage_size,
-                            &payload_offset, &payload_length,
+                            &kernel_offset, &kernel_length,
                             &init_size, &entry_offset) != 0) {
         log_error("[LINUX] bzImage parse failed");
         return -2;
@@ -603,7 +649,7 @@ int linux_loader_init(void) {
 
     /* Kernel: round up init_size to page boundary, align to 2MB */
     u64 kernel_alloc_size = ((init_size + 0xFFFFF) & ~0xFFFFFULL);
-    if (kernel_alloc_size < payload_length) kernel_alloc_size = payload_length;
+    if (kernel_alloc_size < kernel_length) kernel_alloc_size = kernel_length;
     dkm_dma_buffer kernel_buf;
     if (dma_alloc_pages(kernel_alloc_size / 4096, 2 * 1024 * 1024, 0, &kernel_buf) != 0) {
         log_error("[LINUX] failed to alloc kernel memory");
@@ -670,9 +716,9 @@ int linux_loader_init(void) {
     log_hex64("[LINUX] guest RAM size=", ram_size);
 
     /* 4. Load kernel image into allocated memory */
-    const u8 *kernel_src = (const u8 *)bzimage + payload_offset;
-    mem_copy(kernel_buf.virt, kernel_src, payload_length);
-    log_hex64("[LINUX] kernel loaded, size=", payload_length);
+    const u8 *kernel_src = (const u8 *)bzimage + kernel_offset;
+    mem_copy(kernel_buf.virt, kernel_src, kernel_length);
+    log_hex64("[LINUX] protected kernel loaded, size=", kernel_length);
 
     /* 5. Set up guest page tables */
     g_guest.pgt_gpa = LINUX_GUEST_PGT_GPA;
@@ -732,10 +778,10 @@ int linux_loader_init(void) {
     }
 
     setup_boot_params(bp_buf.virt, g_guest.bootparams_gpa,
-                      g_guest.kernel_entry,
+                      g_guest.kernel_gpa,
                       g_guest.cmdline_gpa, cmdline_len,
                       g_guest.initrd_gpa, g_guest.initrd_size,
-                      bzimage);
+                      bzimage, ram_size);
     log_hex64("[LINUX] boot_params at GPA=", g_guest.bootparams_gpa);
 
     /* 9. EPT-map all guest regions (GPA → HPA) */
@@ -833,13 +879,35 @@ int linux_loader_init(void) {
         }
     }
 
+    /* e820 lists 0x00400000-0x03FFFFFF as RAM, but only kernel/initrd/boot
+     * pages were mapped. Fill the holes so virtio-blk READ buffers (often
+     * allocated here and never stored by the vCPU first) have a stable GPA→HPA. */
+    {
+        u64 gpa;
+        u64 filled = 0;
+        for (gpa = 0x00400000ULL; gpa < 0x04000000ULL; gpa += EPT_PAGE_SIZE) {
+            if (ept_gpa_to_hpa(gpa) != 0) continue;
+            dkm_dma_buffer hole;
+            if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0, &hole) != 0) {
+                log_warn("[LINUX] low-RAM hole fill OOM");
+                break;
+            }
+            if (ept_map_range(gpa, hole.phys, EPT_PAGE_SIZE, EPT_RWX) != 0) {
+                log_warn("[LINUX] low-RAM hole fill map failed");
+                break;
+            }
+            filled++;
+        }
+        log_hex64("[LINUX] low-RAM holes filled pages=", filled);
+    }
+
     /* Identity-map the first 1MB (BIOS area, needed by some Linux code paths) */
     if (ept_identity_map(0, 0x100000, EPT_RWX) != 0) {
         log_warn("[LINUX] EPT identity map first 1MB failed (non-critical)");
     }
 
     /* 10. Record guest info */
-    g_guest.kernel_size = payload_length;
+    g_guest.kernel_size = kernel_length;
     g_guest.loaded = 1;
 
     log_hex64("[LINUX] kernel GPA=", g_guest.kernel_gpa);

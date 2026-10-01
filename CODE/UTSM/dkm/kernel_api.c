@@ -57,7 +57,8 @@ static dkm_kernel_api g_kernel_api = {
     .mmio = 0,
     .mm_map_mmio = 0,
     .mm_unmap_mmio = 0,
-    .register_apic_eoi = 0
+    .register_apic_eoi = 0,
+    .sched = 0
 };
 
 const dkm_kernel_api *dkm_get_kernel_api(void) {
@@ -75,6 +76,9 @@ void dkm_fill_platform_info(void) {
     g_kernel_api.net = net_get_api();
     g_kernel_api.block = block_get_api();
     g_kernel_api.mmio = paging_get_api();
+    /* M4/Phase7-8: 调度器与恢复根服务表（drr 为原占位字段，此处激活） */
+    g_kernel_api.sched = utsm_sched_get_api();
+    g_kernel_api.drr = drr_get_recovery_api();
     if (g_rsdp_request.response && g_rsdp_request.response->address) {
         g_kernel_api.rsdp_address = g_rsdp_request.response->address;
     }

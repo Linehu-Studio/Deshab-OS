@@ -12,10 +12,15 @@
  */
 
 #include <utsm/linux_resume.h>
+#include <utsm/linux_xsave.h>
 #include <utsm/vmx.h>
 #include <utsm/vmm.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+
+/* Must be RIP-relative, not a stack slot: vmexit_asm restores guest GPRs
+ * (including RBP) before jumping here, so "=m"(local) can #PF at CR2≈0. */
+int g_linux_resume_failed;
 
 int linux_is_parked(void) {
     return g_guest_parked ? 1 : 0;
@@ -31,34 +36,50 @@ int linux_resume(void) {
     g_linux_guest_active = 1;
     g_guest_terminated = 0;
     g_guest_parked = 0;
+    vmx_linux_timeslice_reset();
+    linux_xsave_save_host();
+    linux_xsave_load_guest();
+    vmx_linux_prepare_entry();
 
-    /* vmresume 控制流（与 linux_launch 的 vmlaunch 对称）：
-     *   - 失败：执行下一条指令，failed=1
-     *   - 成功：进入 guest，不返回。VM-Exit 后跳到 vmx_vm_exit_handler。
-     *   - guest park 时，handler 恢复 saved_rsp 并 jmp 到 post_resume 标签。 */
-    int failed;
+    /* vmresume 控制流（与 linux_launch 的 vmlaunch 对称）。
+     * clobber 全 GPR：从 park 跳回时 CPU 上是 guest 寄存器。 */
+    g_linux_resume_failed = 1;
     __asm__ volatile(
-        "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"      /* 保存当前 RSP */
-        "leaq 1f(%%rip), %%rax\n\t"                     /* 取 post_resume 标签地址 */
-        "movq %%rax, g_saved_return_rip(%%rip)\n\t"     /* 保存返回 RIP */
-        "vmresume\n\t"                                  /* 唤醒 guest */
-        /* ---- 失败路径 ---- */
-        "movl $1, %0\n\t"
+        "pushq %%rbx\n\t"
+        "pushq %%rbp\n\t"
+        "pushq %%r12\n\t"
+        "pushq %%r13\n\t"
+        "pushq %%r14\n\t"
+        "pushq %%r15\n\t"
+        "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+        "vmresume\n\t"
+        "movl $1, g_linux_resume_failed(%%rip)\n\t"
         "jmp 2f\n\t"
-        /* ---- post_resume: park 路径 jmp 到这里 ---- */
         "1:\n\t"
-        "movl $0, %0\n\t"
+        "movl $0, g_linux_resume_failed(%%rip)\n\t"
         "2:\n\t"
-        : "=r"(failed)
-        :: "rax", "rcx", "rdx", "rsi", "rdi",
-           "r8", "r9", "r10", "r11", "memory"
+        "popq %%r15\n\t"
+        "popq %%r14\n\t"
+        "popq %%r13\n\t"
+        "popq %%r12\n\t"
+        "popq %%rbp\n\t"
+        "popq %%rbx\n\t"
+        :
+        :
+        : "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11", "cc", "memory"
     );
 
     /* 回到 host 上下文 */
     g_linux_guest_active = 0;
-    g_guest_parked = 1;   /* guest 再次 park */
+    g_guest_parked = 1;
+    vmx_linux_timeslice_disarm();
+    linux_xsave_save_guest();
+    linux_xsave_load_host();
 
-    if (failed) {
+    if (g_linux_resume_failed) {
         u64 error = vmx_vmcs_read(VMCS_VMX_INSTRUCTION_ERROR);
         log_hex64("[LINUX] vmresume failed, error=", error);
         return -2;

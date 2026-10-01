@@ -27,7 +27,7 @@
 | 编号 | 功能 | 疯的意义 | 状态 | 验收标准 |
 |------|------|---------|------|---------|
 | F1 | 内核 panic 统一兜底 | 崩了也得崩出莲花 | ✅ | panic_symbol + 莲花崩溃屏 + 寄存器简表 + DRR 归档后 halt |
-| F2 | UEFI 帧缓冲控制台 | 疯要有画面 | 🔶 | console_fb 已可出字；统一控制台抽象（无 VGA 回退也出宋体）⬜ |
+| F2 | UEFI 帧缓冲控制台 | 疯要有画面 | 🔶 | fbcon.h 抽象已落（panic 路径使用）；统一控制台后端 ⬜ |
 | F3 | 构建跨平台（Make/CMake） | 疯不应绑 Windows | ⬜ | 当前 build.ps1 + WSL mkfs；Linux/macOS make iso 待做 |
 | F4 | 状态机自检 boot_ok | 知道自己是几成疯 | ✅ | 启动分级自检（IDT/UTSM/DKM/调度器/DRR），输出 ✅/🔶 明细 |
 | F5 | 可跳过 FirstInit | 自由的第一步 | ✅ | FUCK `[dsk] skip_firstinit=1` 直达 desktop；build/configs 模板注入生效 |

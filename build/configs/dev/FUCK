@@ -1,4 +1,4 @@
-# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
+﻿# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
 # build.ps1 -Variant dev 打包前注入 SYSTEM/system/deshab64/FUCK
 # 开发者模式：selftest 开、dev_mode 自动跑 shell.elf 测试、日志持久化、跳过向导直达桌面
 
@@ -89,3 +89,5 @@ lib_path=lib
 linux_lib_guest_path=/usr/lib/deshab
 linux_lib_sync=1
 pe_dll_search=1
+
+

@@ -8,7 +8,7 @@
 - [x] F1 内核 panic 统一兜底（莲花崩溃屏 + panic_symbol + DRR 归档）
 - [x] F4 boot_ok 分级启动自检（`[boot] selftest=0|1|2`）
 - [x] F5 可跳过 FirstInit（`[dsk] skip_firstinit` + build/configs 模板）
-- [ ] F2 统一帧缓冲控制台抽象（console_fb 雏形 🔶）
+- [x] F2 统一帧缓冲控制台抽象（fbcon.h：panic 路径已用；统一控制台后端待做）
 - [ ] F3 跨平台构建（Make/CMake）
 
 ## 🗝️ 二期：仪式（UTSM/UTRW）

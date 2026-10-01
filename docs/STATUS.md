@@ -15,8 +15,9 @@
 | LAPIC timer | ✅ | TSC 校准 + 周期模式，[sched] 配置 | M4 QEMU 日志 |
 | DMA 物理页分配器 | ✅ | bitmap，低 4G 钳位 | e1000 DMA 根治记录 |
 | 页表映射接口（map/unmap） | ⬜ | mmio 通用映射待做 | — |
-| panic 统一兜底（F1） | ✅ | 莲花崩溃屏 + panic_symbol + DRR 归档；CPU 异常/驱动 panic 统一入口 | `.build_tmp/qemu_serial_f1panic.log` |
+| panic 统一兜底（F1） | ✅ | DEAICUP 莲花崩溃屏（ohMyLogo.png 内嵌，背景=图片背景色）+ panic_symbol + DRR 归档；CPU 异常/驱动 panic 统一入口 | `.build_tmp/panic_screen.png` + qemu_serial_f1logo2.log |
 | boot 分级自检（F4） | ✅ | `[boot] selftest=0\|1\|2`，5 项全过 BOOT-OK | `.build_tmp/qemu_serial_f1f4f5.log` |
+| 帧缓冲控制台抽象 fbcon（F2） | 🔶 | `include/utsm/fbcon.h`：像素/混合/填充/RGBA 图像/文本（panic 路径已用）；统一控制台后端 ⬜ | `CODE/UTSM/include/utsm/fbcon.h` |
 | 构建系统 | 🔶 | Windows build.ps1 + WSL mkfs；跨平台 ⬜ | build.ps1 |
 
 ## UTSM / UTRW

@@ -735,6 +735,30 @@ if (Test-Path $LogoPng) {
 } else {
     Write-Host '[build] WARNING: Logo.png not found'
 }
+
+# Generate panic_logo_data.inc from ohMyLogo.png (panic screen logo + bg color)
+$PanicLogoPng = Join-Path $Root 'ohMyLogo.png'
+$PanicLogoInc = Join-Path $UtsmDir 'kernel\panic_logo_data.inc'
+$PanicGenPy   = Join-Path $UtsmDir 'kernel\gen_panic_logo.py'
+if (Test-Path $PanicLogoPng) {
+    $Python = $null
+    foreach ($p in @('C:\Users\林濬哲\AppData\Local\Programs\Python\Python312\python.exe',
+                     'C:\msys64\mingw64\bin\python.exe',
+                     'python', 'python3')) {
+        try { $cmd = Get-Command $p -ErrorAction Stop; $Python = $cmd.Source; break } catch {}
+    }
+    if ($Python) {
+        if (-not (Test-Path $PanicLogoInc) -or ((Get-Item $PanicLogoPng).LastWriteTime -gt (Get-Item $PanicLogoInc).LastWriteTime)) {
+            Write-Host '[build] Generating panic_logo_data.inc from ohMyLogo.png...'
+            & $Python $PanicGenPy $PanicLogoPng $PanicLogoInc
+            if ($LASTEXITCODE -ne 0) { Write-Host '[build] WARNING: panic_logo_data.inc generation failed, using existing file' }
+        }
+    } else {
+        Write-Host '[build] WARNING: Python not found, cannot regenerate panic_logo_data.inc'
+    }
+} else {
+    Write-Host '[build] WARNING: ohMyLogo.png not found (panic screen keeps embedded data)'
+}
 try {
     & $make -C "$DskDir" -f MAKEFILE "CC=$clang" "LD=$lld"
     if ($LASTEXITCODE -ne 0) {

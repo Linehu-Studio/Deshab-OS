@@ -76,6 +76,20 @@
 
 ## 文档体系
 
+### FS-E 系列：文件系统读写严格模式（2026-10-02）
+
+| 项 | 状态 | 说明 | 证据 |
+|----|------|------|------|
+| ext4 读写驱动（CODE/dsk/ext4.c） | ✅ | GPT 定位 p2 + feature 校验 + extent 树(depth0/1)读写 + 块/inode 分配回收 + 目录项插入 + 写后回读校验；启动自检 PASS | `.build_tmp/qemu_run.log`（[EXT4] selftest PASS） |
+| FAT32 大盘写修复 | ✅ | 按需 FAT 表项 RMW（fat32_fat_read/write_entry）+ 块状空闲簇扫描（fat32_find_free_cluster）；修复 rec_len +4 收缩偏移与 chunk 对齐两处错位 | 同上（USER.CONF verify ok → firstInit.txt flip ok） |
+| FS-E01..E07 / FS-E2x / FS-E3x 插桩 | ✅ | 写失败/校验不符/feature 不支持/路径缺失 → 莲花 panic 零降级 | `.build_tmp/qemu_run.log`（FS-E02/E06/E22 复现） |
+| 向导后强制重登 | ✅ | first-boot 分支 FirstInit→persist→login；登录跳过/失败 → FS-E06 panic | 同上（login success → desktop ready） |
+| NET-E01 网络页 Connect panic | ✅ | 无 wlan 栈，Connect 即 panic；Save(仅存配置) 为唯一前进路径 | 同上（NET-E01 复现，fb pmemsave 确认莲花屏） |
+| 主镜像改挂 SATA（run_qemu.bat） | ✅ | DSK/AHCI 块层必须可见 GPT 盘才能访问 p2 ext4；边车退居 ide.1 | run_qemu.bat |
+| 开机画面去 Logo | ✅ | 移除 Logo.png 图像，仅保留居中 "DESHAB P01" 文字；dcp/xj logo 改由 TEXTURES/ 重新生成 | build 日志 |
+
+## 文档体系
+
 | 文档 | 状态 | 说明 |
 |------|------|------|
 | [STATUS.md](./STATUS.md) | ✅ | 单一状态源（本文件） |

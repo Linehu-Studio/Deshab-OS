@@ -231,6 +231,51 @@ static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y,
     }
 }
 
+/* ---- 严格错误策略：NET-E 系列 lotus fatal（零降级） ----
+ * 内嵌 ohMyLogo 莲花（与 login.elf / DSK 同源），任何未实现/失败路径
+ * 整屏显示错误码后停机。 */
+#include "../login/ohmylogo_data.c"
+
+static u64 fi_fat_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
+
+static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color);
+static void firstinit_fatal(const char *sym) {
+    logl(sym);
+    if (fb_a) {
+        u32 *fb = (u32 *)(u64)fb_a;
+        fill_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h, 0xFF020F22u);
+        i64 lx = ((i64)fb_w - g_panic_logo_w) / 2;
+        i64 ly = ((i64)fb_h - g_panic_logo_h) / 2 - 60;
+        if (ly < 0) ly = 0;
+        for (i64 r = 0; r < g_panic_logo_h; r++) {
+            for (i64 c = 0; c < g_panic_logo_w; c++) {
+                const unsigned char *px4 =
+                    g_panic_logo_rgba + ((u64)r * g_panic_logo_w + (u64)c) * 4;
+                u32 a = px4[3];
+                if (a < 8) continue;
+                u32 col = 0xFF000000u | ((u32)px4[0] << 16) | ((u32)px4[1] << 8) | px4[2];
+                if (a < 250) {
+                    u32 bg = 0xFF020F22u;
+                    u32 na = 256 - a;
+                    u32 rr = (((bg >> 16) & 0xFF) * na + ((col >> 16) & 0xFF) * a) >> 8;
+                    u32 gg = (((bg >> 8) & 0xFF) * na + ((col >> 8) & 0xFF) * a) >> 8;
+                    u32 bb = ((bg & 0xFF) * na + (col & 0xFF) * a) >> 8;
+                    col = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+                }
+                i64 xx = lx + c, yy = ly + r;
+                if (xx < 0 || (u64)xx >= fb_w || yy < 0 || (u64)yy >= fb_h) continue;
+                *(u32 *)((u8 *)fb + (u64)yy * fb_p + (u64)xx * 4) = col;
+            }
+        }
+        i64 ty = ly + g_panic_logo_h + 24;
+        fb_text(fb, sym, ((i64)fb_w - (i64)fi_fat_strlen(sym) * ASCII_STEP) / 2,
+                ty, 0xFFF2D8D8u, 0);
+        fb_text(fb, "DESHAB NET FATAL - SYSTEM HALTED",
+                ((i64)fb_w - 32 * ASCII_STEP) / 2, ty + ASCII_H + 16, 0xFFB08890u, 0);
+    }
+    for (;;) __asm__("cli; hlt");
+}
+
 static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
     for (i64 r=0; r<h; r++) {
         i64 yy = y + r;
@@ -1201,6 +1246,8 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 }
                 /* 连接按钮 */
                 if (*mx >= card_x + 680 && *mx < card_x + 860 && *my >= card_y + 310 && *my < card_y + 354) {
+                    /* 严格错误策略：无 wlan 驱动栈 —— 零降级 panic */
+                    firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
                     net->connected = 1;
                     logl("[FirstInit] network connect requested");
                     redraw_network_card(fb, card_x, card_y, net, NET_ACT_CONNECT, *mx, *my, bg, fg);
@@ -1246,6 +1293,8 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 for (int i=0;i<30;i++) delay_frame();
                 return;
             } else if (active == NET_ACT_CONNECT) {
+                /* 严格错误策略：无 wlan 驱动栈，"连接"是未实现路径 —— 零降级 panic */
+                firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
                 net->connected = 1;
                 logl("[FirstInit] network connect requested");
                 redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);

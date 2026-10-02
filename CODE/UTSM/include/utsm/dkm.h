@@ -33,6 +33,30 @@
 struct dkm_kernel_api;
 struct dkm_driver_handle;
 
+/* ===================================================================
+ *  D3: 内核 API 按名导出表（kapi）
+ *
+ *  "自由也要有地图。" 固定偏移 struct ABI 之外的按名查找层：
+ *  驱动/用户态可枚举内核服务并按名取函数指针。
+ *  通过 kernel_api 尾部追加的 ->kapi 指针访问（ABI 兼容）。
+ * =================================================================== */
+typedef struct {
+    const char *name;   /* 如 "log.info"、"dma.alloc_pages" */
+    void *fn;           /* 服务函数指针（签名见对应服务头） */
+} dkm_kapi_entry;
+
+typedef struct {
+    u32 magic;          /* DKM_KAPI_MAGIC */
+    u32 version;        /* DKM_KAPI_VERSION */
+    u32 count;          /* entries 数量 */
+    const dkm_kapi_entry *entries;
+    /* 按名查找：命中返回 0 并写 out_fn；未命中 -1 */
+    int (*lookup)(const char *name, void **out_fn);
+} dkm_kapi_table;
+
+#define DKM_KAPI_MAGIC   0x4b415049u  /* "KAPI" */
+#define DKM_KAPI_VERSION 1u
+
 typedef struct dkm_driver_desc {
     u32 magic;
     u16 abi_version;
@@ -133,6 +157,9 @@ typedef struct dkm_kernel_api {
      * 驱动可用：task_create/uptime/sleep/current_task_slot。
      * DSK 以 api+0xA8 硬偏移读 block 的约定不受影响（仅尾部追加）。 */
     const utsm_sched_api *sched;
+    /* D3: 按名导出表（尾部追加，ABI 兼容）。驱动/用户态枚举内核服务并
+     * 按名取函数指针；固定偏移 struct 字段不受影响。 */
+    const dkm_kapi_table *kapi;
 } dkm_kernel_api;
 
 typedef enum dkm_driver_state {
@@ -160,6 +187,7 @@ typedef struct dkm_builtin_driver {
 void dkm_init(void);
 /* D4: 设置当前驱动日志颜色上下文（driver_init 前设置，返回后清 0） */
 void dkm_log_set_driver(const char *name);
+
 int dkm_load_builtin(const dkm_builtin_driver *driver);
 void dkm_scan_boot_modules(void);
 void dsm_load_by_manifest(void);

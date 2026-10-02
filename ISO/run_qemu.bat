@@ -143,17 +143,15 @@ if exist "%USB_IMG%" (
 )
 
 REM ===== Boot disk attach =====
-REM Main disk must use explicit virtio-blk-pci + bootindex=1: with plain
-REM "-drive if=virtio", OVMF only auto-creates a boot entry when virtio-blk
-REM lands on PCI slot 0x3 (no other PCI devices). Adding NVMe/USB/e1000 moves
-REM it to 0x4/0x5 and OVMF boot enumeration silently drops the ESP, falling
-REM back to EFI Internal Shell even though BOOTX64.EFI is present and valid.
+REM Main disk must use explicit ide-hd + bootindex=1: the DSK/AHCI block
+REM provider only registers the first ready SATA port, so the GPT image
+REM (p1 FAT32 ESP + p2 ext4) has to live on SATA for DSK to see ext4 at all.
 REM bootindex=1 injects the fw_cfg bootorder entry so OVMF always picks it.
-set "OSDISK_OPTS=-drive if=none,id=osdisk,format=raw,file="%IMG%" -device virtio-blk-pci,drive=osdisk,bootindex=1"
+set "OSDISK_OPTS=-drive if=none,id=osdisk,format=raw,file="%IMG%" -device ide-hd,drive=osdisk,bus=ide.0,bootindex=1"
 
 if exist "%SATA_IMG%" (
     echo [qemu] SATA:  %SATA_IMG%
-    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 12G -cpu %QEMU_CPU% %SERIAL_ARGS% -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.0 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
+    "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 12G -cpu %QEMU_CPU% %SERIAL_ARGS% -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% -drive id=sata0,format=raw,file="%SATA_IMG%",if=none -device ide-hd,drive=sata0,bus=ide.1 %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -boot menu=on
 ) else (
     echo [qemu] SATA image not found, booting without block device
     "%QEMU%" -accel %QEMU_ACCEL% -machine q35 -m 12G -cpu %QEMU_CPU% %SERIAL_ARGS% -drive if=pflash,format=raw,readonly=on,file="%OVMF%" %OSDISK_OPTS% %NVME_OPTS% %USB_OPTS% -netdev user,id=net0 -device e1000,netdev=net0 -boot menu=on

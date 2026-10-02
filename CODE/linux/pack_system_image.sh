@@ -174,7 +174,11 @@ if [[ "$esp_bytes" -ge $((4096 * 1024 * 1024)) ]]; then
 fi
 
 mkfs.vfat -F 32 -n DESHABBOOT -s "$fat_cluster_sectors" "$p1" >/dev/null
-mkfs.ext4 -F -q -L DESHAB -U "$EXT4_UUID" -m 1 "$p2"
+# DSK 内嵌 ext4 读写驱动支持范围：4K block / 256B inode / extent 树，
+# 不支持 journal、metadata_csum、64bit（遇到即 panic FS-E28）——
+# 因此这里必须显式关闭这三个 feature。
+mkfs.ext4 -F -q -L DESHAB -U "$EXT4_UUID" -m 1 \
+    -b 4096 -I 256 -O ^has_journal,^metadata_csum,^64bit,^resize_inode "$p2"
 echo "[pack] filesystems:"
 blkid "$p1" "$p2" || true
 

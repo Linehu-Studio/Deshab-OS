@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env python3
-"""Generate panic_logo_data.inc from ohMyLogo.png (root).
+#!/usr/bin/env python3
+"""Generate RGBA8888 C array from a PNG (panic screen / login intro logo).
 
-- Downscale logo to 384px wide (keep aspect), RGBA8888
-- Sample the 4 corners (averaged) as the panic-screen background color
-Usage: python gen_panic_logo.py <ohMyLogo.png> <panic_logo_data.inc>
+- Downscale logo to target width (keep aspect), RGBA8888
+- Sample the 4 corners (averaged) as background color
+Usage: python gen_panic_logo.py <src.png> <out.c> [target_width]
 """
 import sys
 from PIL import Image
@@ -16,10 +16,11 @@ TARGET_W = 384
 def main() -> None:
     src = sys.argv[1] if len(sys.argv) > 1 else SRC
     dst = sys.argv[2] if len(sys.argv) > 2 else DST
+    target_w = int(sys.argv[3]) if len(sys.argv) > 3 else TARGET_W
     im = Image.open(src).convert("RGBA")
     w0, h0 = im.size
-    scale = TARGET_W / w0
-    w, h = TARGET_W, max(1, round(h0 * scale))
+    scale = target_w / w0
+    w, h = target_w, max(1, round(h0 * scale))
     im = im.resize((w, h), Image.LANCZOS)
     px = im.load()
 

@@ -3,6 +3,9 @@
 #include <utsm/idt.h>
 #include <utsm/net.h>
 #include <utsm/mm.h>
+#include <utsm/dma.h>
+#include <utsm/drr.h>
+#include <utsm/utrw.h>
 #include <utsm/panic.h>
 
 static void dkm_api_info(const char *msg) {
@@ -81,12 +84,56 @@ static dkm_kernel_api g_kernel_api = {
     .mm_map_mmio = 0,
     .mm_unmap_mmio = 0,
     .register_apic_eoi = 0,
-    .sched = 0
+    .sched = 0,
+    .kapi = 0
 };
 
 const dkm_kernel_api *dkm_get_kernel_api(void) {
     return &g_kernel_api;
 }
+
+/* ===================================================================
+ *  D3: 按名导出表（kapi）——自由也要有地图
+ * =================================================================== */
+
+static const dkm_kapi_entry g_kapi_entries[] = {
+    { "log.info",           (void *)dkm_api_info },
+    { "log.warn",           (void *)dkm_api_warn },
+    { "log.error",          (void *)dkm_api_error },
+    { "log.panic",          (void *)dkm_api_panic },
+    { "dma.alloc_pages",    (void *)dma_alloc_pages },
+    { "irq.register",       (void *)irq_register },
+    { "irq.vector_alloc",   (void *)irq_vector_alloc },
+    { "irq.vector_free",    (void *)irq_vector_free },
+    { "mm.map_mmio",        (void *)mm_map_mmio },
+    { "mm.unmap_mmio",      (void *)mm_unmap_mmio },
+    { "apic.register_eoi",  (void *)idt_register_apic_eoi },
+    { "drr.snapshot_dirty", (void *)drr_ckpt_snapshot_dirty },
+    { "drr.rollback_pages", (void *)drr_rollback_pages },
+    { "utrw.debug_dump",    (void *)utrw_debug_dump_page },
+};
+
+static int kapi_lookup(const char *name, void **out_fn) {
+    if (!name) return -1;
+    for (u32 i = 0; i < sizeof(g_kapi_entries) / sizeof(g_kapi_entries[0]); i++) {
+        const dkm_kapi_entry *e = &g_kapi_entries[i];
+        const char *a = e->name, *b = name;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) {
+            if (out_fn) *out_fn = e->fn;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static const dkm_kapi_table g_kapi_table = {
+    .magic = DKM_KAPI_MAGIC,
+    .version = DKM_KAPI_VERSION,
+    .count = sizeof(g_kapi_entries) / sizeof(g_kapi_entries[0]),
+    .entries = g_kapi_entries,
+    .lookup = kapi_lookup,
+};
 
 #include "../arch/x86_64/limine.h"
 extern volatile struct limine_rsdp_request g_rsdp_request;
@@ -127,4 +174,6 @@ void dkm_fill_platform_info(void) {
     /* B7 阶段3: 暴露动态向量分配器（MSI/MSI-X 设备驱动使用） */
     g_kernel_api.irq_vector_alloc = irq_vector_alloc;
     g_kernel_api.irq_vector_free = irq_vector_free;
+    /* D3: 按名导出表挂入 kernel_api（尾部追加，ABI 兼容） */
+    g_kernel_api.kapi = &g_kapi_table;
 }

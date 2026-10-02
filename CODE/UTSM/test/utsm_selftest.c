@@ -1,6 +1,8 @@
 #include <utsm/utsm.h>
 #include <utsm/pckc.h>
 #include <utsm/crypto.h>
+#include <utsm/dma.h>
+#include <utsm/dkm.h>
 #include <utsm/log.h>
 #include <utsm/segment.h>
 #include <utsm/arena.h>
@@ -188,6 +190,38 @@ int utsm_selftest_run(void) {
             return (status == UTSM_OK) ? UTSM_ERR_INVALID : status;
         }
         log_info("[UTSM] selftest unsealed segment ok (plain storage)");
+    }
+
+    /* ==== D3: 按名导出表（kapi）——按名取服务并调用 ==== */
+    {
+        const dkm_kernel_api *api = dkm_get_kernel_api();
+        if (!api->kapi || api->kapi->magic != DKM_KAPI_MAGIC) {
+            log_error("[UTSM] selftest kapi table missing");
+            return UTSM_ERR_INVALID;
+        }
+        void *fn = 0;
+        if (api->kapi->lookup("log.info", &fn) != 0) {
+            log_error("[UTSM] selftest kapi lookup log.info failed");
+            return UTSM_ERR_INVALID;
+        }
+        void (*klog)(const char *) = (void (*)(const char *))fn;
+        klog("[UTSM] selftest kapi: log.info via export table");
+        if (api->kapi->lookup("dma.alloc_pages", &fn) != 0) {
+            log_error("[UTSM] selftest kapi lookup dma failed");
+            return UTSM_ERR_INVALID;
+        }
+        int (*kalloc)(u64, u64, u64, dkm_dma_buffer *) = (int (*)(u64, u64, u64, dkm_dma_buffer *))fn;
+        dkm_dma_buffer kbuf;
+        if (kalloc(1, 4096, 0xFFFFFFFFULL, &kbuf) != 0 || !kbuf.virt) {
+            log_error("[UTSM] selftest kapi dma alloc failed");
+            return UTSM_ERR_INVALID;
+        }
+        if (api->kapi->lookup("no.such.service", &fn) == 0) {
+            log_error("[UTSM] selftest kapi negative lookup failed");
+            return UTSM_ERR_INVALID;
+        }
+        log_hex64("[UTSM] selftest kapi entries=", api->kapi->count);
+        log_info("[UTSM] selftest kapi ok");
     }
 
     /* ==== SCHED-1: O(1) runqueue 语义（合成 TCB，协作式，无 tick） ==== */

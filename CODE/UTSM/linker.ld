@@ -27,6 +27,16 @@ SECTIONS
         *(COMMON)
     } :data
 
+    /* U3: @sealed 段标记 —— 用户代码可把静态数据放进 .sealed section
+     *（__attribute__((section(".sealed")))），UTSM 侧可遍历
+     * [__sealed_start, __sealed_end) 对该区建立封缄段。未标记数据 0 开销。 */
+    .sealed : ALIGN(4K) {
+        __sealed_start = .;
+        *(.sealed)
+        *(.sealed.*)
+        __sealed_end = .;
+    } :data
+
     .bss : ALIGN(4K) {
         *(.bss*)
     } :data

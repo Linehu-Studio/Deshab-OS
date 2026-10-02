@@ -156,6 +156,40 @@ int utsm_selftest_run(void) {
         log_info("[UTSM] selftest slow POISONED ok");
     }
 
+    /* ==== U3: @sealed 可选标记 —— unsealed 段明文直存（0 加解密开销） ==== */
+    {
+        utsm_capability ucap;
+        status = utsm_create_segment(process, UTSM_PAGE_SIZE,
+                                     UTSM_SEG_F_READ | UTSM_SEG_F_WRITE |
+                                         UTSM_SEG_F_UNSEALED,
+                                     &ucap);
+        if (status != UTSM_OK) {
+            log_error("[UTSM] selftest unsealed segment create failed");
+            return status;
+        }
+        const char *upl = "unsealed plain text 00";
+        u64 ulen = strlen(upl) + 1;
+        status = utsm_write(ucap, 128, upl, ulen);
+        if (status != UTSM_OK) {
+            log_error("[UTSM] selftest unsealed write failed");
+            return status;
+        }
+        utsm_segment_desc *udesc = utsm_get_segment(ucap.segment_slot);
+        if (!udesc) return UTSM_ERR_INVALID;
+        /* 明文直存：存储区内容必须与明文完全一致（0 开销的可观察证据） */
+        if (memcmp(udesc->cipher_base + 128, upl, ulen) != 0) {
+            log_error("[UTSM] selftest unsealed store not plaintext");
+            return UTSM_ERR_INVALID;
+        }
+        char urb[64];
+        status = utsm_read(ucap, 128, urb, ulen);
+        if (status != UTSM_OK || memcmp(urb, upl, ulen) != 0) {
+            log_error("[UTSM] selftest unsealed read failed");
+            return (status == UTSM_OK) ? UTSM_ERR_INVALID : status;
+        }
+        log_info("[UTSM] selftest unsealed segment ok (plain storage)");
+    }
+
     /* ==== SCHED-1: O(1) runqueue 语义（合成 TCB，协作式，无 tick） ==== */
     /* ==== SCHED-1 + SCHED-2: runqueue / block-wake（tick 竞态保护） ==== */
     {

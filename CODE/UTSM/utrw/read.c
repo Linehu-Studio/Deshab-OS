@@ -20,6 +20,12 @@ int utsm_read(utsm_capability cap, u64 offset, void *dst, u64 len) {
         return status;
     }
 
+    /* U3: @unsealed 段 —— 明文直存，0 加解密开销（capability 校验照走） */
+    if (desc->flags & UTSM_SEG_F_UNSEALED) {
+        memcpy(dst, desc->cipher_base + offset, len);
+        return UTSM_OK;
+    }
+
     utsm_key_material key;
     status = utsm_pckc_get_or_derive(cap.segment_slot, desc, &key);
     if (status != UTSM_OK) {

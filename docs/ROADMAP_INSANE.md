@@ -44,11 +44,11 @@ Deshab 最标志性的疯点——给空气上锁。
 |------|------|---------|------|-------------------|
 | U1 | UTSM 元数据区（UUID 表） | 每页都有"身份" | ✅ | 封缄段表 + UUID 调谐已就位（`CODE/UTSM/core/segment.c`），可查询页归属 |
 | U2 | UTRW Fast/Slow Path 真分支 | 快慢路不是画出来的 | ✅ | Fast path ✅；Slow path ✅（EPOCH/KEY_MISS 恢复，MAC_FAILED/POISONED 交 DRR，selftest PASS） |
-| U3 | `@sealed` 段可选标记 | 用户能选锁不锁 | ⬜ | 链接脚本支持 `__sealed` section；未标记段 0 开销 |
+| U3 | `@sealed` 段可选标记 | 用户能选锁不锁 | ✅ | `UTSM_SEG_F_UNSEALED` 明文直存（0 加解密开销）+ linker.ld `.sealed` section（`__sealed_start/end`）；selftest PASS |
 | U4 | 密文页 dump 工具 | 发疯也要可调试 | ✅ | `utrw_debug_dump_page`：串口 64B 密文/明文 hex 对照，selftest 内置演示（QEMU PASS） |
 | U5 | UTSM selftest 全覆盖 | 把🔶刷成✅ | ✅ | chacha20 KAT = RFC 8439 §2.4.2 官方向量（三方对拍）；"间歇 FAIL" 确认为幽灵缺陷（从未合并进树）；KAT+MAC 确定性+段表+越界+调度+DRR 全量稳定 PASS |
 
-二期做完：UTSM 从"设计"变"可开关的特性"，疯得有旋钮。
+**二期完成：UTSM 从"设计"变成"可开关的特性"，疯得有旋钮。**
 
 ---
 

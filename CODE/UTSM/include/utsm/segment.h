@@ -22,6 +22,10 @@ typedef enum {
 #define UTSM_SEG_F_EXEC            (1U << 2)
 #define UTSM_SEG_F_DMA             (1U << 3)
 #define UTSM_SEG_F_STRONG_RECOVERY (1U << 4)
+/* U3: @sealed 可选标记。默认（不加此 flag）= 封缄段（密文存储，读写走 UTRW
+ * 加解密）；加 UTSM_SEG_F_UNSEALED = 明文直存段（0 加解密开销，读写仍走
+ * capability 校验与 dirty 跟踪，但直接 memcpy）。"用户能选锁不锁"。 */
+#define UTSM_SEG_F_UNSEALED        (1U << 5)
 
 typedef struct utsm_segment_desc {
     uuid128_t segment_uuid;

@@ -15,7 +15,7 @@
 
 - [x] U1 UTSM 元数据区 / UUID 调谐表
 - [x] U2 UTRW Slow Path 真分支（EPOCH/KEY_MISS 恢复 + MAC_FAILED/POISONED→DRR；selftest PASS）
-- [ ] U3 `@sealed` 段可选标记（链接脚本 `__sealed` section）
+- [x] U3 `@sealed` 段可选标记（`UTSM_SEG_F_UNSEALED` 明文直存段 + linker.ld `.sealed` section；selftest PASS）
 - [x] U4 密文页 dump 工具（utrw_debug_dump_page：密文/明文 hex 对照，selftest 演示 PASS）
 - [x] U5 UTSM selftest 全覆盖（RFC 8439 KAT 落地，"间歇 FAIL" 确认为幽灵缺陷；全量稳定 PASS）
 

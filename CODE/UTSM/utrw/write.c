@@ -21,6 +21,18 @@ int utsm_write(utsm_capability cap, u64 offset, const void *src, u64 len) {
         return status;
     }
 
+    /* U3: @unsealed 段 —— 明文直存，0 加解密开销；dirty/seqlock/log 照走，
+     * checkpoint 路径对明文页同样适用（页 MAC 语义由 DRR 侧统一处理）。 */
+    if (desc->flags & UTSM_SEG_F_UNSEALED) {
+        drr_log_write_intent(cap.segment_slot, offset, len);
+        desc->writer_seq++;
+        memcpy(desc->cipher_base + offset, src, len);
+        utsm_mark_dirty(desc, offset, len);
+        desc->writer_seq++;
+        drr_log_write_commit(cap.segment_slot, offset, len);
+        return UTSM_OK;
+    }
+
     utsm_key_material key;
     status = utsm_pckc_get_or_derive(cap.segment_slot, desc, &key);
     if (status != UTSM_OK) {

@@ -338,6 +338,9 @@ void kernel_main(void) {
     log_info("[UTSM] drr init begin");
     INSTR_TS_DECL(ts_drr);
     INSTR_TS_BEGIN(ts_drr);
+    /* R3b: FUCK [utsm] drr_emergency_pool_kb / drr_recovery_log_size 接线 */
+    drr_apply_config((u64)ini_get_int(cfg, "utsm", "drr_emergency_pool_kb", 0),
+                     (u64)ini_get_int(cfg, "utsm", "drr_recovery_log_size", 0));
     drr_init();
     INSTR_TS_END(ts_drr, "drr_init");
     log_info("[UTSM] drr init ok");

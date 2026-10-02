@@ -32,7 +32,7 @@
 - [x] R1 checkpoint 快照（A/B 双槽 + CRC64 + 原子切换）
 - [x] R2 看门狗（timeout 检出 + 回滚/复位，负向测试 PASS）
 - [x] R3 Emergency Pool（64KB 编译期独立池）
-- [ ] R3b `drr_emergency_pool_kb` / `drr_recovery_log_size` FUCK 键接线
+- [x] R3b `drr_emergency_pool_kb` / `drr_recovery_log_size` FUCK 键接线（运行期钳位到编译期上限）
 - [ ] R4 A/B 回滚收尾（segment/system 级验证，依赖真实加密）
 - [ ] R5 PCQ 多核（per-cpu runqueue 负载均衡；BSP-only 🔶）
 

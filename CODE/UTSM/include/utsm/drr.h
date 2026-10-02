@@ -102,6 +102,10 @@ typedef struct {
 /* ---- 公共接口 ---- */
 
 void drr_init(void);
+/* R3b: FUCK [utsm] 配置接线（须在 drr_init 前调用；0 = 用编译期默认）。
+ * pool_kb 钳位到编译期静态池上限（Emergency Pool 为编译期数组，运行期只
+ * 能缩小可用量）；recovery_log_size 钳位到池内剩余容量。 */
+void drr_apply_config(u64 pool_kb, u64 recovery_log_size);
 const u64 *drr_get_root_key(void);
 u64 drr_recovery_generation(void);
 void drr_report_fault(const char *reason);

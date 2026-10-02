@@ -175,7 +175,7 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 1. **一期 F 系列收尾**: F2 统一控制台后端（fbcon.h 抽象已落，panic 已用）。（F1 莲花 panic / F3 跨平台 Makefile / F4 boot 分级自检 / F5 skip_firstinit 已完成）
 2. **二期 U 系列**: @sealed 段标记、密文页 dump、selftest 覆盖率提升（~~UTRW Slow Path 真分支~~ U2 已完成：EPOCH/KEY_MISS 恢复 + MAC_FAILED/POISONED→DRR，selftest PASS）。
 3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表、彩色日志。
-4. **四期 R 系列收尾**: `drr_emergency_pool_kb`/`drr_recovery_log_size` 接线、segment/system 级回滚验证、PCQ per-cpu 多核。
+4. **四期 R 系列收尾**: segment/system 级回滚验证、PCQ per-cpu 多核。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
 5. **五期 E 系列**: 启动莲花动画、假想时光键彩蛋、提交信息规范、风味 ISO。
 6. **工程债（Phase 存档遗留）**: vector allocator/MSI-X、NVMe 高位 BAR、virtio-net virtqueue、DKM 零 warning。
 

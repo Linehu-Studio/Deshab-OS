@@ -76,7 +76,7 @@ Deshab 最标志性的疯点——给空气上锁。
 |------|------|---------|------|-------------------|
 | R1 | checkpoint 快照 | 时光键雏形 | ✅ | dirty shard 位图收集 → dma 页快照 + A/B 双槽 + CRC64 + 原子切换（`CODE/UTSM/drr/drr_core.c`） |
 | R2 | 看门狗计时器 | 卡死也能体面 | ✅ | register/kick/timeout → fault 路径 → 回滚/复位；负向测试 PASS（demo_fault=1） |
-| R3 | Emergency Pool | 崩溃后有地方喘气 | ✅ | 编译期 64KB 独立静态池（独立于堆）+ bump 分配器；`drr_emergency_pool_kb` 键未接线 ⬜ |
+| R3 | Emergency Pool | 崩溃后有地方喘气 | ✅ | 编译期 64KB 独立静态池（独立于堆）+ bump 分配器；`drr_emergency_pool_kb`/`drr_recovery_log_size` FUCK 接线 ✅（运行期钳位） |
 | R4 | A/B 镜像回滚 | 时光机第 1 台 | 🔶 | 页级回滚 + CRC verify + BLAKE2b keyed 页 MAC ✅；segment/system 级回滚待真实加密验证 |
 | R5 | PCQ 位图调度器（单核→多核） | 让"凭感觉"变 O(1) | 🔶 | O(1) 位图 + LAPIC tick + xv6 式切换 ✅；BSP-only，per-cpu 多核负载均衡 ⬜ |
 

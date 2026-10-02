@@ -217,25 +217,58 @@ void drr_emergency_reset(void) {
     drr_init();
 }
 
+/* ---- R3b: FUCK 配置接线（drr_apply_config 设置，drr_init 消费） ---- */
+static u64 g_cfg_pool_bytes;      /* 0 = 编译期默认 */
+static u64 g_cfg_log_size;        /* 0 = 编译期默认 */
+
+void drr_apply_config(u64 pool_kb, u64 recovery_log_size) {
+    g_cfg_pool_bytes = pool_kb ? pool_kb * 1024ULL : 0;
+    g_cfg_log_size = recovery_log_size;
+    if (g_cfg_pool_bytes > DRR_EMERGENCY_POOL_SIZE) {
+        log_warn("[DRR] pool_kb exceeds compile-time pool, clamped");
+        log_hex64("[DRR]   compile-time=", DRR_EMERGENCY_POOL_SIZE);
+        g_cfg_pool_bytes = DRR_EMERGENCY_POOL_SIZE;
+    }
+}
+
 /* ---- 初始化 ---- */
 void drr_init(void) {
     log_info("[DRR] init begin");
     drr_memzero(&g_drr, sizeof(g_drr));
 
+    /* R3b: 池上限 = min(编译期池, FUCK 配置)；小于最小子缓冲布局时回退默认 */
     g_drr.pool_offset = 0;
     g_drr.pool_limit = DRR_EMERGENCY_POOL_SIZE;
+    {
+        const u64 MIN_LAYOUT =
+            DRR_EMERGENCY_STACK_SIZE + DRR_RECOVERY_LOG_SIZE +
+            DRR_CKPT_META_BUF_SIZE + DRR_CRASH_BUF_SIZE + DRR_META_SLAB_SIZE;
+        if (g_cfg_pool_bytes && g_cfg_pool_bytes >= MIN_LAYOUT) {
+            g_drr.pool_limit = g_cfg_pool_bytes;
+        } else if (g_cfg_pool_bytes) {
+            log_warn("[DRR] pool_kb below minimum sub-buffer layout, default kept");
+            log_hex64("[DRR]   minimum=", MIN_LAYOUT);
+        }
+    }
     drr_root_key_generate();
     g_drr.recovery_generation = 1;
     g_drr.heartbeat_interval = 1000;
     g_drr.active_slot = 0; /* A */
 
-    /* 分配 Emergency Pool 子缓冲区 */
+    /* 分配 Emergency Pool 子缓冲区（recovery log 大小可由 FUCK 配置） */
     g_drr.stack_base = (u8 *)pool_alloc_internal(DRR_EMERGENCY_STACK_SIZE, 64);
     g_drr.stack_size = DRR_EMERGENCY_STACK_SIZE;
     g_drr.stack_ptr = DRR_EMERGENCY_STACK_SIZE; /* 栈从顶部向下增长 */
 
-    g_drr.log_base = (drr_log_entry *)pool_alloc_internal(DRR_RECOVERY_LOG_SIZE, 64);
-    g_drr.log_capacity = DRR_RECOVERY_LOG_SIZE / sizeof(drr_log_entry);
+    u64 log_size = DRR_RECOVERY_LOG_SIZE;
+    if (g_cfg_log_size && g_cfg_log_size >= sizeof(drr_log_entry) &&
+        g_cfg_log_size <= g_drr.pool_limit - g_drr.pool_offset) {
+        log_size = g_cfg_log_size;
+    } else if (g_cfg_log_size) {
+        log_warn("[DRR] recovery_log_size out of range, default kept");
+    }
+    g_drr.log_base = (drr_log_entry *)pool_alloc_internal(log_size, 64);
+    g_drr.log_capacity = (u32)(log_size / sizeof(drr_log_entry));
     g_drr.log_count = 0;
 
     g_drr.ckpt_meta_buf = (drr_checkpoint_meta *)pool_alloc_internal(DRR_CKPT_META_BUF_SIZE, 64);
@@ -254,6 +287,8 @@ void drr_init(void) {
     g_drr.ckpt_b.version = DRR_CKPT_VERSION;
 
     g_drr.initialized = 1;
+    log_hex64("[DRR]   pool_limit=", g_drr.pool_limit);
+    log_hex64("[DRR]   log_capacity=", (u64)g_drr.log_capacity);
 
     /* ---- Phase 8: 快照区（dma 页，独立于普通堆；失败降级 metadata-only） ---- */
     g_snap_ok = 0;

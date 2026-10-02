@@ -70,7 +70,7 @@
 | DRR checkpoint（R1） | ✅ | dirty shard → dma 页快照 + A/B 双槽 + CRC64 原子切换 | M4 QEMU 日志 |
 | DRR 回滚（R4） | 🔶 | page 级 + BLAKE2b keyed 页 MAC ✅；segment/system 级待验证 | M4 QEMU 日志 |
 | DRR 看门狗（R2） | ✅ | timeout 检出→回滚/复位；负向测试 PASS | M4 QEMU 日志 |
-| Emergency Pool（R3） | ✅ | 64KB 编译期独立池；`drr_emergency_pool_kb` 键未接线 ⬜ | `include/utsm/drr.h` |
+| Emergency Pool（R3） | ✅ | 64KB 编译期独立池；`drr_emergency_pool_kb`/`drr_recovery_log_size` FUCK 接线 ✅（运行期钳位） | `.build_tmp/qemu_serial_r3b.log` |
 
 ## 文档体系
 

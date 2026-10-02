@@ -12,7 +12,8 @@ typedef enum {
     UTSM_ERR_KEY_MISS = -7,
     UTSM_ERR_STATE = -8,
     UTSM_ERR_POISONED = -9,
-    UTSM_ERR_RETRY = -10
+    UTSM_ERR_RETRY = -10,
+    UTSM_ERR_MAC_FAILED = -11   /* U2: 页 MAC 校验失败（slow path 处置） */
 } utsm_status;
 
 #endif

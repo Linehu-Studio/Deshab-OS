@@ -1,4 +1,5 @@
 #include <utsm/utsm.h>
+#include <utsm/pckc.h>
 #include <utsm/log.h>
 #include <utsm/segment.h>
 #include <utsm/arena.h>
@@ -70,6 +71,53 @@ int utsm_selftest_run(void) {
         return UTSM_ERR_INVALID;
     }
     log_info("[UTSM] selftest read ok");
+
+    /* ==== U2: Slow Path 真分支（EPOCH 刷新 / KEY_MISS 重派生 / POISONED 拒绝） ==== */
+    {
+        /* 1) EPOCH 过期：伪造 stale cap（epoch=desc->key_epoch+1），slow path 应
+         *    返回 OK 并回传刷新后的 cap，重试 read 应成功且内容一致 */
+        utsm_capability stale = cap;
+        stale.epoch = (u32)desc->key_epoch + 1;
+        utsm_capability refreshed = stale;
+        status = utsm_slow_path(stale, UTSM_RIGHT_READ, 128, len,
+                                UTSM_ERR_EPOCH, &refreshed);
+        if (status != UTSM_OK) {
+            log_error("[UTSM] selftest slow EPOCH recover failed");
+            return status;
+        }
+        char slow_rb[64];
+        status = utsm_read(refreshed, 128, slow_rb, len);
+        if (status != UTSM_OK || memcmp(slow_rb, message, len) != 0) {
+            log_error("[UTSM] selftest slow EPOCH retry read failed");
+            return (status == UTSM_OK) ? UTSM_ERR_INVALID : status;
+        }
+        log_info("[UTSM] selftest slow EPOCH ok");
+
+        /* 2) KEY_MISS：清掉该段 PCKC 缓存，slow path 重派生应返回 OK */
+        utsm_pckc_invalidate_slot(cap.segment_slot);
+        status = utsm_slow_path(refreshed, UTSM_RIGHT_READ, 128, len,
+                                UTSM_ERR_KEY_MISS, 0);
+        if (status != UTSM_OK) {
+            log_error("[UTSM] selftest slow KEY_MISS recover failed");
+            return status;
+        }
+        status = utsm_read(refreshed, 128, slow_rb, len);
+        if (status != UTSM_OK || memcmp(slow_rb, message, len) != 0) {
+            log_error("[UTSM] selftest slow KEY_MISS retry read failed");
+            return (status == UTSM_OK) ? UTSM_ERR_INVALID : status;
+        }
+        log_info("[UTSM] selftest slow KEY_MISS ok");
+
+        /* 3) POISONED：不可恢复，原样返回；DRR fault 留痕不重启
+         *    （selftest 场景 drr_report_fault 只计数，无 reboot 语义） */
+        status = utsm_slow_path(refreshed, UTSM_RIGHT_READ, 128, len,
+                                UTSM_ERR_POISONED, 0);
+        if (status != UTSM_ERR_POISONED) {
+            log_error("[UTSM] selftest slow POISONED passthrough failed");
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[UTSM] selftest slow POISONED ok");
+    }
 
     /* ==== SCHED-1: O(1) runqueue 语义（合成 TCB，协作式，无 tick） ==== */
     /* ==== SCHED-1 + SCHED-2: runqueue / block-wake（tick 竞态保护） ==== */

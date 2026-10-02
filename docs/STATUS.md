@@ -26,7 +26,7 @@
 |--------|------|----------|------|
 | 封缄段表 / UUID 调谐（U1） | ✅ | 段创建/查询闭环 | `CODE/UTSM/core/segment.c` |
 | UTRW Fast Path | ✅ | capability→PCKC→line 解密→seqlock | `utrw/read.c` |
-| UTRW Slow Path（U2） | ⬜ | `utrw/slow_path.c` 当前为 stub | — |
+| UTRW Slow Path（U2） | ✅ | EPOCH 刷新 / KEY_MISS 重派生 / POISONED+MAC_FAILED→DRR / STALE_CAP 拒绝；全分支 selftest PASS | `utrw/slow_path.c` + `.build_tmp/qemu_serial_u2slowpath.log` |
 | `@sealed` 段标记（U3） | ⬜ | 未实现 | — |
 | selftest（U5） | 🔶 | KAT/段表/越界已覆盖；chacha20 KAT 间歇 FAIL 待修 | `test/utsm_selftest.c` |
 | 真实加密原语 | 🔶 | chacha20/KDF/MAC 已落（Phase 9 早期），PCKC schedule 待接 | `crypto/` |

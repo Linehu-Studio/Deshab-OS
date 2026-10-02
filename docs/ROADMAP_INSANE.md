@@ -43,7 +43,7 @@ Deshab 最标志性的疯点——给空气上锁。
 | 编号 | 功能 | 疯的意义 | 状态 | 实现要点 / 验收标准 |
 |------|------|---------|------|-------------------|
 | U1 | UTSM 元数据区（UUID 表） | 每页都有"身份" | ✅ | 封缄段表 + UUID 调谐已就位（`CODE/UTSM/core/segment.c`），可查询页归属 |
-| U2 | UTRW Fast/Slow Path 真分支 | 快慢路不是画出来的 | 🔶 | Fast path ✅（capability 校验→PCKC→line 解密→seqlock）；Slow path ⬜（当前 `utrw/slow_path.c` 为 stub） |
+| U2 | UTRW Fast/Slow Path 真分支 | 快慢路不是画出来的 | ✅ | Fast path ✅；Slow path ✅（EPOCH/KEY_MISS 恢复，MAC_FAILED/POISONED 交 DRR，selftest PASS） |
 | U3 | `@sealed` 段可选标记 | 用户能选锁不锁 | ⬜ | 链接脚本支持 `__sealed` section；未标记段 0 开销 |
 | U4 | 密文页 dump 工具 | 发疯也要可调试 | 🔶 | shell 可读内存；专用 dump 命令 + 明文/密文对照待做 |
 | U5 | UTSM selftest 全覆盖 | 把🔶刷成✅ | 🔶 | chacha20 KAT/段表/越界已覆盖，KAT 间歇 FAIL 待修；覆盖率目标 ≥70% |

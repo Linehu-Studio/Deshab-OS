@@ -50,7 +50,7 @@ kernel_main() → serial_init → idt_init → arena_init(16MB) → dma_init(Lim
 
 ## 3. 五大核心架构支柱
 
-> 每根支柱的**当前实现边界**：SAS-R0-PCQ — 调度器 BSP-only，per-cpu runqueue 结构就位未启用；任务加密上下文为结构预留。UTSM — 封缄段表/UUID ✅，加密原语 chacha20/KDF/BLAKE2b 已落，PCKC schedule 待接；全内存密文为设计意图，当前仅 selftest 路径覆盖。UTRW — Fast Path 真实现，Slow Path 为 stub。DRR — checkpoint/看门狗/Emergency Pool ✅（演示级），Emergency Pool 为编译期 64KB 静态池。DKM — 14 驱动能加载 ✅，无热卸载/无 capability/无符号版本协商。
+> 每根支柱的**当前实现边界**：SAS-R0-PCQ — 调度器 BSP-only，per-cpu runqueue 结构就位未启用；任务加密上下文为结构预留。UTSM — 封缄段表/UUID ✅，加密原语 chacha20/KDF/BLAKE2b 已落，PCKC schedule 待接；全内存密文为设计意图，当前仅 selftest 路径覆盖。UTRW — Fast Path 真实现，Slow Path 真分支（EPOCH/KEY_MISS 恢复、MAC_FAILED/POISONED 交 DRR）。DRR — checkpoint/看门狗/Emergency Pool ✅（演示级），Emergency Pool 为编译期 64KB 静态池。DKM — 14 驱动能加载 ✅，无热卸载/无 capability/无符号版本协商。
 
 ### 3.1 SAS-R0-PCQ — 单地址空间Ring0调度模型
 

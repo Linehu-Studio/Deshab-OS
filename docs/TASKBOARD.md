@@ -14,7 +14,7 @@
 ## 🗝️ 二期：仪式（UTSM/UTRW）
 
 - [x] U1 UTSM 元数据区 / UUID 调谐表
-- [ ] U2 UTRW Slow Path 真分支（Fast path ✅；slow_path.c 现为 stub）
+- [x] U2 UTRW Slow Path 真分支（EPOCH/KEY_MISS 恢复 + MAC_FAILED/POISONED→DRR；selftest PASS）
 - [ ] U3 `@sealed` 段可选标记（链接脚本 `__sealed` section）
 - [ ] U4 密文页 dump 工具（明文/密文对照命令）
 - [ ] U5 UTSM selftest 全覆盖（修 chacha20 KAT 间歇 FAIL，覆盖率 ≥70%）

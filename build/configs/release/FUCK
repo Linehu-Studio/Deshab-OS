@@ -1,4 +1,4 @@
-# Deshab Kernel Configuration — release 变体（build/configs/release/FUCK）
+﻿# Deshab Kernel Configuration — release 变体（build/configs/release/FUCK）
 # build.ps1 -Variant release 打包前注入 SYSTEM/system/deshab64/FUCK
 # 发布版：调试零开销、进登录+向导正常路径、真机安全选项
 
@@ -81,9 +81,11 @@ dsk_trace=0
 block_trace=0
 net_trace=0
 input_trace=0
+color_log=0
 
 [compat]
 lib_path=lib
 linux_lib_guest_path=/usr/lib/deshab
 linux_lib_sync=0
 pe_dll_search=1
+

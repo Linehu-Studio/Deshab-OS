@@ -44,7 +44,57 @@ static void log_emit(const char *s) {
     }
 }
 
+/* ---- D4: DKM 彩色日志 ----
+ * 驱动 init 期间由 dkm_log_set_driver() 设置 ANSI 颜色上下文；
+ * 颜色只走串口（QEMU stdio 可见），BOOTLOG 缓冲保持纯文本。 */
+static const char *g_log_color = 0;
+static int g_log_color_on = 1;
+
+void log_set_color(const char *ansi) {
+    g_log_color = ansi;
+}
+
+void log_color_enable(int enable) {
+    g_log_color_on = enable;
+    if (!enable) g_log_color = 0;
+}
+
+/* 串口带色输出 + 缓冲纯文本（临界区内） */
+static void log_emit_colored(const char *color, const char *a,
+                             const char *b, const char *c) {
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    serial_write(color);
+    serial_write(a);
+    if (b) serial_write(b);
+    if (c) serial_write(c);
+    serial_write("\x1b[0m\n");
+    if (g_log_capture_on) {
+        const char *parts[3] = { a, b, c };
+        for (int i = 0; i < 3; i++) {
+            const char *s = parts[i];
+            if (!s) continue;
+            while (*s) {
+                if (g_log_len < LOG_BUF_SIZE) {
+                    g_log_buf[g_log_len++] = *s;
+                }
+                s++;
+            }
+        }
+        if (g_log_len < LOG_BUF_SIZE) {
+            g_log_buf[g_log_len++] = '\n';
+        }
+    }
+    if (flags & (1ULL << 9)) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
+
 static void log_line(const char *level, const char *msg) {
+    if (g_log_color && g_log_color_on) {
+        log_emit_colored(g_log_color, level, " ", msg);
+        return;
+    }
     log_emit(level);
     log_emit(" ");
     log_emit(msg);
@@ -72,6 +122,10 @@ void log_hex64(const char *prefix, u64 value) {
         buf[2 + i] = hex[(value >> ((15 - i) * 4)) & 0xf];
     }
     buf[18] = 0;
+    if (g_log_color && g_log_color_on) {
+        log_emit_colored(g_log_color, prefix, buf, 0);
+        return;
+    }
     log_emit(prefix);
     log_emit(buf);
     log_emit("\n");

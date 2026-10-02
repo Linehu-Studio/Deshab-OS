@@ -51,8 +51,10 @@ int dkm_load_builtin(const dkm_builtin_driver *driver) {
 
     log_info("[DKM] builtin driver init begin");
     log_info(driver->desc->name);
+    dkm_log_set_driver(driver->desc->name);   /* D4: 驱动自己的颜色 */
     handle.state = DKM_STATE_INITING;
     status = driver->init(dkm_get_kernel_api(), &handle);
+    dkm_log_set_driver(0);
     handle.init_status = status;
 
     if (status != 0) {

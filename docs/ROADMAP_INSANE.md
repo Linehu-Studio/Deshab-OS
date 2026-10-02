@@ -61,7 +61,7 @@ Deshab 最标志性的疯点——给空气上锁。
 | D1 | DKM 热卸载（基础） | 从"焊死"到"可拔" | ⬜ | 仅有 `DKM_F_NO_UNLOAD` 标志与状态机文档；需引用计数+资源回收，load/unload 循环 100 次不崩 |
 | D2 | 裸机器码加载器 | 真·无限自由 | ⬜ | 任意 elf/裸码塞地址即执行；能打印、能崩内核 |
 | D3 | 内核 API 导出表 | 自由也要有地图 | ⬜ | 当前为固定偏移 struct ABI（`CODE/sdk/include/deshab/kernel_api.h`）；需按名导出表 kapi() |
-| D4 | DKM 彩色日志前缀 | 每个驱动有自己的脾气 | ⬜ | 加载时自选颜色；日志一眼看出是谁在骂 |
+| D4 | DKM 彩色日志前缀 | 每个驱动有自己的脾气 | ✅ | 驱动名 FNV hash → 8 色 ANSI（确定性可复现）；init 期着色，仅串口；FUCK `color_log` 开关 |
 | D5 | 最小 REPL/shell | 自由的交互面 | ✅ | shell.elf：ls/cat/cp/mv/rm/run/probe/test/pci 等 25+ 命令 |
 
 三期做完：用户能真在系统里"为所欲为"，疯得可上手。

@@ -45,7 +45,7 @@
 | virtio_net | 🔶 | PCI/capability 枚举，无 virtqueue | — |
 | 热卸载（D1） | ⬜ | 仅有 NO_UNLOAD 标志与状态机文档 | — |
 | 按名 API 导出表（D3） | ⬜ | 固定偏移 struct ABI | `CODE/sdk/include/deshab/kernel_api.h` |
-| 彩色日志（D4） | ⬜ | 仅 info/warn/error/panic | — |
+| 彩色日志（D4） | ✅ | `dkm_log_set_driver`（驱动名 FNV hash → 8 色调色板，确定可复现）；init 期间驱动日志带 ANSI 色（仅串口，BOOTLOG 纯文本）；FUCK `[debug] color_log` 总开关 | `.build_tmp/qemu_serial_d4color.log`（1150 彩色行） |
 
 ## DSK 主内核 / 用户态
 

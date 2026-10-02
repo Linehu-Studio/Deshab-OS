@@ -158,6 +158,8 @@ typedef struct dkm_builtin_driver {
 } dkm_builtin_driver;
 
 void dkm_init(void);
+/* D4: 设置当前驱动日志颜色上下文（driver_init 前设置，返回后清 0） */
+void dkm_log_set_driver(const char *name);
 int dkm_load_builtin(const dkm_builtin_driver *driver);
 void dkm_scan_boot_modules(void);
 void dsm_load_by_manifest(void);

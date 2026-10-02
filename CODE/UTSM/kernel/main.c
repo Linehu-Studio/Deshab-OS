@@ -299,6 +299,10 @@ void kernel_main(void) {
     g_boot_cfg_loaded = (utsm_load_fuck_config(&g_boot_cfg) == 0);
     ini_config *cfg = g_boot_cfg_loaded ? &g_boot_cfg : NULL;
 
+    /* D4: DKM 彩色日志总开关（FUCK [debug] color_log，默认开；
+     * 颜色只走串口，BOOTLOG.TXT 保持纯文本） */
+    log_color_enable(ini_get_bool(cfg, "debug", "color_log", 1));
+
     /* ---- 插桩: FUCK 配置加载完成 ---- */
     INSTR_PROBE(BOOT, (u64)g_boot_cfg_loaded, 0, 0, 0);
 

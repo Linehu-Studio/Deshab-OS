@@ -32,6 +32,27 @@ static const dkm_log_api g_log_api = {
     .panic = dkm_api_panic
 };
 
+/* ---- D4: DKM 彩色日志——每个驱动有自己的脾气 ----
+ * 加载器在 driver_init 前调用 dkm_log_set_driver(desc->name)：
+ * 驱动名 FNV-1a hash → 8 色调色板（明亮色系，串口可读），
+ * 同名驱动颜色确定性可复现。init 返回后由调用方清上下文。 */
+void dkm_log_set_driver(const char *name) {
+    static const char *palette[8] = {
+        "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[35m",
+        "\x1b[96m", "\x1b[92m", "\x1b[93m", "\x1b[95m"
+    };
+    if (!name || !*name) {
+        log_set_color(0);
+        return;
+    }
+    u32 h = 2166136261u;
+    while (*name) {
+        h ^= (u8)*name++;
+        h *= 16777619u;
+    }
+    log_set_color(palette[h & 7]);
+}
+
 static dkm_kernel_api g_kernel_api = {
     .version = DKM_KERNEL_API_VERSION,
     .size = sizeof(dkm_kernel_api),

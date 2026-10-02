@@ -97,7 +97,7 @@ static void boot_screen(void) {
     int W = (int)g_fb_w, H = (int)g_fb_h;
 
     /* M2 修复：保留 DSK 已绘制的启动画面（渐变背景 + 居中开机 Logo +
-     * dcp/xj 角标），打字机叠加在其上下空白区——logo 不跳位、不重复、
+     * dcp/xj 角标），boot 屏叠加在其上下空白区——logo 不跳位、不重复、
      * 不被覆盖。DSK logo 居中 157px：占据 H/2-78 .. H/2+78。 */
     {
         u64 pitch_u32 = g_fb_pitch / 4;
@@ -112,24 +112,17 @@ static void boot_screen(void) {
     int lx = (W - lw) / 2;
     int ty = H / 2 - 220;
 
-    /* boot-title（logo 上方空白区） */
+    /* boot-title（logo 上方空白区）——一次性整行绘制（打字机效果已删） */
     const char *title = "DESHAB";
     int tl = kstrlen(title);
-    for (int i = 0; i < tl; i++) {
-        char t[2] = { title[i], 0 };
-        du_draw_string(&g_fb, t, W / 2 - tl * (int)DU_ASCII_STEP + i * (int)DU_ASCII_STEP * 2,
-                       ty, KS_ACCENT, 0, DU_ASCII_STEP * 2);
-        flip_buffer();
-        busy_delay(2000000);
-    }
+    du_draw_string(&g_fb, title, W / 2 - tl * (int)DU_ASCII_STEP, ty,
+                   KS_ACCENT, 0, DU_ASCII_STEP * 2);
     du_divider_h(&g_fb, W / 2 - 120, ty + 30, 240, KS_ACCENT);
 
     /* boot-subtitle（对应 Kate "由 Deaicup 工作室制作"） */
     draw_centered("DEAICUP STUDIO", W / 2, ty + 44, KS_ACCENT2, 0);
-    flip_buffer();
-    busy_delay(2500000);
 
-    /* boot-lines 打字机：logo 下方空白区（H/2+110 起），进度条再下方 */
+    /* boot-lines（logo 下方空白区，H/2+110 起）——整屏一次绘制 */
     int ly = H / 2 + 110;
     int bar_y = ly + BOOT_LINE_COUNT * ((int)DU_ASCII_LINE_H + 2) + 12;
     int bw = 260;
@@ -137,27 +130,33 @@ static void boot_screen(void) {
         const char *s = BOOT_LINES[li];
         u32 fg = (li == 1 || li == BOOT_LINE_COUNT - 1) ? KS_TEXT_DIM : KS_ACCENT2;
         du_draw_string(&g_fb, ">", lx, ly, KS_ACCENT, 0, DU_ASCII_STEP);
-        for (int ci = 0; s[ci]; ci++) {
-            char t[2] = { s[ci], 0 };
-            du_draw_string(&g_fb, t, lx + (ci + 1) * (int)DU_ASCII_STEP, ly,
-                           fg, 0, DU_ASCII_STEP);
-            flip_buffer();
-            busy_delay(125000);
-        }
+        du_draw_string(&g_fb, s, lx + (int)DU_ASCII_STEP, ly, fg, 0, DU_ASCII_STEP);
         ly += (int)DU_ASCII_LINE_H + 2;
-        /* boot-bar:渐变填充（accent → accent2） */
+        /* boot-bar: 渐变填充（accent → accent2） */
         int fill = bw * (li + 1) / BOOT_LINE_COUNT;
         du_rect_outline(&g_fb, W / 2 - bw / 2, bar_y, bw, 6, KS_BORDER, 1);
         if (fill > 2) du_fill_rect_gradient(&g_fb, W / 2 - bw / 2 + 1, bar_y + 1,
                                             fill - 2, 4, KS_ACCENT, KS_ACCENT2);
-        flip_buffer();
     }
+    flip_buffer();
 
     /* boot-hint + credit（对应 Kate "SYSTEM ONLINE" + "© 2026 Deaicup Studio"） */
     draw_centered("SYSTEM ONLINE", W / 2, H - 64, KS_ACCENT2, 0);
     draw_centered("(C) 2026 DEAICUP STUDIO", W / 2, H - 40, KS_TEXT_DIM, 0);
     flip_buffer();
     busy_delay(10000000);
+}
+
+/* ============================================================
+ *  严格错误策略插桩（D 系列）：错误不再降级，整屏 fatal + 错误码。
+ *  每个插桩点唯一 symbol（DSK-E<nn>）。
+ * ============================================================ */
+
+static void desktop_fatal(const char *sym) {
+    /* 严格错误策略：任何错误不再降级，串口留档 + 停机。
+     * （UI 层 fatal 屏由各 UI 组件就绪后的路径使用；此处不依赖任何子系统） */
+    slog(sym);
+    for (;;) __asm__("cli; hlt");
 }
 
 /* ============================================================
@@ -170,8 +169,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     slog("boot");
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
-        slog("bad context");
-        for (;;) __asm__("hlt");
+        desktop_fatal("DSK-E01-BADCONTEXT");
     }
     g_boot_ctx = ctx;
 

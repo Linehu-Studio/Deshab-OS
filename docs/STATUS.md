@@ -55,9 +55,10 @@
 | FirstInit 向导 | 🔶 | 输入+SHA256+写盘闭环；按键崩溃未复现（B6） | `.build_tmp/qemu_serial_b6.log` |
 | 可跳过 FirstInit（F5） | ✅ | `[dsk] skip_firstinit=1` 直达 desktop，跳过向导与登录 | `.build_tmp/qemu_serial_f1f4f5.log` |
 | mouseInit（PS/2 鼠标） | ✅ | IRQ12 + 包解码 + 光标（M1） | `.build_tmp/qemu_serial_mouse.log` |
-| desktop.elf | ✅ | 三页面+窗口+任务栏+双缓冲 | — |
+| desktop.elf | ✅ | 三页面+窗口+任务栏+双缓冲；打字机效果已删（整屏一次绘制）；DSK-E01 fatal 插桩 | — |
+| SATA 边车镜像 | ✅ | `make_sata_sidecar.sh` 每次构建自动重建（旧 mkfat32.ps1 缺失导致 login.elf 长期缺盘的静默降级已根治） | build.ps1 |
 | shell.elf | ✅ | 25+ 命令（ls/cat/cp/mv/run/probe/test/pci…） | — |
-| login.elf | ✅ | USER.CONF + skip_login | — |
+| login.elf | ✅ | USER.CONF + skip_login；ohMyLogo 开场屏 + 严格错误插桩（LOGIN-E01..E05 fatal，零降级） | `.build_tmp/login4.png` + qemu_serial_login4.log |
 | PE/EXE 兼容层 | ✅ | PE32+ 原生 / PE32 走 x86emu32 | — |
 | Linux 兼容层 | 🔶 | VMM+park-and-resume；VMX 实机验证待 VT-x/KVM | — |
 | Pacman | ⬜ | 五阶段方案 | — |

@@ -1,4 +1,4 @@
-# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
+﻿# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
 # build.ps1 -Variant dev 打包前注入 SYSTEM/system/deshab64/FUCK
 # 开发者模式：selftest 开、dev_mode 自动跑 shell.elf 测试、日志持久化、跳过向导直达桌面
 
@@ -10,7 +10,7 @@ xj380_guest=0
 selftest=1
 # F1 验证钩子: 1=启动自检后触发莲花崩溃屏（演示/回归用，日常保持 0）
 panic_test=0
-dev_mode=1
+dev_mode=0
 la57_guard=0
 mcfg_check=0
 max_phys_addr_bits=0
@@ -62,10 +62,10 @@ demo_fault=0
 watchdog_enabled=1
 
 [dsk]
-show_logo=0
-skip_login=1
-# F5: dev 直达桌面（跳过向导与登录）
-skip_firstinit=1
+show_logo=1
+skip_login=0
+# F5: dev 也走完整流程（Logo→向导→登录→桌面）；skip_firstinit=1 可直达桌面
+skip_firstinit=0
 mouse_init=1
 netman=1
 session=native
@@ -90,6 +90,10 @@ lib_path=lib
 linux_lib_guest_path=/usr/lib/deshab
 linux_lib_sync=1
 pe_dll_search=1
+
+
+
+
 
 
 

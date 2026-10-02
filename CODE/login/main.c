@@ -125,6 +125,67 @@ static void fb_text(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg) {
     for (i64 i=0; s[i]; i++) fb_char(fb, (u32)(u8)s[i], x+i*ASCII_STEP, y, fg, bg);
 }
 
+static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color);
+static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h);
+static u64 lf_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
+
+/* ===================================================================
+ *  严格错误策略插桩：任何错误（含未实现路径）不再降级、不再静默跳过，
+ *  必须整屏 fatal 显示错误码后停机。"疯但好使" 的反面保障：
+ *  错也错得有落款。每个插桩点一个唯一 symbol（LOGIN-E<nn>）。
+ * =================================================================== */
+static void login_fatal(const char *sym) {
+    logl(sym);
+    if (fb_a) {
+        u32 *fb = (u32 *)(u64)fb_a;
+        fill_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h, 0xFF3A0E14u);
+        i64 cx = ((i64)fb_w - (i64)lf_strlen(sym) * ASCII_STEP) / 2;
+        fb_text(fb, sym, cx, (i64)fb_h / 2 - 40, 0xFFF2D8D8u, 0);
+        fb_text(fb, "DESHAB LOGIN FATAL - SYSTEM HALTED",
+                ((i64)fb_w - 36 * ASCII_STEP) / 2, (i64)fb_h / 2, 0xFFB08890u, 0);
+    }
+    for (;;) __asm__("cli; hlt");
+}
+
+/* ohMyLogo 开场：登录卡片之前显示 DEAICUP 莲花 Logo（ohMyLogo.png 内嵌） */
+#include "ohmylogo_data.c"
+
+static void draw_logo_rgba(u32 *fb, i64 x, i64 y) {
+    for (i64 r = 0; r < g_panic_logo_h; r++) {
+        for (i64 c = 0; c < g_panic_logo_w; c++) {
+            const unsigned char *px4 =
+                g_panic_logo_rgba + ((u64)r * g_panic_logo_w + (u64)c) * 4;
+            u32 a = px4[3];
+            if (a < 8) continue;
+            u32 col = 0xFF000000u | ((u32)px4[0] << 16) | ((u32)px4[1] << 8) | px4[2];
+            if (a < 250) {
+                /* 简单 alpha 混合到深蓝底 */
+                u32 bg = 0xFF020F22u;
+                u32 na = 256 - a;
+                u32 rr = (((bg >> 16) & 0xFF) * na + ((col >> 16) & 0xFF) * a) >> 8;
+                u32 gg = (((bg >> 8) & 0xFF) * na + ((col >> 8) & 0xFF) * a) >> 8;
+                u32 bb = ((bg & 0xFF) * na + (col & 0xFF) * a) >> 8;
+                col = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+            }
+            i64 xx = x + c, yy = y + r;
+            if (xx < 0 || (u64)xx >= fb_w || yy < 0 || (u64)yy >= fb_h) continue;
+            *(u32 *)((u8 *)fb + (u64)yy * fb_p + (u64)xx * 4) = col;
+        }
+    }
+}
+
+static void logo_intro_screen(u32 *fb) {
+    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
+    i64 lx = ((i64)fb_w - g_panic_logo_w) / 2;
+    i64 ly = ((i64)fb_h - g_panic_logo_h) / 2 - 30;
+    if (ly < 0) ly = 0;
+    draw_logo_rgba(fb, lx, ly);
+    fb_text(fb, "DESHAB LOGIN", ((i64)fb_w - 12 * ASCII_STEP) / 2,
+            ly + g_panic_logo_h + 16, 0xFFF0D080u, 0);
+    for (int i = 0; i < 40; i++) delay_frame();   /* ~1.3s 开场 */
+}
+
+
 static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
     for (i64 r=0; r<h; r++) {
         i64 yy = y + r;
@@ -699,11 +760,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[login] boot");
 
-    /* 防篡改：第一时间校验 .text 段完整性。失败则拒绝继续，立即返回。 */
+    /* 防篡改：第一时间校验 .text 段完整性。失败 = 系统被篡改，严格 panic。 */
     if (!login_verify_integrity()) {
-        logl("[login] integrity check failed, refusing to continue");
-        if (ctx) ((dsk_boot_context *)ctx)->reserved[2] = 0;
-        return;
+        login_fatal("LOGIN-E01-INTEGRITY-FAIL");
     }
 
     logl("[login] calibrating TSC");
@@ -713,8 +772,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     login_mouse_init();
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
-        logl("[login] bad context");
-        return;
+        login_fatal("LOGIN-E02-BADCONTEXT");
     }
 
     fb_a = ctx->framebuffer_address;
@@ -724,14 +782,14 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     logl("[login] framebuffer ready");
 
+    /* D 系列：登录界面之前的 ohMyLogo 开场（DEAICUP 莲花） */
+    logo_intro_screen((u32 *)(u64)fb_a);
+
     /* Get conf data from boot context (passed by DSK) */
     const u8 *conf_buf = (const u8 *)(u64)ctx->reserved[0];
     u32 conf_size = (u32)ctx->reserved[1];
     if (!conf_buf || conf_size == 0) {
-        logl("[login] no conf data, cannot login");
-        /* Mark as skipped (reserved[2]=0) and return */
-        ((dsk_boot_context *)ctx)->reserved[2] = 0;
-        return;
+        login_fatal("LOGIN-E03-NOUSERCONF");
     }
     logl("[login] conf data received");
 
@@ -750,13 +808,13 @@ void dsk_entry(const dsk_boot_context *ctx) {
             g_has_user = 1;
             logl("[login] username found");
         } else {
-            logl("[login] username not found in conf");
+            login_fatal("LOGIN-E04-NO-USERNAME");
         }
         if (conf_get_value(conf_buf, conf_size, "passwordSha256", g_password_hash, sizeof(g_password_hash)) == 0) {
             g_has_hash = 1;
             logl("[login] password hash found");
         } else {
-            logl("[login] passwordSha256 not found in conf");
+            login_fatal("LOGIN-E05-NO-PASSWORD-HASH");
         }
     } else {
         logl("[login] conf appears encrypted, will verify by password decryption");

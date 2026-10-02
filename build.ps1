@@ -977,15 +977,20 @@ if ($Variant -eq 'both') {
 # Sidecar AHCI test disk only. Not one of the ISO/*.img system images.
 Write-Host '[build] Rebuilding SATA FAT32 sidecar (.build_tmp/sata_fat32_dsk.img, not ISO/*.img)...'
 $BuildTmp = Join-Path $Root '.build_tmp'
-$MkFat32Ps = Join-Path $BuildTmp 'mkfat32.ps1'
-if (Test-Path $MkFat32Ps) {
-    & powershell -ExecutionPolicy Bypass -File $MkFat32Ps
+$SidecarSh = Join-Path $Root 'CODE\linux\make_sata_sidecar.sh'
+$SidecarImg = Join-Path $BuildTmp 'sata_fat32_dsk.img'
+if ((Test-Path $SidecarSh) -and (Get-Command wsl -ErrorAction SilentlyContinue)) {
+    $wslSh = ConvertTo-WslUnixPath $SidecarSh
+    $wslSys = ConvertTo-WslUnixPath $SystemDir
+    $wslImg = ConvertTo-WslUnixPath $SidecarImg
+    & wsl -u root -- bash $wslSh $wslSys $wslImg
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[build] WARNING: mkfat32.ps1 exited with $LASTEXITCODE"
+        Write-Host "[build] WARNING: sidecar rebuild failed ($LASTEXITCODE), keeping old image"
+    } else {
+        Write-Host "[build] SATA IMG: $SidecarImg"
     }
-    Write-Host "[build] SATA IMG: $(Join-Path $BuildTmp 'sata_fat32_dsk.img')"
 } else {
-    Write-Host '[build] WARNING: mkfat32.ps1 not found, SATA image not rebuilt'
+    Write-Host '[build] WARNING: make_sata_sidecar.sh/WSL unavailable, SATA image not rebuilt'
 }
 
 # NVMe 测试盘镜像 (64MB, LBA0 带 DESHABNVME0 签名, 用于验证 NVMe block 数据路径)

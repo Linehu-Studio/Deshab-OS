@@ -9,7 +9,7 @@
 - [x] F4 boot_ok 分级启动自检（`[boot] selftest=0|1|2`）
 - [x] F5 可跳过 FirstInit（`[dsk] skip_firstinit` + build/configs 模板）
 - [x] F2 统一帧缓冲控制台抽象（fbcon.h：panic 路径已用；统一控制台后端待做）
-- [ ] F3 跨平台构建（Make/CMake）
+- [x] F3 跨平台构建（根 Makefile：make dev/release/realtest；macOS 打包受 mkfs.ext4 限制）
 
 ## 🗝️ 二期：仪式（UTSM/UTRW）
 

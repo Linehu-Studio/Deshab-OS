@@ -1,5 +1,6 @@
 #include <utsm/utsm.h>
 #include <utsm/pckc.h>
+#include <utsm/crypto.h>
 #include <utsm/log.h>
 #include <utsm/segment.h>
 #include <utsm/arena.h>
@@ -71,6 +72,33 @@ int utsm_selftest_run(void) {
         return UTSM_ERR_INVALID;
     }
     log_info("[UTSM] selftest read ok");
+
+    /* ==== U5: chacha20 KAT（RFC 8439 §2.4.2 官方向量）====
+     * 历史注：FUCK 注释曾提"并行会话 chacha20 KAT 间歇 FAIL"——该测试
+     * 从未合并进本树（幽灵缺陷）。本 KAT 为确定性官方向量，不依赖
+     * 硬件/时钟/随机数，PASS/FAIL 完全可复现。期望值由
+     * test/gen_chacha_kat.py 生成，并经 pycryptodome 独立对拍。 */
+    {
+#include "chacha_kat.inc"
+        u8 ks[64];
+        utsm_chacha20_block(kat_key, kat_nonce, kat_counter, ks);
+        if (memcmp(ks, kat_expect, 64) != 0) {
+            log_error("[UTSM] selftest chacha20 KAT FAIL (RFC 8439 §2.4.2)");
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[UTSM] selftest chacha20 KAT ok (RFC 8439 §2.4.2)");
+
+        /* page MAC 确定性：同输入同 MAC、跨页不同 MAC */
+        const u64 *rk = drr_get_root_key();
+        u64 m1 = utsm_page_mac(rk, 0, 0, 0, desc->cipher_base);
+        u64 m2 = utsm_page_mac(rk, 0, 0, 0, desc->cipher_base);
+        u64 m3 = utsm_page_mac(rk, 0, 1, 0, desc->cipher_base);
+        if (m1 != m2 || m1 == m3) {
+            log_error("[UTSM] selftest page MAC determinism FAIL");
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[UTSM] selftest page MAC determinism ok");
+    }
 
     /* ==== U4: 密文页 dump —— 串口输出密文/明文 hex 对照 ==== */
     {

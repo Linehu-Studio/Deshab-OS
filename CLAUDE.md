@@ -173,7 +173,7 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 
 下一阶段优先路线（活跃路线 = `docs/ROADMAP_INSANE.md` 五期填补计划，任务编号 F/U/D/R/E；状态唯一来源 = `docs/STATUS.md`）：
 1. **一期 F 系列收尾**: F2 统一控制台后端（fbcon.h 抽象已落，panic 已用）。（F1 莲花 panic / F3 跨平台 Makefile / F4 boot 分级自检 / F5 skip_firstinit 已完成）
-2. **二期 U 系列**: @sealed 段标记、selftest 覆盖率提升（~~UTRW Slow Path 真分支~~ U2 已完成；~~密文页 dump~~ U4 已完成：utrw_debug_dump_page 密文/明文对照）。
+2. **二期 U 系列**: @sealed 段标记（~~U2 Slow Path~~、~~U4 密文 dump~~、~~U5 KAT~~ 已完成；chacha20 KAT 已落地为 RFC 8439 官方向量并三方对拍，"间歇 FAIL" 确认为从未合并的幽灵缺陷）。
 3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表、彩色日志。
 4. **四期 R 系列收尾**: segment/system 级回滚验证、PCQ per-cpu 多核。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
 5. **五期 E 系列**: 启动莲花动画、假想时光键彩蛋、提交信息规范、风味 ISO。

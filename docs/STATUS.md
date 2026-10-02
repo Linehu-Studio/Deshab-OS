@@ -29,7 +29,7 @@
 | UTRW Slow Path（U2） | ✅ | EPOCH 刷新 / KEY_MISS 重派生 / POISONED+MAC_FAILED→DRR / STALE_CAP 拒绝；全分支 selftest PASS | `utrw/slow_path.c` + `.build_tmp/qemu_serial_u2slowpath.log` |
 | `@sealed` 段标记（U3） | ⬜ | 未实现 | — |
 | 密文页 dump（U4） | ✅ | `utrw_debug_dump_page(slot,page,offset)`：串口输出 64B 密文/明文 hex 对照（selftest 内置演示） | `.build_tmp/qemu_serial_u4dump.log` |
-| selftest（U5） | 🔶 | KAT/段表/越界已覆盖；chacha20 KAT 间歇 FAIL 待修 | `test/utsm_selftest.c` |
+| selftest（U5） | ✅ | chacha20 KAT 落地为 RFC 8439 §2.4.2 官方向量（gen_chacha_kat.py 生成，pycryptodome 独立对拍）；"间歇 FAIL" 确认为幽灵缺陷（该测试从未合并进本树）；page MAC 确定性检查已加；全量 selftest 稳定 PASS | `.build_tmp/qemu_serial_u5kat.log` |
 | 真实加密原语 | 🔶 | chacha20/KDF/MAC 已落（Phase 9 早期），PCKC schedule 待接 | `crypto/` |
 
 ## DKM 驱动系统

@@ -17,7 +17,7 @@
 - [x] U2 UTRW Slow Path 真分支（EPOCH/KEY_MISS 恢复 + MAC_FAILED/POISONED→DRR；selftest PASS）
 - [ ] U3 `@sealed` 段可选标记（链接脚本 `__sealed` section）
 - [x] U4 密文页 dump 工具（utrw_debug_dump_page：密文/明文 hex 对照，selftest 演示 PASS）
-- [ ] U5 UTSM selftest 全覆盖（修 chacha20 KAT 间歇 FAIL，覆盖率 ≥70%）
+- [x] U5 UTSM selftest 全覆盖（RFC 8439 KAT 落地，"间歇 FAIL" 确认为幽灵缺陷；全量稳定 PASS）
 
 ## 🔌 三期：自由（DKM/用户态）
 

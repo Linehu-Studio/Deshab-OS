@@ -16,7 +16,7 @@
 - [x] U1 UTSM 元数据区 / UUID 调谐表
 - [x] U2 UTRW Slow Path 真分支（EPOCH/KEY_MISS 恢复 + MAC_FAILED/POISONED→DRR；selftest PASS）
 - [ ] U3 `@sealed` 段可选标记（链接脚本 `__sealed` section）
-- [ ] U4 密文页 dump 工具（明文/密文对照命令）
+- [x] U4 密文页 dump 工具（utrw_debug_dump_page：密文/明文 hex 对照，selftest 演示 PASS）
 - [ ] U5 UTSM selftest 全覆盖（修 chacha20 KAT 间歇 FAIL，覆盖率 ≥70%）
 
 ## 🔌 三期：自由（DKM/用户态）

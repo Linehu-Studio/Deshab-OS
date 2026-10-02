@@ -72,6 +72,15 @@ int utsm_selftest_run(void) {
     }
     log_info("[UTSM] selftest read ok");
 
+    /* ==== U4: 密文页 dump —— 串口输出密文/明文 hex 对照 ==== */
+    {
+        int dst = utrw_debug_dump_page(cap.segment_slot, 0, 128);
+        if (dst != UTSM_OK) {
+            log_error("[UTSM] selftest cipher dump failed");
+            return dst;
+        }
+    }
+
     /* ==== U2: Slow Path 真分支（EPOCH 刷新 / KEY_MISS 重派生 / POISONED 拒绝） ==== */
     {
         /* 1) EPOCH 过期：伪造 stale cap（epoch=desc->key_epoch+1），slow path 应

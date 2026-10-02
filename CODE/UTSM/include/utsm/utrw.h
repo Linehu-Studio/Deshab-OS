@@ -15,4 +15,7 @@ int utsm_write(utsm_capability cap, u64 offset, const void *src, u64 len);
 int utsm_slow_path(utsm_capability cap, u32 rights, u64 offset, u64 len,
                    int reason, utsm_capability *out_cap);
 
+/* U4: 密文页 dump（调试特权：串口输出 offset_in_page 起 64B 密文/明文 hex 对照） */
+int utrw_debug_dump_page(u32 segment_slot, u64 page_index, u64 offset_in_page);
+
 #endif

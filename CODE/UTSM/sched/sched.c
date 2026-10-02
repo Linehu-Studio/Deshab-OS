@@ -17,6 +17,7 @@
 #include <utsm/sched.h>
 #include <utsm/sched_ext.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/arena.h>
 #include <utsm/config.h>
 #include <utsm/process.h>
@@ -630,7 +631,9 @@ void utsm_sched_demo_window(void) {
     log_hex64("[SCHED] demo tasks=", (u64)((a >= 0) + (b >= 0) + (c >= 0)));
 
     if (utsm_sched_enable(0) != 0) {
-        log_warn("[SCHED] enable failed, demo window skipped");
+        /* 严格错误策略插桩：enable 失败不允许静默跳过演示窗口继续启动 */
+        panic_full("SCH-E02 SCHED ENABLE FAILED",
+                   "utsm_sched_enable failed; skipping demo window is forbidden", 0);
         return;
     }
 

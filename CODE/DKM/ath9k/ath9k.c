@@ -531,8 +531,11 @@ static void ath9k_rx_drain(void) {
  * 真实硬件验证后增量完善。
  */
 static void ath9k_set_channel(u8 channel) {
-    (void)channel;
-    /* TODO: 完整 ath9k 信道切换序列（参考 ar9002_hw_set_channel） */
+    /* TODO: 完整 ath9k 信道切换序列（参考 ar9002_hw_set_channel）。
+     * 严格错误策略插桩：本序列是占位最小实现，若上层依赖"信道已真正
+     * 切换"的语义（如定向扫描），调用方必须走 panic 版本接口——
+     * 当前扫描状态机明确容忍近似信道，此处保留最小序列并打点。 */
+    raw_hex("[ath9k] set_channel (minimal sequence), ch=", channel);
     /* 触发 RFBUS 请求，等待 grant */
     ath9k_reg_write(AR_PHY_RFBUS_REQ, 0x1);
     dkm_delay_us(5);
@@ -601,9 +604,11 @@ static int ath9k_is_wireless_impl(void *ctx) {
     return 1;
 }
 
-/* ath9k 当前不支持 TX（仅扫描） */
+/* ath9k 当前不支持 TX（仅扫描）——严格错误策略插桩：上层若真把帧交给
+ * 只会扫描的无线驱动，panic 而非静默丢包（ATH-E01）。 */
 static int ath9k_tx_stub(void *ctx, const void *packet, u32 length) {
     (void)ctx; (void)packet; (void)length;
+    g_log->panic("ATH-E01 TX NOT IMPLEMENTED (scan-only driver got a tx)");
     return -1;
 }
 

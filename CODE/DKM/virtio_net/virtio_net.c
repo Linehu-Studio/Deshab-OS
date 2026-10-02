@@ -775,19 +775,21 @@ static void virtio_net_selftest(void) {
     log_hex("[virtio_net] selftest rx frames seen=", frames);
 }
 
-/* ================= stub（初始化失败时的安全占位，与历史行为一致） ================= */
+/* ================= stub（初始化失败时的安全占位） =================
+ * 严格错误策略插桩：占位不再静默丢包/静默无数据——一旦被上层调用
+ * （即有人真的把流量交给未协商 virtqueue 的设备），立即莲花 panic。
+ * 正常路径 netman 因 flags 缺 LINK_UP 不会选中本驱动，stub 不触发。 */
 
 static int virtio_net_tx_stub(void *ctx, const void *packet, u32 length) {
-    (void)ctx;
-    (void)packet;
-    log_hex("[virtio_net] tx stub: packet dropped, len=", length);
+    (void)ctx; (void)packet;
+    log_hex("[virtio_net] tx stub hit, len=", length);
+    g_log->panic("VNET-E01 TX VIRTQUEUE NOT IMPLEMENTED (stub tx called)");
     return 0;
 }
 
 static int virtio_net_rx_poll_stub(void *ctx, void *buffer, u32 capacity, u32 *out_length) {
-    (void)ctx;
-    (void)buffer;
-    (void)capacity;
+    (void)ctx; (void)buffer; (void)capacity;
+    g_log->panic("VNET-E02 RX VIRTQUEUE NOT IMPLEMENTED (stub rx called)");
     if (out_length) *out_length = 0;
     return 0;
 }

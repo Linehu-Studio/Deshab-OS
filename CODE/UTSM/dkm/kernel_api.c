@@ -177,3 +177,33 @@ void dkm_fill_platform_info(void) {
     /* D3: 按名导出表挂入 kernel_api（尾部追加，ABI 兼容） */
     g_kernel_api.kapi = &g_kapi_table;
 }
+
+/* ===================================================================
+ *  严格错误策略插桩：设计已定但未实现的 DKM 能力，建立代码骨架，
+ *  调用即莲花 panic（DKM-E 系列）。当前无调用方（骨架）。
+ * =================================================================== */
+
+/* D1: DKM 驱动热卸载（引用计数）。driver_desc 已有 NO_UNLOAD 标志位，
+ * 但卸载路径本身（refcount + driver_exit + 段回收）未实现。 */
+void dkm_unload_driver(u32 driver_index) {
+    (void)driver_index;
+    panic_full("DKM-E01 DRIVER HOT UNLOAD NOT IMPLEMENTED",
+               "refcount unload path: designed (D1), not implemented", 0);
+}
+
+/* D2: 裸机器码加载器（无 ELF 头，直接映射 .text blob 到可执行页跳转）。
+ * SAS-R0 单地址空间下合法；加载器未实现。 */
+void *dkm_load_bare_code(const void *blob, u64 size) {
+    (void)blob; (void)size;
+    panic_full("DKM-E02 BARE CODE LOADER NOT IMPLEMENTED",
+               "headerless machine-code loader: designed (D2), not implemented", 0);
+    return 0;
+}
+
+/* 多核：SIPI 唤醒 AP（apic.drv 注释预留）。BSP-only 是当前既定边界，
+ * 一旦被调用即 panic 而非静默单核继续。 */
+void dkm_sipi_wake_ap(u32 lapic_id, u64 entry_eip) {
+    (void)lapic_id; (void)entry_eip;
+    panic_full("DKM-E03 SIPI AP WAKE NOT IMPLEMENTED",
+               "AP startup framework: designed, not implemented (BSP-only)", 0);
+}

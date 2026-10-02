@@ -9,7 +9,7 @@ CFLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-
 ASFLAGS := -target x86_64-unknown-none -ffreestanding -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Iinclude -I../utsm-ipc
 LDFLAGS := -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 
-C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c sched/*.c dkm/*.c test/*.c vmm/*.c pe/*.c)
+C_SOURCES := $(wildcard arch/x86_64/*.c kernel/*.c runtime/*.c mm/*.c core/*.c crypto/*.c pckc/*.c utrw/*.c drr/*.c sched/*.c dkm/*.c test/*.c vmm/*.c pe/*.c brand/*.c pkg/*.c)
 S_SOURCES := $(wildcard arch/x86_64/*.S vmm/*.S sched/*.S)
 OBJECTS := $(C_SOURCES:.c=.o) $(S_SOURCES:.S=.o)
 DEPS := $(C_SOURCES:.c=.d)

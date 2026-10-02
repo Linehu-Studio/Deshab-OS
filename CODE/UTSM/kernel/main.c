@@ -1,4 +1,5 @@
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/arena.h>
 #include <utsm/utsm.h>
 #include <utsm/drr.h>
@@ -427,14 +428,22 @@ void kernel_main(void) {
                     if (g_compat_linux_lib_sync) {
                         int lsrc = lxc_sync_lib_dir(g_compat_linux_guest_path);
                         if (lsrc == 0) log_info("[UTSM] lib sync ok");
-                        else log_warn("[UTSM] lib sync skipped (non-fatal)");
+                        else {
+                            /* 严格错误策略插桩：lib 同步失败零降级（LNX-E01） */
+                            panic_full("LNX-E01 LIB SYNC FAILED",
+                                       "FAT32 lib dir sync to Linux guest failed", 0);
+                        }
                     }
                     /* VSCode Phase 5: tarball module 存在时装到 guest /opt/vscode
-                     * （已安装则秒跳过；失败不阻断启动，桌面降级显示未安装） */
+                     * （已安装则秒跳过；失败零降级 panic） */
                     if (g_compat_vscode_install) {
                         int vsrc = lxc_vscode_install();
                         if (vsrc == 0) log_info("[UTSM] vscode ready");
-                        else log_warn("[UTSM] vscode install skipped (non-fatal)");
+                        else {
+                            /* 严格错误策略插桩：VSCode 安装失败零降级（LNX-E02） */
+                            panic_full("LNX-E02 VSCODE INSTALL FAILED",
+                                       "vscode tarball install into guest failed", 0);
+                        }
                     }
                 } else {
                     log_error("[UTSM] Linux launch failed");

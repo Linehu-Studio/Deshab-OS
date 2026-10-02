@@ -1327,10 +1327,11 @@ static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
         if (rela_off && rela_sz) {
             /* P0 修复: 边界检查 rela_off 和 rela_off+rela_sz 必须在 [min_vaddr, min_vaddr+isize) 内 */
             if (rela_off < min_vaddr || rela_off >= min_vaddr + isize) {
-                logl("[DSK] ELF: rela_off out of bounds, skipping reloc");
+                /* 严格错误策略：重定位表越界 = 镜像损坏，零降级 panic */
                 logh("[DSK] ELF: rela_off=", rela_off);
                 logh("[DSK] ELF: min_vaddr=", min_vaddr);
                 logh("[DSK] ELF: isize=", isize);
+                dsk_fatal("ELF-E01 RELA OUT OF BOUNDS");
                 continue;
             }
             if (rela_off + rela_sz > min_vaddr + isize) {

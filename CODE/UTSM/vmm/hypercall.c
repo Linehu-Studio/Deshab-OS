@@ -160,31 +160,37 @@ static long hcall_surface_info(u64 a0, u64 a1, u64 a2) {
     return UTSM_HCALL_OK;
 }
 
+/* ===================================================================
+ *  严格错误策略插桩：Phase 1.3 设计已定但未实现的 hypercall，
+ *  一律 panic（HCALL-E 系列），零降级零 NOSYS 静默返回。
+ * =================================================================== */
+#include <utsm/panic.h>
+
 static long hcall_cap_validate(u64 a0, u64 a1, u64 a2) {
-    /* Phase 1.3: stub — capability validation not yet implemented */
     (void)a0; (void)a1; (void)a2;
-    log_info("[HCALL] CAP_VALIDATE (stub)");
+    panic_full("HCALL-E01 CAP_VALIDATE NOT IMPLEMENTED",
+               "capability validation hypercall: designed (Phase 1.3), not implemented", 0);
     return UTSM_HCALL_NOSYS;
 }
 
 static long hcall_utrw_read(u64 a0, u64 a1, u64 a2) {
-    /* Phase 1.3: stub — sealed memory read not yet implemented */
     (void)a0; (void)a1; (void)a2;
-    log_info("[HCALL] UTRW_READ (stub)");
+    panic_full("HCALL-E02 UTRW_READ NOT IMPLEMENTED",
+               "sealed memory read hypercall: designed (Phase 1.3), not implemented", 0);
     return UTSM_HCALL_NOSYS;
 }
 
 static long hcall_utrw_write(u64 a0, u64 a1, u64 a2) {
-    /* Phase 1.3: stub — sealed memory write not yet implemented */
     (void)a0; (void)a1; (void)a2;
-    log_info("[HCALL] UTRW_WRITE (stub)");
+    panic_full("HCALL-E03 UTRW_WRITE NOT IMPLEMENTED",
+               "sealed memory write hypercall: designed (Phase 1.3), not implemented", 0);
     return UTSM_HCALL_NOSYS;
 }
 
 static long hcall_drr_checkpoint(u64 a0, u64 a1, u64 a2) {
-    /* Phase 1.3: stub — DRR checkpoint trigger not yet implemented */
     (void)a0; (void)a1; (void)a2;
-    log_info("[HCALL] DRR_CHECKPOINT (stub)");
+    panic_full("HCALL-E04 DRR_CHECKPOINT NOT IMPLEMENTED",
+               "DRR checkpoint hypercall: designed (Phase 1.3), not implemented", 0);
     return UTSM_HCALL_NOSYS;
 }
 
@@ -213,8 +219,9 @@ static long hcall_console_write(u64 a0, u64 a1, u64 a2) {
 }
 
 static long hcall_console_read(u64 a0, u64 a1, u64 a2) {
-    /* Phase 1.3: stub — console read not yet implemented */
     (void)a0; (void)a1; (void)a2;
+    panic_full("HCALL-E05 CONSOLE_READ NOT IMPLEMENTED",
+               "console read hypercall: designed (Phase 1.3), not implemented", 0);
     return UTSM_HCALL_NOSYS;
 }
 

@@ -10,6 +10,7 @@
 
 #include <utsm/drr.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/dma.h>
 #include <utsm/segment.h>
 #include <utsm/config.h>
@@ -317,11 +318,69 @@ void drr_init(void) {
             log_info("[DRR] snapshot region ok");
             log_hex64("[DRR]   pages=", 1 + 128);
         } else {
-            log_warn("[DRR] snapshot region unavailable (metadata-only mode)");
+            /* 严格错误策略插桩：快照区是 DRR 页回滚的前提，缺失即降级
+             * metadata-only——按零降级原则直接 panic（DRR-E01）。 */
+            panic_full("DRR-E01 SNAPSHOT REGION ALLOC FAILED",
+                       "snapshot dma pages unavailable; metadata-only mode is forbidden", 0);
         }
     }
 
     log_info("[DRR] init ok");
+}
+
+/* ===================================================================
+ *  严格错误策略插桩：设计已定但未实现的 DRR 能力，建立代码骨架，
+ *  调用即 panic（DRR-E2x 系列）。当前无调用方（骨架）。
+ * =================================================================== */
+
+/* Root key 持久化（sealed disk region）：drr_init 可重入要求 root key
+ * 跨 emergency reset 固化。当前实现走内存 fallback key（见
+ * drr_root_key_generate），sealed disk 尚未落盘。 */
+void drr_root_key_seal_to_disk(void) {
+    panic_full("DRR-E02 ROOT KEY SEAL NOT IMPLEMENTED",
+               "sealed disk region for root key persistence: designed, not implemented", 0);
+}
+
+/* task_kill crypto erase：任务被杀时 key_epoch++ 并擦除其密钥材料。
+ * 当前 task_exit 只回收 slot，不做 crypto erase。 */
+void drr_task_kill_crypto_erase(u32 task_slot) {
+    (void)task_slot;
+    panic_full("DRR-E03 TASK KILL CRYPTO ERASE NOT IMPLEMENTED",
+               "key_epoch++ erase on task kill: designed, not implemented", 0);
+}
+
+/* segment/system 级回滚入口（R4 遗留）：页级回滚已实现，
+ * segment/system 级接口的调用方尚未接线。 */
+void drr_rollback_segment(u32 seg_slot) {
+    (void)seg_slot;
+    panic_full("DRR-E04 SEGMENT ROLLBACK NOT IMPLEMENTED",
+               "segment-level rollback: designed (R4), not verified/implemented", 0);
+}
+
+void drr_rollback_system(void) {
+    panic_full("DRR-E05 SYSTEM ROLLBACK NOT IMPLEMENTED",
+               "system-level rollback: designed (R4), not verified/implemented", 0);
+}
+
+/* DKM 驱动 recovery ops（DKM README 设计：quiesce/reset/reinit/dump_state）。
+ * 驱动侧从未提供该回调表，DRR 亦未在恢复路径调用。 */
+typedef struct {
+    u32 magic;          /* 'D','R','O','P' */
+    u32 version;
+    void (*quiesce)(void *drv);
+    void (*reset)(void *drv);
+    void (*reinit)(void *drv);
+    void (*dump_state)(void *drv);
+} dkm_driver_recovery_ops;
+
+void drr_driver_recovery_dispatch(const dkm_driver_recovery_ops *ops, void *drv) {
+    (void)drv;
+    if (!ops) {
+        panic_full("DRR-E06 DRIVER RECOVERY OPS MISSING",
+                   "driver did not provide dkm_driver_recovery_ops", 0);
+    }
+    panic_full("DRR-E07 DRIVER RECOVERY NOT IMPLEMENTED",
+               "quiesce/reset/reinit dispatch: designed (DKM README), not implemented", 0);
 }
 
 const u64 *drr_get_root_key(void) {

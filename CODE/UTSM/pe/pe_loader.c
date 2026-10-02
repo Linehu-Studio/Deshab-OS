@@ -17,6 +17,7 @@
 #include "../include/utsm/pe.h"
 #include <utsm/arena.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/types.h>
 
 /* 合成 shim 地址范围（32位解释器用）：0x00010000..0x0001FFFF */
@@ -202,7 +203,11 @@ static void resolve_imports(u8 *image, u64 image_base_actual,
 
             const char *func_name = 0;
             if (thunk & 0x80000000ULL) {
-                /* 序号导入：暂不支持，记为未实现 */
+                /* 严格错误策略插桩：序号导入是未实现路径，零降级 panic
+                 * （PE-E02）。shim 表按名称索引，序号导入无法解析语义。 */
+                log_error("[PE] ordinal import encountered");
+                panic_full("PE-E02 ORDINAL IMPORT NOT IMPLEMENTED",
+                           "PE import by ordinal: designed, not implemented", 0);
                 func_name = "#ordinal";
             } else {
                 /* 名称导入：thunk 是 IMAGE_IMPORT_BY_NAME 的 RVA */

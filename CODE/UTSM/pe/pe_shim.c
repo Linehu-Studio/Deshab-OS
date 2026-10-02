@@ -29,6 +29,7 @@
 #include "../include/utsm/pe.h"   /* P5: pe_window_host */
 #include <utsm/arena.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
 
@@ -1753,11 +1754,15 @@ static u64 __attribute__((ms_abi)) shim_SetDIBitsToDevice(
     return copied;
 }
 
-/* 未实现 stub(64位)— 日志告警(含调用点返回地址)并返回 0 */
+/* 未实现 stub(64位)——严格错误策略插桩：PE 应用调到 shim 表未覆盖的
+ * API = 未实现路径，按零降级原则 panic（PE-E01），不再告警返回 0。
+ * shim 表没有的 API 一旦被调用，PE 程序的语义已经是错的。 */
 static u64 __attribute__((ms_abi)) shim_unimpl64(u64 a0, u64 a1, u64 a2, u64 a3) {
     (void)a0; (void)a1; (void)a2; (void)a3;
-    log_warn("[PE] unimplemented API called");
+    log_error("[PE] unimplemented API called");
     log_hex64("[PE]   caller rip=", (u64)__builtin_return_address(0));
+    panic_full("PE-E01 UNSHIMMED API CALLED",
+               "PE app imported an API outside the shim table: not implemented", 0);
     return 0;
 }
 

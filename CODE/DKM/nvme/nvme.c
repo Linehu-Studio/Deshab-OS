@@ -920,13 +920,17 @@ static int nvme_msix_program(const struct dkm_kernel_api *api,
      * 页属性 PCD|PWT (UC), MSI-X 表访问不要求 cache 一致性操作。 */
     volatile u32 *tbl = (volatile u32 *)api->mm_map_mmio(tbl_phys, 4096);
     if (!tbl) {
-        g_log->warn("[nvme] MSI-X: table MMIO map failed; polling");
+        /* 严格错误策略插桩：MSI-X 表映射失败不允许静默转轮询（NVME-E01） */
+        g_log->error("[nvme] MSI-X: table MMIO map failed");
+        g_log->panic("NVME-E01 MSIX TABLE MAP FAILED");
         return 0;
     }
 
     int vector = api->irq_vector_alloc();
     if (vector < 0 || vector > 255) {
-        g_log->warn("[nvme] MSI-X: vector alloc failed; polling");
+        /* 严格错误策略插桩：向量分配失败不允许静默转轮询（NVME-E02） */
+        g_log->error("[nvme] MSI-X: vector alloc failed");
+        g_log->panic("NVME-E02 VECTOR ALLOC FAILED");
         return 0;
     }
     log_dec("[nvme] MSI-X vector=", (u64)vector);
@@ -958,7 +962,10 @@ static int nvme_msix_program(const struct dkm_kernel_api *api,
     log_hex("[nvme] MSI-X readback entry vctl=", rb_vc);
     if (!(rb_ctl & 0x8000u) || rb_a0 != addr || rb_a1 != 0 ||
         (rb_d & 0xffu) != ((u32)vector & 0xffu) || (rb_vc & 1u)) {
-        g_log->warn("[nvme] MSI-X: readback mismatch; rolling back");
+        /* 严格错误策略插桩：MSI-X 编程回读不符 = 硬件/虚拟机拒绝消息中断，
+         * 不允许静默回滚转轮询（NVME-E03）。 */
+        g_log->error("[nvme] MSI-X: readback mismatch");
+        g_log->panic("NVME-E03 MSIX READBACK MISMATCH");
         u32 rb = dkm_pci_read(bus, dev, func, (u8)cap);
         rb = (rb & 0x0000ffffu) | (msg_ctl << 16);      /* 恢复原 msg_ctl */
         dkm_pci_write(bus, dev, func, (u8)cap, rb);

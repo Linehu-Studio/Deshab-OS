@@ -735,11 +735,12 @@ int driver_init(const struct dkm_kernel_api *api,
         raw_log("[e1000] MAC from RAL/RAH\n");
     }
 
-    /* 仍为全 0 或多播位错误时使用与虚拟机配置一致的回退 MAC */
+    /* 仍为全 0 或多播位错误时——严格错误策略插桩：MAC 读不到 = 网卡
+     * 身份不可知，零降级 panic（E1K-E01），不再用硬编码 MAC 冒充。 */
     if ((mac[0]==0&&mac[1]==0&&mac[2]==0&&mac[3]==0&&mac[4]==0&&mac[5]==0) ||
         (mac[0] & 1)) {
-        mac[0]=0x52; mac[1]=0x54; mac[2]=0x00; mac[3]=0x12; mac[4]=0x34; mac[5]=0x56;
-        raw_log("[e1000] using fallback MAC 52:54:00:12:34:56\n");
+        raw_log("[e1000] MAC read failed (zero/multicast)\n");
+        g_log->panic("E1K-E01 MAC READ FAILED");
     }
 
     raw_mac("[e1000] MAC=", mac);

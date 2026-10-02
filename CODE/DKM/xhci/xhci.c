@@ -2073,7 +2073,8 @@ int driver_init(const struct dkm_kernel_api *api,
 
         /* Port Reset */
         if (xhci_reset_port(port) != 0) {
-            g_log->warn("[xhci] port reset failed; skipping");
+            /* 严格错误策略插桩：端口复位失败 = 设备不可用，零降级 panic */
+            g_log->panic("XHC-E01 PORT RESET FAILED");
             continue;
         }
         g_log->info("[xhci] port reset OK");

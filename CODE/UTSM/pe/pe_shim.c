@@ -216,10 +216,12 @@ static u64 __attribute__((ms_abi)) shim_WriteFile(u64 handle, u64 buffer, u64 le
 static u64 __attribute__((ms_abi)) shim_ReadFile(u64 handle, u64 buffer, u64 max_length,
                                                   u64 bytes_read_ptr, u64 overlapped) {
     (void)handle; (void)buffer; (void)max_length; (void)overlapped;
-    /* 暂不支持输入读取;lpNumberOfBytesRead 同为 DWORD*(4 字节) */
-    u64 brp = gp(bytes_read_ptr);
-    if (brp) *(u32 *)brp = 0;
-    return 1;
+    /* 严格错误策略插桩：读取路径未实现。此前返回 TRUE+0 字节是
+     * "假装能跑"——PE 应用以为读到了 EOF。零降级 panic（PE-E04）。 */
+    log_error("[PE] ReadFile called on shim without input backend");
+    panic_full("PE-E04 READFILE INPUT NOT IMPLEMENTED",
+               "shim ReadFile has no input backend: designed, not implemented", 0);
+    return 0;
 }
 
 static u64 __attribute__((ms_abi)) shim_ExitProcess(u64 exit_code) {
@@ -287,7 +289,13 @@ static u64 __attribute__((ms_abi)) shim_GetEnvironmentVariableA(u64 name, u64 bu
 static u64 __attribute__((ms_abi)) shim_CreateFileA(u64 filename, u64 access, u64 share,
                                                      u64 sa, u64 disp, u64 flags, u64 template) {
     (void)filename; (void)access; (void)share; (void)sa; (void)disp; (void)flags; (void)template;
-    return 0;  /* 暂不支持文件 */
+    /* 严格错误策略插桩：文件访问未实现。返回 INVALID_HANDLE 是诚实的
+     * Win32 失败语义（应用可自行处理），但功能本身未实现——按零降级
+     * 原则 panic（PE-E05），不做"假装没有文件"的静默降级。 */
+    log_error("[PE] CreateFileA called: file IO not implemented");
+    panic_full("PE-E05 FILE IO NOT IMPLEMENTED",
+               "shim CreateFileA: file backend designed, not implemented", 0);
+    return 0;
 }
 static u64 __attribute__((ms_abi)) shim_CloseHandle(u64 handle) { (void)handle; return 1; }
 static u64 __attribute__((ms_abi)) shim_GetFileSize(u64 handle, u64 high) {

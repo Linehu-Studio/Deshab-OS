@@ -1,5 +1,6 @@
 #include <utsm/net.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 
 /*
  * 最小 netdev 注册表：
@@ -92,14 +93,15 @@ static int net_is_wireless_impl(u32 index) {
 }
 
 /* 统计查询：返回驱动层累计的收发统计。
- * 当前实现为占位：返回全零统计。
- * 后续由驱动在 tx/rx 回调内更新共享统计区，此处直接读取。
- * 驱动层的本地统计（如 e1000 的 g_stat_tx_ok 等）与 netdev 层统计
- * 通过 driver_ctx 统一后即可返回精确值。 */
+ * 严格错误策略插桩：全零统计占位 = 向上层谎报"网卡零流量"，
+ * 零降级 panic（NETST-E01）。驱动层统计区接入（driver_ctx 共享统计）
+ * 后才能提供真实语义。 */
 static int net_device_stats_impl(u32 index, dkm_net_stats *out) {
     if (!out) return -1;
     if (index >= g_net_device_count) return -2;
-    /* 占位：全零。后续由驱动填充实际统计。 */
+    (void)index;
+    panic_full("NETST-E01 NET STATS NOT IMPLEMENTED",
+               "netdev stats placeholder returns all-zero: driver stats wiring not implemented", 0);
     for (u32 i = 0; i < sizeof(dkm_net_stats); i++)
         ((u8 *)out)[i] = 0;
     return 0;

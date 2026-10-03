@@ -144,7 +144,11 @@ static void apply_relocations(u8 *image, u32 image_size, u64 image_base_actual, 
                 val += (u32)delta;
                 *(u32 *)target = val;
             } else {
-                /* 其他重定位类型暂不支持 */
+                /* 严格错误策略插桩：未实现的重定位类型静默跳过 = 重定位
+                 * 不完整照跑，零降级 panic（PE-E03）。 */
+                log_error("[PE] unsupported reloc type");
+                panic_full("PE-E03 RELOC TYPE NOT IMPLEMENTED",
+                           "PE base-reloc type outside ABSOLUTE/HIGHLOW/DIR64: not implemented", 0);
             }
         }
         block_rva += block_size;

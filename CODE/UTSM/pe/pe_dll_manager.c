@@ -356,7 +356,9 @@ int pe_dll_load(const char *dll_name, u64 *out_base) {
             return 0;
         }
         if (e->state == DLL_STATE_LOADING) {
-            /* 循环依赖：返回 -1，调用方填 unimpl stub */
+            /* 循环依赖：返回 -1，调用方填 unimpl stub——该 stub 被调用
+             * 即 PE-E01 莲花 panic（见 pe_shim.c shim_unimpl64），
+             * 不存在静默降级出口。 */
             if (out_base) *out_base = 0;
             return -1;
         }

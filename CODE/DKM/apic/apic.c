@@ -6,7 +6,8 @@
  *   2. IOAPIC 重定向表初始化: 逐条目编程, 将 ISA IRQ 映射到 vector 0x20-0x2F
  *      (兼容 PIC 布局), 逐条目 mask
  *   3. MADT ISO (Interrupt Source Override) 处理: 按 ACPI 规范修正 IRQ→GSI 映射
- *   4. SIPI 多核启动框架 (预留, 未实现)
+ *   4. SIPI 多核启动框架 (预留: 调用 dkm_sipi_wake_ap 即 DKM-E03 panic,
+ *      见 CODE/UTSM/dkm/kernel_api.c 骨架)
  *
  * B7 路由接管 (apic_route):
  *   FUCK [drivers] apic_route=1 时, 本驱动在初始化末尾尝试把中断路由

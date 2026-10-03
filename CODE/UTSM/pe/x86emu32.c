@@ -11,6 +11,7 @@
 #include "x86emu32.h"
 #include "pe_shim.h"
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/types.h>
 
 /* ===== 内存访问（带边界检查） ===== */
@@ -278,14 +279,20 @@ static int try_iat_call(x86emu_state *emu, u32 target) {
     if (target >= 0x00010000 && target < 0x00020000) {
         int shim_idx = target & 0xFFFF;
         if (shim_idx == 0xFFFF) {
-            /* 未实现 stub */
-            log_warn("[PE32] call unimplemented API");
+            /* 严格错误策略插桩：32 位解释器调用未实现 API = 静默 EAX=0
+             * 会给 PE 程序喂错误语义，零降级 panic（PE-E06）。 */
+            log_error("[PE32] call unimplemented API");
+            panic_full("PE-E06 EMU UNSHIMMED API CALLED",
+                       "x86emu32 IAT call hit unimplemented stub: not implemented", 0);
             emu->regs[X86_EAX] = 0;
             return 1;
         }
         const pe_shim_entry *se = pe_shim_get(shim_idx);
         if (!se) {
-            log_warn("[PE32] shim index out of range");
+            /* 严格错误策略插桩：shim 索引越界 = 导入解析已损坏，panic（PE-E07） */
+            log_error("[PE32] shim index out of range");
+            panic_full("PE-E07 SHIM INDEX OUT OF RANGE",
+                       "x86emu32 IAT call with invalid shim index", 0);
             emu->regs[X86_EAX] = 0;
             return 1;
         }

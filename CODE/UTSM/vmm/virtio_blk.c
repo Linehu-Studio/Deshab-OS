@@ -346,8 +346,10 @@ void virtio_blk_backend_init(void) {
         u64 ssize = blk->sector_size(0);
         if (ssize > 0) g_blk_sector_size = (u32)ssize;
         /* 从设备名推算容量不可得，用默认值（guest 端可再探测）。
-         * 实际 capacity 需读 ATA IDENTIFY；这里给 4GB 占位，
-         * guest mkfs/mount 会按此上限工作。 */
+         * 【插桩白名单】capacity 为声明值而非真实容量：block API 尚无
+         * capacity 查询（sector_count 仅部分 provider 提供）。这是对
+         * guest 的声明边界而非"静默失败"，guest 端按声明值工作；
+         * 补齐 block capacity 查询后改为真实值。 */
         g_blk_capacity = 8ULL * 1024 * 1024 * 1024 / 512;  /* 8GB in sectors */
         log_info("[VBLK] bound to UTSM block device 0");
         log_hex64("[VBLK] capacity(sectors)=", g_blk_capacity);

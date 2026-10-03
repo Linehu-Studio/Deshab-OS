@@ -1,5 +1,6 @@
 #include <utsm/dkm.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include <utsm/types.h>
 #include "../arch/x86_64/limine.h"
 #include "../kernel/ini_parser.h"
@@ -356,7 +357,9 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
                 log_info("[DSM] module not found");
                 log_info(drv->name);
                 if (drv->required && stage->required) {
-                    log_error("[DSM] required module missing, abort stage");
+                    /* 严格错误策略插桩：required 驱动缺模块零降级（DKM-E04） */
+                    panic_full("DKM-E04 REQUIRED DRIVER MODULE MISSING",
+                               "required driver boot module not found in manifest stage", 0);
                     break;
                 }
                 continue;
@@ -368,11 +371,19 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
 
             if (dkm_check_elf64(f->address, f->size) != 0) {
                 log_error("[DSM] ELF check failed");
+                if (drv->required && stage->required) {
+                    panic_full("DKM-E05 REQUIRED DRIVER ELF INVALID",
+                               "required driver boot module failed ELF64 check", 0);
+                }
                 continue;
             }
 
             if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
                 log_error("[DSM] symbol scan failed");
+                if (drv->required && stage->required) {
+                    panic_full("DKM-E06 REQUIRED DRIVER SYMBOL SCAN FAILED",
+                               "required driver symbol scan failed", 0);
+                }
                 continue;
             }
 
@@ -380,7 +391,9 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
             if (result != 0) {
                 log_error("[DSM] load failed");
                 if (drv->required && stage->required) {
-                    log_error("[DSM] required driver failed, abort stage");
+                    /* 严格错误策略插桩：required 驱动加载失败零降级（DKM-E07） */
+                    panic_full("DKM-E07 REQUIRED DRIVER LOAD FAILED",
+                               "required driver relocation/load failed", 0);
                     break;
                 }
             } else {

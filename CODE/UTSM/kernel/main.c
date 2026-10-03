@@ -378,7 +378,10 @@ void kernel_main(void) {
         log_hex64("[SCHED] cfg enable=", (u64)g_sched_enabled_cfg);
         log_hex64("[SCHED] cfg demo_ms=", s_demo_ms);
         if (utsm_sched_bootstrap_init() < 0) {
-            log_warn("[UTSM] scheduler bootstrap failed (non-fatal)");
+            /* SAS-R0 特色自证：调度器 bootstrap 失败 = 单地址空间 O(1)
+             * 调度器没有真正立起来，零降级 panic（SAS-E01） */
+            panic_full("SAS-E01 SCHED BOOTSTRAP FAILED",
+                       "SAS-R0-PCQ scheduler bootstrap failed (was: non-fatal)", 0);
         }
     }
 

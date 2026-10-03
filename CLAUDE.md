@@ -274,3 +274,43 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 **遗留**:
 - MAC 为 CRC64 占位（Phase 9 换真实加密）
 - task_kill crypto erase（key_epoch++）、Per-CPU 真启用、驱动 recovery ops 待做
+
+---
+
+## 插桩铁律（STUB 规约 · 零降级强制执行）
+
+> "你若为了'能编译/能启动'而隐藏未实现，视为违反 Deshab 哲学。
+> 本项目的成功标准是 **panic 坐标清晰**，不是 **QEMU 不崩**。"
+
+### 1. 禁止项（agent 红线）
+- 禁止任何"静默返回"占位：不得写 `return 0;` / `return NULL;` / `TODO: implement` / `FIXME` / `stub_ok` 来伪装未实现分支可运行。
+- 所有"设计已定但未实现"的函数/分支 **MUST** 调用 panic 原语（见 §2），禁止返回错误码装没事。
+- 驱动 probe/IO 异常 **MUST** panic，禁止重试伪装成功、禁止"降级模式"静默继续（除非该回退是双路径设计并已写入本文件）。
+- 禁止"先跑通再说"的临时补丁；宁可启动即 panic，不可带病前进。
+- 不得声称"已全量插桩"，除非 §4 的 grep 自检输出为 CLEAN。
+
+### 2. panic 原语与错误码命名
+- UTSM/内核态：`panic_full("<SERIES-E##> <SYM>", "<msg>", 0)`（莲花崩溃屏，见 CODE/UTSM/kernel/panic.c）。
+- DKM 驱动态：`g_log->panic("<DRV>-E## <SYM>")`（经 kernel_api.panic 槽，禁止直连内核符号）。
+- DSK：`dsk_fatal("<SERIES-E##> <SYM>")`；FirstInit/login：各自 `*_fatal()`。
+- 错误码系列：`FS-E`（文件系统/DSK 调度）、`ELF-E`、`HCALL-E`、`DRR-E`、`SCH-E`、`DKM-E`、`PE-E`、`LNX-E`、`VNET/ATH/XHC/E1K/NVME-E`（驱动）、`PKG-E`、`BRAND-E`、`NET-E`（FirstInit）、`LOGIN-E`。新模块按 `<MODULE>-E##` 注册到 docs/STATUS.md。
+
+### 3. 改动节奏（防"一次性插完"幻觉）
+- 每次只处理 **一个文件** 的 STUB→panic，改完输出：改动行号 + 剩余 STUB 计数。
+- 骨架允许"不接线"（无人调用的 skeleton 函数），但接线后行为必须是 panic。
+- 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过。新增白名单项必须改本文件并说明理由。
+
+### 4. 自检命令（验收只认这个输出，不认自然语言保证）
+```
+powershell -Command "Get-ChildItem CODE\UTSM,CODE\DKM,CODE\dsk -Recurse -Include *.c,*.h |
+  Select-String -Pattern 'TODO|FIXME|stub_ok|\bstub\b|未实现|暂不支持|待实现|not implemented' |
+  Group-Object Path | Sort-Object Count -Descending"
+```
+- 命中行 **只允许** 两类：① panic 调用/其注释（含错误码字面量）；② 本文件白名单内的设计内回退日志。
+- 其余命中 = 未清干净，禁止提交。基线快照（2026-10-03）：~118 命中，绝大多数已是 panic 坐标注释；新增代码不得抬高裸命中数。
+
+### 5. 验收格式（每次插桩提交必须附）
+```
+[STUB] <阶段>/<模块>/<文件>::<函数> | 改动行=<L1-L2> | 剩余STUB=<N> | “<一句疯洁标语>” | 已提交=<hash>
+```
+- 例：`[STUB] P1/UTSM/vmm/hypercall.c::hcall_utrw_read | 改动行=176-181 | 剩余STUB=112 | “封缄之下，未成之物当自爆”`

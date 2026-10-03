@@ -100,6 +100,13 @@ int utsm_selftest_run(void) {
             return UTSM_ERR_INVALID;
         }
         log_info("[UTSM] selftest page MAC determinism ok");
+
+        /* ==== U3+: 封缄内存 .sealed 区 MAC 校验（UTSM-E03 路径自证） ==== */
+        {
+            extern void utsm_sealed_verify(void);
+            utsm_sealed_verify();   /* 不符即 panic，返回即通过 */
+            log_info("[UTSM] selftest sealed MAC verify ok");
+        }
     }
 
     /* ==== U4: 密文页 dump —— 串口输出密文/明文 hex 对照 ==== */

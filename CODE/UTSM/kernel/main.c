@@ -357,6 +357,13 @@ void kernel_main(void) {
     INSTR_TS_END(ts_utsm, "utsm_init");
     log_info("[UTSM] init ok");
 
+    /* === 封缄内存极早期初始化（UTSM-E01..E04） ===
+     * .sealed 区为空 / root key 缺失 → 此处极早期 panic，绝不带病前进。 */
+    {
+        extern void utsm_sealed_early_init(void);
+        utsm_sealed_early_init();
+    }
+
     /* === SAS-R0-PCQ 调度器：bootstrap 任务绑定（Phase 7） ===
      * 只做 sched_init + cpu_init + bootstrap TCB（绑定当前 rsp），
      * 不开中断、不碰定时器，对既有启动行为零影响。
@@ -406,9 +413,15 @@ void kernel_main(void) {
             dsm_load_named(cfg, "pci");
             dsm_load_named(cfg, "ahci");
 
-            /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 === */
+            /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 ===
+             * 严格错误策略：linux_guest=1 即"请求了 guest"——模块缺失、
+             * 启动失败、IPC 失败一律 panic（VMM-E/LNX-E），零降级。 */
             int run_linux = ini_get_bool(cfg, "boot", "linux_guest", 1);
-            if (run_linux && linux_loader_init() == 0) {
+            if (run_linux) {
+                if (linux_loader_init() != 0) {
+                    panic_full("VMM-E01 LINUX BZIMAGE MISSING",
+                               "linux_guest=1 but bzImage boot module not found", 0);
+                }
                 INSTR_TS_DECL(ts_linux);
                 INSTR_TS_BEGIN(ts_linux);
                 log_info("[UTSM] Linux loader init ok");
@@ -416,7 +429,8 @@ void kernel_main(void) {
                 if (ipc_shm_init() == 0) {
                     log_info("[UTSM] IPC shm init ok");
                 } else {
-                    log_error("[UTSM] IPC shm init failed (non-fatal)");
+                    panic_full("LNX-E03 IPC SHM INIT FAILED",
+                               "IPC shared memory init failed (was: non-fatal)", 0);
                 }
 
                 int lin_st = linux_launch();
@@ -446,11 +460,14 @@ void kernel_main(void) {
                         }
                     }
                 } else {
+                    /* 严格错误策略插桩：guest 启动失败零降级（VMM-E02） */
                     log_error("[UTSM] Linux launch failed");
                     log_hex64("[UTSM] Linux st=", (u64)(i64)lin_st);
+                    panic_full("VMM-E02 LINUX LAUNCH FAILED",
+                               "linux_guest=1 requested but VMX launch failed", 0);
                 }
             } else {
-                log_warn("[UTSM] Linux loader unavailable (no bzImage or disabled)");
+                log_warn("[UTSM] Linux guest disabled by FUCK (linux_guest=0)");
             }
         } else {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
@@ -460,10 +477,14 @@ void kernel_main(void) {
 
         /* === OpenXJ380 guest — 可通过 FUCK [boot] xj380_guest=0 跳过 ===
          * 三内核架构路线 B：XJ380 作为第二 guest（与 Linux 并列）。
-         * 需要 Limine boot module xj380.krl（OpenXJ380 构建产物 kernel.krl）。
-         * guest 终止前 host 挂起；无模块/被禁用时优雅跳过。 */
+         * 严格错误策略：xj380_guest=1 即"请求了 guest"——模块缺失或
+         * 启动失败一律 panic（VMM-E03/E04），零降级。 */
         int run_xj380 = ini_get_bool(cfg, "boot", "xj380_guest", 1);
-        if (run_xj380 && xj380_loader_init() == 0) {
+        if (run_xj380) {
+            if (xj380_loader_init() != 0) {
+                panic_full("VMM-E03 XJ380 KERNEL.KRL MISSING",
+                           "xj380_guest=1 but kernel.krl boot module not found", 0);
+            }
             INSTR_TS_DECL(ts_xj380);
             INSTR_TS_BEGIN(ts_xj380);
             log_info("[UTSM] XJ380 loader init ok");
@@ -472,11 +493,14 @@ void kernel_main(void) {
             if (xj_st == 0) {
                 log_info("[UTSM] XJ380 guest terminated (host resumed)");
             } else {
+                /* 严格错误策略插桩：XJ380 启动失败零降级（VMM-E04） */
                 log_error("[UTSM] XJ380 launch failed");
                 log_hex64("[UTSM] XJ380 st=", (u64)(i64)xj_st);
+                panic_full("VMM-E04 XJ380 LAUNCH FAILED",
+                           "xj380_guest=1 requested but launch failed", 0);
             }
         } else {
-            log_warn("[UTSM] XJ380 loader unavailable (no kernel.krl or disabled)");
+            log_warn("[UTSM] XJ380 guest disabled by FUCK (xj380_guest=0)");
         }
     } else {
         log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");

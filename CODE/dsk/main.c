@@ -2033,15 +2033,15 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
             dsk_run_login(ctx);
         }
 
-        /* default_shell=cmd → 直接进 CMD.ELF（PE/EXE 兼容层前端），
-         * cmd 退出后回落桌面。 */
+        /* default_shell=cmd → 直接进 CMD.ELF（PE/EXE 兼容层前端）。
+         * 严格错误策略：FUCK 明确要求 cmd 却加载失败 = 零降级 panic（DSK-E09）。 */
         const char *def_shell = dsk_cfg_ok ? dsk_ini_get(&dsk_cfg, "dsk", "default_shell") : 0;
         if (def_shell && dsk_ini_streq(def_shell, "cmd")) {
             logl("[DSK:SCHED] default_shell=cmd -> cmd.elf");
             char cn[12]; /* CMD      ELF */
             cn[0]='C';cn[1]='M';cn[2]='D';cn[3]=' ';cn[4]=' ';cn[5]=' ';cn[6]=' ';cn[7]=' ';cn[8]='E';cn[9]='L';cn[10]='F';
             if (dsk_load_and_run(cn, ctx) == 0) logl("[DSK] cmd.elf returned, falling back to desktop");
-            else logl("[DSK] cmd.elf load failed, falling back to desktop");
+            else dsk_fatal("DSK-E09 DEFAULT SHELL CMD.ELF MISSING");
         }
 
         logl("[DSK:SCHED] loading desktop");

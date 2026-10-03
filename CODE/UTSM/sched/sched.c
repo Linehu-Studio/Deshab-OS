@@ -629,6 +629,11 @@ void utsm_sched_demo_window(void) {
     int b = utsm_task_create(UTSM_SCHED_NO_PROCESS, 20, demo_task_body, (void *)2ULL);
     int c = utsm_task_create(UTSM_SCHED_NO_PROCESS, 40, demo_task_body, (void *)3ULL);
     log_hex64("[SCHED] demo tasks=", (u64)((a >= 0) + (b >= 0) + (c >= 0)));
+    if (a < 0 || b < 0 || c < 0) {
+        /* 严格错误策略插桩：demo 任务建不全 = 调度器内部状态损坏，panic（SCH-E03） */
+        panic_full("SCH-E03 DEMO TASK CREATE FAILED",
+                   "utsm_task_create failed inside demo window", 0);
+    }
 
     if (utsm_sched_enable(0) != 0) {
         /* 严格错误策略插桩：enable 失败不允许静默跳过演示窗口继续启动 */

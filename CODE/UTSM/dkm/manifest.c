@@ -267,7 +267,12 @@ static int dsm_parse_manifest(const char *text, u64 size) {
         dsm_expect(&p, ':');
 
         if (streq_static(key, "stages")) {
-            if (dsm_expect(&p, '[') != 0) return -1;
+            if (dsm_expect(&p, '[') != 0) {
+                /* 严格错误策略插桩：stage 解析失败零降级（DKM-E08） */
+                panic_full("DKM-E08 MANIFEST STAGES PARSE FAILED",
+                           "dsm_parse_manifest: stages array malformed", 0);
+                return -1;
+            }
             while (p < end && *p) {
                 dsm_skip_ws(&p);
                 if (*p == ']') { p++; break; }
@@ -300,6 +305,9 @@ static int dsm_ensure_manifest(void) {
     rsp = g_module_request.response;
     if (!rsp) {
         log_warn("[DSM] no Limine module response");
+        /* 严格错误策略插桩：manifest 缺失零降级（DKM-E09） */
+        panic_full("DKM-E09 NO LIMINE MODULE RESPONSE",
+                   "dsm_ensure_manifest: no Limine module response", 0);
         return -1;
     }
 
@@ -314,6 +322,9 @@ static int dsm_ensure_manifest(void) {
 
     if (!manifest_file) {
         log_warn("[DSM] manifest not found in boot modules");
+        /* 严格错误策略插桩：manifest 缺失零降级（DKM-E10） */
+        panic_full("DKM-E10 MANIFEST NOT FOUND",
+                   "dsm_ensure_manifest: dkm:manifest boot module missing", 0);
         return -1;
     }
 
@@ -409,7 +420,12 @@ void dsm_load_by_manifest_upto(const ini_config *cfg, u32 max_stage_id) {
 }
 
 void dsm_load_named(const ini_config *cfg, const char *name) {
-    if (!name || dsm_ensure_manifest() != 0) return;
+    if (!name || dsm_ensure_manifest() != 0) {
+        /* 严格错误策略插桩：按名加载 manifest 缺失零降级（DKM-E11） */
+        panic_full("DKM-E11 NAMED LOAD MANIFEST MISSING",
+                   "dsm_load_named: null name or manifest unavailable", 0);
+        return;
+    }
 
     for (u32 si = 0; si < g_stage_count; si++) {
         dsm_stage_entry *stage = &g_stages[si];
@@ -430,6 +446,9 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
             if (!drv->boot_module) {
                 log_warn("[DSM] named module not found");
                 log_info(name);
+                /* 严格错误策略插桩：named 驱动缺模块零降级（DKM-E12） */
+                panic_full("DKM-E12 NAMED DRIVER MODULE MISSING",
+                           "dsm_load_named: named driver boot module not found", 0);
                 return;
             }
             f = drv->boot_module;
@@ -437,15 +456,24 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
             log_info(drv->name);
             if (dkm_check_elf64(f->address, f->size) != 0) {
                 log_error("[DSM] ELF check failed");
+                /* 严格错误策略插桩：named 驱动 ELF 校验失败零降级（DKM-E13） */
+                panic_full("DKM-E13 NAMED DRIVER ELF INVALID",
+                           "dsm_load_named: named driver failed ELF64 check", 0);
                 return;
             }
             if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
                 log_error("[DSM] symbol scan failed");
+                /* 严格错误策略插桩：named 驱动符号扫描失败零降级（DKM-E14） */
+                panic_full("DKM-E14 NAMED DRIVER SYMBOL SCAN FAILED",
+                           "dsm_load_named: named driver symbol scan failed", 0);
                 return;
             }
             result = dkm_load_elf_rel(f->address, f->size, &symbols);
             if (result != 0) {
                 log_error("[DSM] load failed");
+                /* 严格错误策略插桩：named 驱动加载失败零降级（DKM-E15） */
+                panic_full("DKM-E15 NAMED DRIVER LOAD FAILED",
+                           "dsm_load_named: named driver relocation/load failed", 0);
                 return;
             }
             drv->loaded = 1;
@@ -454,6 +482,9 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
     }
     log_warn("[DSM] named driver not in manifest");
     log_info(name);
+    /* 严格错误策略插桩：named 驱动不在 manifest 零降级（DKM-E16） */
+    panic_full("DKM-E16 NAMED DRIVER NOT IN MANIFEST",
+               "dsm_load_named: named driver not found in manifest", 0);
 }
 
 void dsm_load_by_manifest_ex(const ini_config *cfg) {

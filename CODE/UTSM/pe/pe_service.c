@@ -21,6 +21,7 @@
 #include <utsm/idt.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/panic.h>
 
 /* 32位 PE 用的栈与堆 */
 #define PE32_STACK_SIZE  (64 * 1024)   /* 64KB 栈 */
@@ -293,6 +294,8 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         if (rc != 0) {
             pe_dll_defer_dllmain(0);
             log_error("[PE] PE32+ load failed");
+            panic_full("PE-E10 PE32+ LOAD FAILED",
+                       "pe_service_run: PE32+ image load failed", 0);
             return -5;
         }
         log_info("[PE] running PE32+ natively");
@@ -307,6 +310,8 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         u8 *pe_stack = (u8 *)kmem_alloc_aligned(PE_STACK_BYTES, 4096);
         if (!pe_stack) {
             log_error("[PE] stack alloc failed");
+            panic_full("PE-E11 PE STACK ALLOC FAILED",
+                       "pe_service_run: 1MB PE stack allocation failed", 0);
             return -9;
         }
         u64 stack_top = (u64)pe_stack + PE_STACK_BYTES;  /* 4096 对齐 -> 16 对齐 */
@@ -339,6 +344,8 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
         if (rc != 0) {
             log_error("[PE] PE32 interp load failed");
             log_hex64("[PE] rc=", (u64)(i64)rc);
+            panic_full("PE-E12 PE32 INTERP LOAD FAILED",
+                       "pe_service_run: PE32 interpreter load failed", 0);
             return -6;
         }
         log_info("[PE] running PE32 via x86emu32");
@@ -351,6 +358,8 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
                                 img.iat, img.iat_count, stack_top);
         if (irc != 0) {
             log_error("[PE32] emu init failed");
+            panic_full("PE-E13 EMU INIT FAILED",
+                       "pe_service_run: x86emu32 init failed", 0);
             return -7;
         }
         emu.eip = img.entry_point;
@@ -367,12 +376,16 @@ int pe_service_run(const void *pe_data, u64 size, const char *cmdline, u64 *exit
             int rrc = x86emu32_run(&emu, &code);
             if (rrc != 0) {
                 log_error("[PE32] emulator error");
+                panic_full("PE-E14 EMULATOR ERROR",
+                           "pe_service_run: x86emu32_run returned error", 0);
                 code = 0xFFFFFFFFULL;
             }
             /* emu 字段只在未发生 longjmp 的正常返回路径读取
              * (setjmp 语义:longjmp 后被修改的自动变量值不确定) */
             if (emu.error && !emu.exited) {
                 log_warn("[PE32] emulator stopped with error");
+                panic_full("PE-E15 EMULATOR STOPPED WITH ERROR",
+                           "pe_service_run: emulator stopped in error state", 0);
             }
         } else {
             code = pe_shim_get_exit_code();

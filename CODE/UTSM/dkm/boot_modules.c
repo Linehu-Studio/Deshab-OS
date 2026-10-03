@@ -1,7 +1,8 @@
-#include <utsm/dkm.h>
+﻿#include <utsm/dkm.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/arena.h>
+#include <utsm/panic.h>
 #include "../arch/x86_64/limine.h"
 
 #define ELF_MAGIC0 0x7f
@@ -178,10 +179,14 @@ int dkm_scan_symbols(const void *address, u64 size, struct dkm_symbol_scan *out)
 
     if (ehdr->shoff == 0 || ehdr->shnum == 0 || ehdr->shentsize < sizeof(elf64_shdr)) {
         log_error("[DKM] ELF has no section table");
+        panic_full("DKM-E30 ELF NO SECTION TABLE",
+                   "dkm_scan_symbols: driver ELF has no section table", 0);
         return -1;
     }
     if (!range_ok(ehdr->shoff, (u64)ehdr->shnum * ehdr->shentsize, size)) {
         log_error("[DKM] ELF section table out of range");
+        panic_full("DKM-E31 ELF SECTION TABLE OUT OF RANGE",
+                   "dkm_scan_symbols: section table out of file range", 0);
         return -1;
     }
 
@@ -202,10 +207,14 @@ int dkm_scan_symbols(const void *address, u64 size, struct dkm_symbol_scan *out)
 
     if (!symtab || !strtab || strtab->type != SHT_STRTAB) {
         log_error("[DKM] missing symtab/strtab");
+        panic_full("DKM-E32 ELF MISSING SYMTAB",
+                   "dkm_scan_symbols: symtab/strtab missing or invalid", 0);
         return -1;
     }
     if (symtab->entsize < sizeof(elf64_sym) || !range_ok(symtab->offset, symtab->size, size) || !range_ok(strtab->offset, strtab->size, size)) {
         log_error("[DKM] invalid symtab/strtab range");
+        panic_full("DKM-E33 ELF SYMTAB RANGE INVALID",
+                   "dkm_scan_symbols: symtab/strtab out of file range", 0);
         return -1;
     }
 
@@ -241,6 +250,8 @@ int dkm_scan_symbols(const void *address, u64 size, struct dkm_symbol_scan *out)
         return 0;
     }
     log_error("[DKM] required driver symbols missing");
+    panic_full("DKM-E34 REQUIRED DRIVER SYMBOLS MISSING",
+               "dkm_scan_symbols: driver_desc/init/exit symbol missing", 0);
     return -1;
 }
 
@@ -271,12 +282,16 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
 
     if (total_size == 0) {
         log_error("[DKM] no allocatable sections");
+        panic_full("DKM-E35 ELF NO ALLOC SECTIONS",
+                   "dkm_load_elf_rel: no allocatable sections", 0);
         return -1;
     }
 
     u8 *image = (u8 *)kmem_alloc_aligned(total_size, max_align);
     if (!image) {
         log_error("[DKM] failed to allocate module memory");
+        panic_full("DKM-E36 MODULE MEM ALLOC FAILED",
+                   "dkm_load_elf_rel: module memory allocation failed", 0);
         return -1;
     }
     memset(image, 0, total_size);
@@ -353,6 +368,8 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
             } else {
                 log_error("[DKM] unsupported relocation type");
                 log_hex64("[DKM] reloc type=", (u64)reloc_type);
+                panic_full("DKM-E37 UNSUPPORTED RELOCATION",
+                           "dkm_load_elf_rel: unsupported relocation type", 0);
                 return -1;
             }
 
@@ -373,6 +390,8 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
     const dkm_driver_desc *desc = (const dkm_driver_desc *)(image + image_offset[desc_sym->shndx] + desc_sym->value);
     if (desc->magic != DKM_DRIVER_MAGIC) {
         log_error("[DKM] external driver_desc magic mismatch");
+        panic_full("DKM-E38 DRIVER DESC MAGIC MISMATCH",
+                   "dkm_load_elf_rel: external driver_desc magic mismatch", 0);
         return -1;
     }
 
@@ -397,6 +416,8 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
     if (result != 0) {
         handle.state = DKM_STATE_FAILED;
         log_error("[DKM] external driver init failed");
+        panic_full("DKM-E39 EXTERNAL DRIVER INIT FAILED",
+                   "dkm_load_elf_rel: external driver_init returned non-zero", 0);
         return result;
     }
     handle.state = DKM_STATE_ACTIVE;
@@ -408,6 +429,8 @@ void dkm_scan_boot_modules(void) {
     struct limine_module_response *response = g_module_request.response;
     if (!response) {
         log_warn("[DKM] no Limine module response");
+        panic_full("DKM-E40 NO LIMINE MODULE RESPONSE",
+                   "dkm_scan_boot_modules: no Limine module response", 0);
         return;
     }
 
@@ -418,6 +441,8 @@ void dkm_scan_boot_modules(void) {
         struct limine_file *file = response->modules[i];
         if (!file) {
             log_warn("[DKM] null module entry");
+            panic_full("DKM-E41 NULL MODULE ENTRY",
+                       "dkm_scan_boot_modules: null boot module entry", 0);
             continue;
         }
 
@@ -439,11 +464,15 @@ void dkm_scan_boot_modules(void) {
                 int load_result = dkm_load_elf_rel(file->address, file->size, &symbols);
                 if (load_result != 0) {
                     log_error("[DKM] external driver load failed");
+                    panic_full("DKM-E42 EXTERNAL DRIVER LOAD FAILED",
+                               "dkm_scan_boot_modules: external driver load failed", 0);
                 }
             }
         } else {
             log_error("[DKM] module ELF64 rejected");
             log_hex64("[DKM] elf status=", (u64)(i64)status);
+            panic_full("DKM-E43 MODULE ELF64 REJECTED",
+                       "dkm_scan_boot_modules: boot module ELF64 check rejected", 0);
         }
     }
 

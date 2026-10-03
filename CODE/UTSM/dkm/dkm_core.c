@@ -1,5 +1,6 @@
-#include <utsm/dkm.h>
+﻿#include <utsm/dkm.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 
 static int dkm_validate_desc(const dkm_driver_desc *desc) {
     if (!desc) {
@@ -27,18 +28,24 @@ void dkm_init(void) {
         log_info("[DKM] init ok");
     } else {
         log_error("[DKM] init failed");
+        panic_full("DKM-E50 BUILTIN INIT FAILED",
+                   "dkm_init: builtin console_early load failed", 0);
     }
 }
 
 int dkm_load_builtin(const dkm_builtin_driver *driver) {
     if (!driver || !driver->desc || !driver->init) {
         log_error("[DKM] invalid builtin driver");
+        panic_full("DKM-E51 INVALID BUILTIN DRIVER",
+                   "dkm_load_builtin: builtin driver descriptor invalid", 0);
         return -1;
     }
 
     int status = dkm_validate_desc(driver->desc);
     if (status != 0) {
         log_error("[DKM] driver_desc rejected");
+        panic_full("DKM-E52 DRIVER DESC REJECTED",
+                   "dkm_load_builtin: builtin driver_desc validation failed", 0);
         return status;
     }
 
@@ -60,6 +67,8 @@ int dkm_load_builtin(const dkm_builtin_driver *driver) {
     if (status != 0) {
         handle.state = DKM_STATE_FAILED;
         log_error("[DKM] builtin driver init failed");
+        panic_full("DKM-E53 BUILTIN DRIVER INIT FAILED",
+                   "dkm_load_builtin: builtin driver_init returned non-zero", 0);
         return status;
     }
 

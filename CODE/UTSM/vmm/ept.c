@@ -1,4 +1,5 @@
 #include <utsm/ept.h>
+#include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
@@ -41,6 +42,7 @@ static u64 ept_alloc_page(void) {
     dkm_dma_buffer buf;
     if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0x100000000ULL, &buf) != 0) {
         log_error("[EPT] alloc page failed");
+        panic_full("EPT-E01 EPT PAGE ALLOC FAILED", "dma_alloc_pages failed for an ept page table page", 0);
         return 0;
     }
     /* dma_alloc_pages 已清零 */
@@ -51,6 +53,7 @@ int ept_init(void) {
     g_ept_pml4_phys = ept_alloc_page();
     if (g_ept_pml4_phys == 0) {
         log_error("[EPT] failed to alloc PML4");
+        panic_full("EPT-E02 ALLOC PML4 FAILED", "ept root pml4 page allocation failed", 0);
         return -1;
     }
     g_ept_pml4_virt = (u64)phys_to_virt(g_ept_pml4_phys);
@@ -122,6 +125,7 @@ int ept_map_range(u64 gpa, u64 hpa, u64 size, u64 flags) {
     if ((gpa & (EPT_PAGE_SIZE - 1)) || (hpa & (EPT_PAGE_SIZE - 1)) ||
         (size & (EPT_PAGE_SIZE - 1))) {
         log_error("[EPT] unaligned map request");
+        panic_full("EPT-E03 UNALIGNED MAP REQUEST", "ept map request got a non page aligned gpa hpa or size", 0);
         return -2;
     }
 
@@ -132,6 +136,7 @@ int ept_map_range(u64 gpa, u64 hpa, u64 size, u64 flags) {
         u64 *entry = ept_walk(cur_gpa, 1);
         if (!entry) {
             log_error("[EPT] walk failed");
+            panic_full("EPT-E04 EPT WALK FAILED", "ept_walk could not allocate intermediate page tables", 0);
             return -3;
         }
         *entry = ept_make_leaf(cur_hpa, flags, EPT_MEMORY_TYPE_WB);

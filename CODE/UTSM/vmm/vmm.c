@@ -1,4 +1,5 @@
 #include <utsm/vmm.h>
+#include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/log.h>
@@ -412,23 +413,28 @@ int vmm_init(void) {
     log_info("[VMM] init begin");
 
     if (vmx_enable() != 0) {
-        log_error("[VMM] VMX enable failed");
+        /* 【插桩白名单】设计内环境探测：WHPX/无嵌套 VMX 等 VMX 不可用属
+         * CLAUDE.md §3 白名单"VMX/bzImage/kernel.krl 未配置跳过"。 */
+        log_error("[VMM] VMX enable failed (environment probe, skipping)");
         return -1;
     }
 
     if (ept_init() != 0) {
-        log_error("[VMM] EPT init failed");
+        /* 【插桩白名单】同上：EPT 不可用走 shadow paging 回退，由外层门跳过 guest 段。 */
+        log_error("[VMM] EPT init failed (environment probe, skipping)");
         return -2;
     }
 
     if (vmx_vmcs_alloc(&g_vmcs_phys) != 0) {
-        log_error("[VMM] VMCS alloc failed");
+        /* 【插桩白名单】同上：init 期资源探测失败，非运行期语义错误。 */
+        log_error("[VMM] VMCS alloc failed (environment probe, skipping)");
         return -3;
     }
     log_hex64("[VMM] VMCS phys=", g_vmcs_phys);
 
     if (vmx_vmcs_load(g_vmcs_phys) != 0) {
-        log_error("[VMM] VMCS load failed");
+        /* 【插桩白名单】同上。 */
+        log_error("[VMM] VMCS load failed (environment probe, skipping)");
         return -4;
     }
 
@@ -436,7 +442,8 @@ int vmm_init(void) {
     vmx_vmcs_write(VMCS_VPID, 0x1234);
     u64 vpid_readback = vmx_vmcs_read(VMCS_VPID);
     if (vpid_readback != 0x1234) {
-        log_error("[VMM] VMCS read/write verify failed");
+        /* 【插桩白名单】同上：init 期硬件回读探测，异常环境交外层门跳过。 */
+        log_error("[VMM] VMCS read/write verify failed (environment probe, skipping)");
         log_hex64("[VMM] wrote=0x1234 read=", vpid_readback);
         return -5;
     }
@@ -550,6 +557,7 @@ static void vmm_dump_guest_state(void) {
 int vmm_self_test(void) {
     if (!g_vmm_ready) {
         log_error("[VMM] not ready");
+        panic_full("VMM-E15 VMM NOT READY", "self test invoked before vmm_init succeeded", 0);
         return -1;
     }
 
@@ -573,18 +581,22 @@ int vmm_self_test(void) {
 
     if (ept_map_range(0x1000, guest_code_phys, 4096, EPT_RWX) != 0) {
         log_error("[VMM] map guest code failed");
+        panic_full("VMM-E16 MAP GUEST CODE FAILED", "ept_map_range failed for the self test code page", 0);
         return -3;
     }
     if (ept_map_range(0x8000, guest_stack_phys, 4096, EPT_RWX) != 0) {
         log_error("[VMM] map guest stack failed");
+        panic_full("VMM-E17 MAP GUEST STACK FAILED", "ept_map_range failed for the self test stack page", 0);
         return -4;
     }
     if (ept_map_range(0x3000, guest_gdt_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[VMM] map guest GDT failed");
+        panic_full("VMM-E18 MAP GUEST GDT FAILED", "ept_map_range failed for the self test gdt page", 0);
         return -5;
     }
     if (ept_map_range(0x4000, guest_tss_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[VMM] map guest TSS failed");
+        panic_full("VMM-E19 MAP GUEST TSS FAILED", "ept_map_range failed for the self test tss page", 0);
         return -6;
     }
     /* P8.4: Map IDT page for KVM nested VMX (IDTR base = 0x5000) */
@@ -593,6 +605,7 @@ int vmm_self_test(void) {
         for (int i = 0; i < 4096; i++) g_guest_idt[i] = 0;
         if (ept_map_range(0x5000, guest_idt_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
             log_error("[VMM] map guest IDT failed");
+            panic_full("VMM-E20 MAP GUEST IDT FAILED", "ept_map_range failed for the self test idt page", 0);
             return -9;
         }
     }
@@ -616,6 +629,7 @@ int vmm_self_test(void) {
             ept_map_range(0x7000, pdpt_phys, 4096, EPT_READ | EPT_WRITE) != 0 ||
             ept_map_range(0x9000, pd_phys, 4096, EPT_READ | EPT_WRITE) != 0) {
             log_error("[VMM] map guest page tables failed");
+            panic_full("VMM-E21 MAP GUEST PAGE TABLES FAILED", "ept_map_range failed for the self test page tables", 0);
             return -12;
         }
     }
@@ -629,10 +643,12 @@ int vmm_self_test(void) {
      * Without this, VMLAUNCH fails (error 4 or silent failure under KVM). */
     if (vmx_vmcs_clear(g_vmcs_phys) != 0) {
         log_error("[VMM] vmclear failed");
+        panic_full("VMM-E22 VMCLEAR FAILED", "vmclear failed on the self test vmcs", 0);
         return -10;
     }
     if (vmx_vmcs_load(g_vmcs_phys) != 0) {
         log_error("[VMM] vmptrld after vmclear failed");
+        panic_full("VMM-E23 VMPTRLD FAILED", "vmptrld failed after vmclear on the self test vmcs", 0);
         return -11;
     }
 
@@ -725,6 +741,7 @@ int vmm_self_test(void) {
             log_hex64("[VMM] CR4 missing(need)=", cr4_missing);
             log_hex64("[VMM] CR4 extra(forbid)=", cr4_extra);
         }
+        panic_full("VMM-E24 VMLAUNCH FAILED", "vmlaunch failed during the self test launch", 0);
         return -7;
     }
 
@@ -735,6 +752,7 @@ int vmm_self_test(void) {
 
     if (g_last_exit_reason != EXIT_HLT) {
         log_warn("[VMM] expected HLT exit");
+        panic_full("VMM-E25 UNEXPECTED EXIT REASON", "self test guest exited with a reason other than hlt", 0);
         return -8;
     }
 

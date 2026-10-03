@@ -16,6 +16,7 @@
 #include <utsm/idt.h>
 #include <utsm/dkm.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 
 extern void outb(u16 port, u8 value);
 extern u8 inb(u16 port);
@@ -63,6 +64,7 @@ int lapic_timer_init(u32 freq_hz) {
             base = rdmsr_(MSR_IA32_APIC_BASE);
         }
         if (base & APIC_BASE_X2APIC) {
+            /* 【插桩白名单】设计内降级：x2APIC 不支持 MMIO timer，降级协作模式 */
             log_warn("[LAPIC] x2APIC mode, MMIO timer unsupported");
             return -1;
         }
@@ -73,6 +75,8 @@ int lapic_timer_init(u32 freq_hz) {
         if (!mm || !mm->map_mmio) return -2;
         if (mm->map_mmio(phys, 0x1000) != 0) {
             log_warn("[LAPIC] map_mmio failed");
+            panic_full("LAPIC-E01 MAP_MMIO FAILED",
+                       "lapic_timer_init: LAPIC MMIO mapping failed", 0);
             return -3;
         }
         u64 hhdm = 0;
@@ -82,6 +86,8 @@ int lapic_timer_init(u32 freq_hz) {
         if (mm->is_mapped && !mm->is_mapped((u64)g_lapic)) {
             g_lapic = 0;
             log_warn("[LAPIC] mapped page not reachable");
+            panic_full("LAPIC-E02 MAPPED PAGE NOT REACHABLE",
+                       "lapic_timer_init: mapped LAPIC page not reachable", 0);
             return -4;
         }
 
@@ -121,6 +127,8 @@ int lapic_timer_init(u32 freq_hz) {
     u64 delta = (u64)ccr0 - (u64)ccr1;             /* 16 分频时钟 10ms tick 数 */
     if (delta < 1000) {
         log_warn("[LAPIC] timer calibration implausible");
+        panic_full("LAPIC-E03 CALIBRATION IMPLAUSIBLE",
+                   "lapic_timer_init: PIT-vs-LAPIC calibration implausible", 0);
         lapic_timer_stop();
         return -5;
     }
@@ -134,6 +142,8 @@ int lapic_timer_init(u32 freq_hz) {
         int vec = irq_vector_alloc();
         if (vec < 0) {
             log_warn("[LAPIC] irq_vector_alloc failed");
+            panic_full("LAPIC-E04 IRQ VECTOR ALLOC FAILED",
+                       "lapic_timer_init: dynamic vector allocation failed", 0);
             return -6;
         }
         g_timer_vector = vec;

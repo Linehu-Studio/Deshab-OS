@@ -1,4 +1,5 @@
 #include <utsm/vmx.h>
+#include <utsm/panic.h>
 #include <utsm/ept.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
@@ -41,10 +42,12 @@ u64 vmx_kernel_virt_to_phys(const void *address) {
 
     if (!response) {
         log_error("[VMX] Limine kernel-address response missing");
+        panic_full("VMX-E01 KERNEL ADDRESS RESPONSE MISSING", "limine did not return a kernel address response", 0);
         return 0;
     }
     if (virt < response->virtual_base) {
         log_error("[VMX] address is below kernel virtual base");
+        panic_full("VMX-E02 ADDRESS BELOW KERNEL VIRTUAL BASE", "kernel virtual to physical conversion got an address below the kernel base", 0);
         return 0;
     }
 
@@ -235,6 +238,7 @@ int vmx_enable(void) {
     dkm_dma_buffer vmxon_buf;
     if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0x100000000ULL, &vmxon_buf) != 0) {
         log_error("[VMX] failed to alloc VMXON region");
+        panic_full("VMX-E03 ALLOC VMXON REGION FAILED", "dma_alloc_pages failed for the vmxon region", 0);
         return -2;
     }
     g_vmxon_phys = vmxon_buf.phys;
@@ -276,6 +280,7 @@ int vmx_enable(void) {
         /* 第二次尝试：读 vmx instruction error 通过 VMCS 不适用 vmxon；
          * 简化：返回失败。 */
         log_error("[VMX] vmxon failed");
+        panic_full("VMX-E04 VMXON FAILED", "the vmxon instruction failed to enter vmx root mode", 0);
         return -3;
     }
 
@@ -301,6 +306,7 @@ int vmx_vmcs_alloc(u64 *phys_out) {
     dkm_dma_buffer buf;
     if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0x100000000ULL, &buf) != 0) {
         log_error("[VMX] failed to alloc VMCS region");
+        panic_full("VMX-E05 ALLOC VMCS REGION FAILED", "dma_alloc_pages failed for the vmcs region", 0);
         return -2;
     }
     /* 偏移 0 写入 VMCS revision ID */
@@ -328,6 +334,7 @@ int vmx_vmcs_load(u64 phys) {
     );
     if (err) {
         log_error("[VMX] vmptrld failed");
+        panic_full("VMX-E06 VMPTRLD FAILED", "the vmptrld instruction failed to load the vmcs", 0);
         return -1;
     }
     return 0;
@@ -352,6 +359,7 @@ int vmx_vmcs_clear(u64 phys) {
     );
     if (err) {
         log_error("[VMX] vmclear failed");
+        panic_full("VMX-E07 VMCLEAR FAILED", "the vmclear instruction failed on the vmcs", 0);
         return -1;
     }
     return 0;

@@ -14,6 +14,7 @@
  */
 
 #include <utsm/ipc_shm.h>
+#include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/log.h>
@@ -48,6 +49,7 @@ int ipc_shm_init(void) {
     u64 page_count = UTSM_IPC_SHM_SIZE / 4096;
     if (dma_alloc_pages(page_count, 4096, 0, &g_shm_buf) != 0) {
         log_error("[IPC] failed to alloc shared memory (1MB)");
+        panic_full("IPC-E01 ALLOC SHARED MEMORY FAILED", "dma_alloc_pages failed for the 1mb ipc shared memory region", 0);
         return -1;
     }
     log_hex64("[IPC] shm HPA=", g_shm_buf.phys);
@@ -84,6 +86,7 @@ int ipc_shm_init(void) {
     if (ept_map_range(LINUX_GUEST_IPC_SHM_GPA, g_shm_buf.phys,
                       UTSM_IPC_SHM_SIZE, EPT_READ | EPT_WRITE) != 0) {
         log_error("[IPC] EPT map shared memory failed");
+        panic_full("IPC-E02 EPT MAP SHARED MEMORY FAILED", "ept_map_range failed for the ipc shared memory region", 0);
         return -2;
     }
     log_hex64("[IPC] shm mapped GPA=", LINUX_GUEST_IPC_SHM_GPA);
@@ -143,6 +146,7 @@ int ipc_shm_send(u32 msg_type, const void *data, u32 data_len) {
     /* Check if Linux is ready to receive */
     if (!g_shm->header.linux_ready) {
         log_warn("[IPC] send: Linux not ready, dropping message");
+        panic_full("IPC-E03 SEND WITH LINUX NOT READY", "message dropped because the linux side never became ready", 0);
         return -1;
     }
 
@@ -169,6 +173,7 @@ int ipc_shm_send(u32 msg_type, const void *data, u32 data_len) {
     /* Enqueue into utsm_to_linux ring */
     if (utsm_ipc_ring_push(&g_shm->utsm_to_linux, &msg) != 0) {
         log_warn("[IPC] send: ring full, dropping message");
+        panic_full("IPC-E04 SEND RING FULL", "message dropped because the utsm to linux ring is full", 0);
         return -1;
     }
 

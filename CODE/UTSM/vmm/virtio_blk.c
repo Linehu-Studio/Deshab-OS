@@ -15,6 +15,7 @@
  */
 
 #include <utsm/virtio_mmio.h>
+#include <utsm/panic.h>
 #include <utsm/linux_loader.h>
 #include <utsm/block.h>
 #include <utsm/log.h>
@@ -690,6 +691,7 @@ static int xrootfs_map_esp_file(void) {
     if (nclus == 0 || nclus > XROOTFS_MAX_CLUSTERS) {
         log_error("[VBLK] extra-rootfs cluster map too large");
         log_hex64("[VBLK] nclus=", nclus);
+        panic_full("VVB-E10 EXTRA ROOTFS CLUSTER MAP TOO LARGE", "extra rootfs image cluster count exceeds the static map limit", 0);
         return -7;
     }
 
@@ -697,6 +699,7 @@ static int xrootfs_map_esp_file(void) {
     for (i = 0; i < nclus; i++) {
         if (fc_cur < 2 || fc_cur >= 0x0FFFFFF8u) {
             log_error("[VBLK] extra-rootfs FAT chain short");
+            panic_full("VVB-E11 EXTRA ROOTFS FAT CHAIN SHORT", "fat chain of the extra rootfs image ended before covering the file", 0);
             return -8;
         }
         g_xrootfs_clus_lba[i] = (u32)vol + data_start + (fc_cur - 2u) * spc;

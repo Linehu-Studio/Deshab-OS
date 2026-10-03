@@ -560,6 +560,8 @@ int irq_vector_alloc(void) {
         return vec;
     }
     log_warn("[IDT] vector alloc failed: pool exhausted");
+    panic_full("IDT-E01 VECTOR POOL EXHAUSTED",
+               "irq_vector_alloc: dynamic vector pool exhausted", 0);
     return -1;
 }
 

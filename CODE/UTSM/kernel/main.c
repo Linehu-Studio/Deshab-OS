@@ -190,7 +190,10 @@ static void disk_log_flush(void) {
         log_info("[UTSM] disk_log: BOOTLOG.TXT written");
         log_hex64("[UTSM] disk_log: bytes=", len);
     } else {
-        log_error("[UTSM] disk_log: FAT32 write failed");
+        /* 【插桩白名单】设计内只读块路径：AHCI provider 当前仅注册最小
+         * read（CLAUDE.md ahci 驱动说明），write 恒为空，bootlog 落盘
+         * 失败属环境能力缺失而非数据读写错误。诊断日志不得阻断启动。 */
+        log_error("[UTSM] disk_log: FAT32 write failed (read-only block path, skip)");
         log_hex64("[UTSM] disk_log: rc=", (u64)(i64)rc);
     }
 }
@@ -258,6 +261,8 @@ void kernel_main(void) {
             if (cr4 & (1ULL << 12)) {
                 log_error("[UTSM] LA57 is ACTIVE — this kernel requires 4-level paging");
                 log_error("[UTSM] Refusing to boot. Disable LA57 in firmware settings.");
+                panic_full("VMM-E11 LA57 ACTIVE REFUSE BOOT",
+                           "5-level paging active; kernel requires 4-level paging", 0);
                 arch_halt_forever();
             }
         }
@@ -404,6 +409,8 @@ void kernel_main(void) {
          * (configured separately) may still work. Force-continue regardless. */
         if (vmm_st != 0) {
             log_warn("[UTSM] VMM self-test FAIL, but continuing to Linux guest");
+            panic_full("VMM-E12 VMM SELFTEST FAIL",
+                       "VMM self-test failed; force-continue removed by instrumentation", 0);
             vmm_st = 0;  /* force pass to continue to Linux guest */
         }
         if (vmm_st == 0) {
@@ -476,6 +483,8 @@ void kernel_main(void) {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
             log_error("[UTSM] VMM self-test FAIL");
             log_hex64("[UTSM] VMM st=", (u64)(i64)vmm_st);
+            panic_full("VMM-E13 VMM SELFTEST FAIL",
+                       "VMM self-test failed (non-zero status)", 0);
         }
 
         /* === OpenXJ380 guest — 可通过 FUCK [boot] xj380_guest=0 跳过 ===
@@ -532,6 +541,8 @@ void kernel_main(void) {
                 log_info("[UTSM] SELFTEST PASS");
             } else {
                 log_error("[UTSM] SELFTEST FAIL");
+                panic_full("VMM-E14 SELFTEST FAIL",
+                           "utsm_selftest_run returned non-zero", 0);
                 arch_halt_forever();
             }
         }
@@ -570,6 +581,8 @@ void kernel_main(void) {
 
     if (dsk_load_and_jump() != 0) {
         log_error("[UTSM] DSK jump failed");
+        panic_full("VMM-E15 DSK JUMP FAILED",
+                   "dsk_load_and_jump returned non-zero", 0);
     }
 
     /* ---- 插桩: 启动总耗时（仅在 DSK 跳转失败时可见） ---- */

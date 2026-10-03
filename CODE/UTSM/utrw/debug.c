@@ -3,6 +3,7 @@
 #include <utsm/pckc.h>
 #include <utsm/crypto.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 
 void *memcpy(void *dst, const void *src, usize len);
 
@@ -66,6 +67,8 @@ int utrw_debug_dump_page(u32 segment_slot, u64 page_index, u64 offset_in_page) {
     int st = utsm_pckc_get_or_derive(segment_slot, desc, &key);
     if (st != UTSM_OK) {
         log_warn("[UTRW] dump: key derive failed");
+        panic_full("UTRW-E10 DUMP KEY DERIVE FAILED",
+                   "utrw_debug_dump_page: PCKC key derivation failed", 0);
         return st;
     }
     u64 dump_line = (page_off + offset_in_page) / UTSM_CACHE_LINE_SIZE;

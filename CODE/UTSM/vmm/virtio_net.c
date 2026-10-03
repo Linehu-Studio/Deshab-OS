@@ -14,6 +14,7 @@
  */
 
 #include <utsm/virtio_mmio.h>
+#include <utsm/panic.h>
 #include <utsm/linux_loader.h>
 #include <utsm/net.h>
 #include <utsm/log.h>

@@ -18,6 +18,7 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/pe.h>
+#include <utsm/panic.h>
 
 /* ---- PE 导出目录结构（packed，与 pe_loader.h 风格一致） ---- */
 typedef struct __attribute__((packed)) {
@@ -263,6 +264,8 @@ static u64 resolve_export_by_name(u64 image_base, u32 export_dir_rva,
 static u64 resolve_forwarded_export(u64 image_base, u32 func_rva, int depth) {
     if (depth > PE_DLL_FWD_DEPTH_MAX) {
         log_warn("[PE] forwarded export chain too deep");
+        panic_full("PE-E20 FORWARD CHAIN TOO DEEP",
+                   "resolve_forwarded_export: forwarded export chain too deep", 0);
         return 0;
     }
     const char *fwd = (const char *)(image_base + func_rva);
@@ -280,6 +283,8 @@ static u64 resolve_forwarded_export(u64 image_base, u32 func_rva, int depth) {
     while (buf[dot] && buf[dot] != '.') dot++;
     if (buf[dot] != '.' || dot == 0 || buf[dot + 1] == 0) {
         log_warn("[PE] malformed forwarder string");
+        panic_full("PE-E21 MALFORMED FORWARDER STRING",
+                   "resolve_forwarded_export: malformed forwarder string", 0);
         return 0;
     }
     buf[dot] = 0;
@@ -318,6 +323,8 @@ static u64 resolve_forwarded_export(u64 image_base, u32 func_rva, int depth) {
         u64 addr = resolve_export_by_ordinal(base, g_dll_cache[idx].export_dir_rva, ord);
         if (addr == 0) {
             log_warn("[PE] ordinal forward target not found");
+            panic_full("PE-E22 ORDINAL FORWARD NOT FOUND",
+                       "resolve_forwarded_export: ordinal forward target missing", 0);
         }
         return addr;
     }
@@ -368,6 +375,8 @@ int pe_dll_load(const char *dll_name, u64 *out_base) {
     idx = dll_cache_alloc();
     if (idx < 0) {
         log_warn("[PE] DLL cache full, cannot load");
+        panic_full("PE-E23 DLL CACHE FULL",
+                   "pe_dll_load: DLL cache exhausted", 0);
         if (out_base) *out_base = 0;
         return -2;
     }
@@ -402,6 +411,8 @@ int pe_dll_load(const char *dll_name, u64 *out_base) {
     if (pe_load_image(file_copy, file_size, &info) != 0) {
         log_warn("[PE] DLL load failed: pe_load_image error");
         log_info(dll_name);
+        panic_full("PE-E24 DLL IMAGE LOAD FAILED",
+                   "pe_dll_load: pe_load_image failed for DLL", 0);
         entry->state = DLL_STATE_NONE;
         if (out_base) *out_base = 0;
         return -5;
@@ -436,6 +447,8 @@ int pe_dll_load(const char *dll_name, u64 *out_base) {
                 log_info("[PE] DllMain deferred");
             } else {
                 log_warn("[PE] DllMain pending queue full, skipped");
+                panic_full("PE-E25 DLLMAIN PENDING QUEUE FULL",
+                           "pe_dll_load: DllMain pending queue full", 0);
             }
         } else {
             typedef int (__attribute__((ms_abi)) *dllmain_fn)(u64, u32, u64);

@@ -13,6 +13,7 @@
  */
 
 #include <utsm/linux_loader.h>
+#include <utsm/panic.h>
 #include <utsm/linux_xsave.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
@@ -440,11 +441,13 @@ int linux_launch(void) {
     const struct linux_guest_info *gi = linux_get_guest_info();
     if (!gi || !gi->loaded) {
         log_error("[LINUX] guest not loaded");
+        panic_full("LNX-E20 LINUX GUEST NOT LOADED", "linux_launch invoked before linux_loader_init loaded a guest", 0);
         return -1;
     }
 
     if (!vmm_is_ready()) {
         log_error("[LINUX] VMM not ready");
+        panic_full("LNX-E21 VMM NOT READY", "linux_launch invoked before vmm_init succeeded", 0);
         return -2;
     }
 
@@ -487,10 +490,12 @@ int linux_launch(void) {
      * 内容不受影响：VMCLEAR 只回写内存并改状态，VMPTRLD 再挂载。 */
     if (vmx_vmcs_clear(vmm_get_vmcs_phys()) != 0) {
         log_error("[LINUX] vmclear failed");
+        panic_full("LNX-E22 VMCLEAR FAILED", "vmclear failed on the linux guest vmcs before launch", 0);
         return -4;
     }
     if (vmx_vmcs_load(vmm_get_vmcs_phys()) != 0) {
         log_error("[LINUX] vmptrld after vmclear failed");
+        panic_full("LNX-E23 VMPTRLD FAILED", "vmptrld failed after vmclear on the linux guest vmcs", 0);
         return -5;
     }
 
@@ -621,6 +626,7 @@ int linux_launch(void) {
         }
         log_hex64("[LINUX] vmlaunch failed, error=", error);
         g_linux_guest_active = 0;
+        panic_full("LNX-E24 VMLAUNCH FAILED", "vmlaunch failed for the linux guest", 0);
         return -3;
     }
 
@@ -632,6 +638,7 @@ int linux_launch(void) {
     log_hex64("[LINUX] vmexit count=", vmexit_get_count());
     if (!g_guest_parked) {
         log_error("[LINUX] guest terminated before daemon park");
+        panic_full("LNX-E25 GUEST TERMINATED BEFORE PARK", "linux guest terminated before the daemon parked", 0);
         return -6;
     }
 
@@ -653,6 +660,7 @@ int linux_launch(void) {
         if (!got_ready) {
             g_guest_parked = 0;
             log_error("[LINUX] HLT without EXEC_READY handshake");
+            panic_full("LNX-E26 HLT WITHOUT EXEC READY", "guest parked without the daemon publishing exec_ready", 0);
             return -7;
         }
     }

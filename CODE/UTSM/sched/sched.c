@@ -546,12 +546,16 @@ int utsm_sched_enable(u32 tick_hz) {
 
     if (lapic_timer_init(tick_hz) != 0) {
         log_error("[SCHED] lapic timer init failed, stays cooperative");
+        panic_full("SAS-E04 LAPIC TIMER INIT FAILED",
+                   "utsm_sched_enable: lapic_timer_init failed", 0);
         return -1;
     }
     int vec = lapic_timer_vector();
     if (vec < 0 || irq_register((u8)vec, utsm_tick_handler) != 0) {
         lapic_timer_stop();
         log_error("[SCHED] tick handler registration failed");
+        panic_full("SAS-E05 TICK HANDLER REGISTER FAILED",
+                   "utsm_sched_enable: tick handler registration failed", 0);
         return -2;
     }
     idt_set_exception_hook(utsm_sched_exc_hook);

@@ -6,6 +6,7 @@
 #include <utsm/pe.h>
 #include <utsm/linux_compat.h>
 #include <utsm/instr.h>
+#include <utsm/panic.h>
 #include "../arch/x86_64/limine.h"
 #include "../../tools/fat32_lfn.h"
 
@@ -215,6 +216,8 @@ static u32 fat32_get_next_cluster(u32 fat_start_byte, u32 clus,
         log_error("[UTSM] FAT32: on-demand FAT sector read failed");
         log_hex64("[UTSM] FAT32: fat_sec_lba=", fat_sec_lba);
         log_hex64("[UTSM] FAT32: clus=", clus);
+        panic_full("DSL-E01 FAT SECTOR READ FAILED",
+                   "fat32_get_next_cluster: on-demand FAT sector read failed", 0);
         return 0x0FFFFFFF;
     }
     return fat32_read_u32(g_dsk_fat32_fat_sec + ent_off_in_sec) & 0x0FFFFFFF;
@@ -223,11 +226,14 @@ static u32 fat32_get_next_cluster(u32 fat_start_byte, u32 clus,
 static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
     const dkm_kernel_api *api = dkm_get_kernel_api();
     if (!api || !api->block || !api->block->device_count) {
+        /* 【插桩白名单】设计内双路径回退：无块设备时由调用方回退
+         * Limine boot module（CLAUDE.md 两阶段 DSK 加载设计）。 */
         log_error("[UTSM] FAT32: no block api available");
         return -1;
     }
     u32 count = api->block->device_count();
     if (count == 0 || api->block->sector_size(0) != 512) {
+        /* 【插桩白名单】同上：无块设备属设计内回退路径。 */
         log_error("[UTSM] FAT32: no block device or wrong sector size");
         log_hex64("[UTSM] FAT32: device_count=", count);
         return -1;
@@ -239,12 +245,17 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
     if (st != 0) {
         log_error("[UTSM] FAT32: BPB read failed");
         log_hex64("[UTSM] FAT32: read status=", (u64)(i64)st);
+        panic_full("DSL-E04 BPB READ FAILED",
+                   "dsk_load_from_block_fat32: BPB 256-sector read failed", 0);
         return -1;
     }
 
     const fat32_bpb *bpb = (const fat32_bpb *)disk;
     if (bpb->boot_sig != 0xAA55 || bpb->bytes_per_sector != 512) {
-        log_error("[UTSM] FAT32: invalid BPB signature or sector size");
+        /* 【插桩白名单】设计内设备探测：device 0 可能是 GPT 主盘（LBA0 为
+         * 保护性 MBR，带 0x55AA 签名但非 FAT32 VBR）。非 FAT32 卷时由调用
+         * 方回退 Limine boot module（CLAUDE.md 两阶段 DSK 加载设计）。 */
+        log_error("[UTSM] FAT32: not a FAT32 volume on device 0 (fallback to boot module)");
         log_hex64("[UTSM] FAT32: boot_sig=", bpb->boot_sig);
         log_hex64("[UTSM] FAT32: bps=", bpb->bytes_per_sector);
         return -1;
@@ -271,6 +282,8 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
             log_error("[UTSM] FAT32: dir cluster read failed");
             log_hex64("[UTSM] FAT32: clus=", clus);
             log_hex64("[UTSM] FAT32: lba=", clus_lba);
+            panic_full("DSL-E06 DIR CLUSTER READ FAILED",
+                       "dsk_load_from_block_fat32: root dir cluster read failed", 0);
             return -1;
         }
 
@@ -294,6 +307,8 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
 
     if (!found_clus || found_size == 0) {
         log_error("[UTSM] FAT32: DESHAB.ELF not found in root dir");
+        panic_full("DSL-E07 DESHAB ELF NOT FOUND",
+                   "dsk_load_from_block_fat32: DESHAB.ELF not found in root dir", 0);
         return -1;
     }
     log_hex64("[UTSM] FAT32: found_clus=", found_clus);
@@ -301,6 +316,8 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
 
     if (found_size > sizeof(g_dsk_fat32_filedata)) {
         log_error("[UTSM] FAT32: file exceeds 2MB buffer");
+        panic_full("DSL-E08 DSK FILE EXCEEDS BUFFER",
+                   "dsk_load_from_block_fat32: deshab.elf exceeds file buffer", 0);
         return -1;
     }
     u8 *dst = g_dsk_fat32_filedata;
@@ -319,6 +336,8 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
             log_error("[UTSM] FAT32: data cluster read failed");
             log_hex64("[UTSM] FAT32: fc=", fc);
             log_hex64("[UTSM] FAT32: lba=", fc_lba);
+            panic_full("DSL-E09 DATA CLUSTER READ FAILED",
+                       "dsk_load_from_block_fat32: file data cluster read failed", 0);
             return -1;
         }
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = chunk[b];
@@ -334,6 +353,8 @@ static int dsk_load_from_block_fat32(const void **out_addr, u64 *out_size) {
     if (!file_buf) {
         log_error("[UTSM] FAT32: arena alloc failed");
         log_hex64("[UTSM] FAT32: size=", found_size);
+        panic_full("DSL-E10 ARENA ALLOC FAILED",
+                   "dsk_load_from_block_fat32: arena alloc for DSK image failed", 0);
         return -1;
     }
     for (u32 i = 0; i < found_size; i++) file_buf[i] = g_dsk_fat32_filedata[i];
@@ -1070,7 +1091,9 @@ int dsk_load_and_jump(void) {
     if (fat32_ok == 0) {
         log_info("[UTSM] DSK loaded from FAT32 block provider");
     } else {
-        /* 2) fallback: Limine boot module */
+        /* 2) fallback: Limine boot module
+         * 【插桩白名单】设计内双路径回退：块设备读 deshab.elf 失败时
+         * 回退 Limine boot module 预加载，按任务要求保持原样不插桩。 */
         log_info("[UTSM] FAT32 block path unavailable; trying Limine module");
         struct limine_file *file = dsk_find_module();
         if (!file) {
@@ -1086,6 +1109,8 @@ int dsk_load_and_jump(void) {
     if (status != 0) {
         log_error("[UTSM] DSK ELF rejected");
         log_hex64("[UTSM] DSK ELF status=", (u64)(i64)status);
+        panic_full("DSL-E11 DSK ELF REJECTED",
+                   "dsk_load_and_jump: deshab.elf ELF check rejected", 0);
         return status;
     }
 
@@ -1094,12 +1119,16 @@ int dsk_load_and_jump(void) {
     if (status != 0) {
         log_error("[UTSM] DSK load failed");
         log_hex64("[UTSM] DSK load status=", (u64)(i64)status);
+        panic_full("DSL-E12 DSK LOAD FAILED",
+                   "dsk_load_and_jump: DSK ELF image load failed", 0);
         return status;
     }
 
     dsk_boot_context *ctx = (dsk_boot_context *)kmem_alloc_aligned(sizeof(dsk_boot_context), 16);
     if (!ctx) {
         log_error("[UTSM] DSK context allocation failed");
+        panic_full("DSL-E13 DSK CONTEXT ALLOC FAILED",
+                   "dsk_load_and_jump: boot context allocation failed", 0);
         return -1;
     }
     dsk_fill_boot_context(ctx);
@@ -1169,5 +1198,7 @@ int dsk_load_and_jump(void) {
     entry(ctx);
 
     log_error("[UTSM] DSK returned unexpectedly");
+    panic_full("DSL-E14 DSK RETURNED UNEXPECTEDLY",
+               "dsk entry point returned to UTSM", 0);
     return -1;
 }

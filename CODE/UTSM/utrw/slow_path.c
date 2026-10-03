@@ -3,6 +3,7 @@
 #include <utsm/pckc.h>
 #include <utsm/drr.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 
 /* ===================================================================
  *  U2: UTRW Slow Path 真分支
@@ -53,6 +54,8 @@ int utsm_slow_path(utsm_capability cap, u32 rights, u64 offset, u64 len,
         st = utsm_pckc_get_or_derive(cap.segment_slot, desc, &key);
         if (st != UTSM_OK) {
             log_warn("[UTRW] slow: KEY_MISS re-derive failed");
+            panic_full("UTRW-E01 KEY_MISS RE-DERIVE FAILED",
+                       "utsm_slow_path: KEY_MISS key re-derivation failed", 0);
             return st;
         }
         log_warn("[UTRW] slow: KEY_MISS -> key re-derived (retry)");

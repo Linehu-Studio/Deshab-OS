@@ -1,4 +1,5 @@
 #include <utsm/vmx.h>
+#include <utsm/panic.h>
 #include <utsm/ept.h>
 #include <utsm/vmm.h>
 #include <utsm/hypercall.h>
@@ -98,10 +99,12 @@ static int ept_map_guest_ram_page(u64 gpa_page) {
     dkm_dma_buffer buf;
     if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0, &buf) != 0) {
         log_error("[VMEXIT] OOM for guest RAM page");
+        panic_full("VMX-E10 OOM FOR GUEST RAM PAGE", "dma_alloc_pages failed for a demand mapped guest ram page", 0);
         return -1;
     }
     if (ept_map_range(gpa_page, buf.phys, EPT_PAGE_SIZE, EPT_RWX) != 0) {
         log_error("[VMEXIT] EPT map guest RAM page failed");
+        panic_full("VMX-E11 EPT MAP GUEST RAM PAGE FAILED", "ept_map_range failed for a demand mapped guest ram page", 0);
         return -1;
     }
     return 0;
@@ -1091,6 +1094,7 @@ static int handle_virtio_mmio_access(u64 gpa, u64 rip, int *out_resume) {
         log_error("[VMEXIT] virtio-mmio: cannot decode access insn");
         log_hex64("[VMEXIT] rip=", rip);
         *out_resume = 0;
+        panic_full("VMX-E12 CANNOT DECODE VIRTIO MMIO INSN", "instruction fetch or decode failed for a virtio mmio access", 0);
         return -1;
     }
 
@@ -1146,6 +1150,7 @@ static int handle_ept_violation(u64 qualification, u64 rip, int *out_resume) {
             log_error("[VMEXIT] EPT upgrade existing page failed");
             log_hex64("[VMEXIT] gpa=", gpa);
             *out_resume = 0;
+            panic_full("VMX-E13 EPT UPGRADE EXISTING PAGE FAILED", "ept_map_range failed while upgrading an existing ept leaf", 0);
             return -1;
         }
         ept_flush_ept();
@@ -1161,6 +1166,7 @@ static int handle_ept_violation(u64 qualification, u64 rip, int *out_resume) {
         log_error("[VMEXIT] EPT violation: guest RAM map failed");
         log_hex64("[VMEXIT] gpa=", gpa);
         *out_resume = 0;
+        panic_full("VMX-E14 EPT VIOLATION GUEST RAM MAP FAILED", "demand mapping a guest ram page on ept violation failed", 0);
         return -1;
     }
     *out_resume = 1;
@@ -1322,6 +1328,7 @@ static int handle_exception(u64 qualification, u64 rip, int *out_resume) {
         log_hex64("[VMEXIT] df idtr=", vmx_vmcs_read(VMCS_GUEST_IDTR_BASE));
         log_hex64("[VMEXIT] df idtl=", vmx_vmcs_read(VMCS_GUEST_IDTR_LIMIT));
         *out_resume = 0;
+        panic_full("VMX-E15 GUEST DOUBLE FAULT", "guest took a double fault which will not be reinjected", 0);
         return 0;
     }
     if (g_linux_guest_active) {
@@ -1461,6 +1468,7 @@ int vmexit_dispatch(void) {
             if (ept_map_guest_ram_page(page) != 0) {
                 log_error("[VMEXIT] EPT misconfig repair failed");
                 resume = 0;
+                panic_full("VMX-E16 EPT MISCONFIG REPAIR FAILED", "both ept_repair_leaf and a fresh page alloc failed on ept misconfig", 0);
                 break;
             }
             if (misconfig_logs <= 16)
@@ -1484,6 +1492,7 @@ int vmexit_dispatch(void) {
         log_hex64("[VMEXIT] triple idtr=", vmx_vmcs_read(VMCS_GUEST_IDTR_BASE));
         log_hex64("[VMEXIT] triple idtl=", vmx_vmcs_read(VMCS_GUEST_IDTR_LIMIT));
         resume = 0;
+        panic_full("VMX-E17 GUEST TRIPLE FAULT", "guest cpu entered a triple fault", 0);
         break;
     case EXIT_EXTERNAL_INTERRUPT:
         INSTR_STAT_INC(ext_irq);

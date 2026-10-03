@@ -2,6 +2,7 @@
 #include <utsm/dma.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/panic.h>
 #include "../arch/x86_64/limine.h"
 
 #define MM_PAGE_SIZE 4096ULL
@@ -79,11 +80,15 @@ static void mm_lazy_init(void) {
     g_max_phys_addr_bits = 0;
     if (!g_hhdm_request.response) {
         log_warn("[MM] missing HHDM response");
+        panic_full("MM-E10 MISSING HHDM RESPONSE",
+                   "mm_lazy_init: Limine HHDM response missing", 0);
         return;
     }
     g_hhdm = g_hhdm_request.response->offset;
     if (!g_hhdm) {
         log_warn("[MM] null HHDM offset");
+        panic_full("MM-E11 NULL HHDM OFFSET",
+                   "mm_lazy_init: HHDM offset is zero", 0);
         return;
     }
 
@@ -95,6 +100,8 @@ static void mm_lazy_init(void) {
         log_error("[MM] LA57 5-level paging ACTIVE — REFUSING to proceed");
         log_error("[MM] This kernel requires 4-level paging (48-bit virtual)");
         log_error("[MM] Disable LA57 in BIOS/firmware settings");
+        panic_full("MM-E12 LA57 ACTIVE REFUSE",
+                   "mm_lazy_init: 5-level paging active; 4-level walk required", 0);
         return;
     }
 
@@ -113,6 +120,8 @@ static void mm_lazy_init(void) {
             log_hex64("[MM] CPU MaxPhysAddr bits=", g_max_phys_addr_bits);
             if (g_max_phys_addr_bits > 52) {
                 log_error("[MM] physical address width > 52 bits — PTE cannot represent");
+                panic_full("MM-E13 PHYS ADDR WIDTH EXCEEDED",
+                           "mm_lazy_init: physical address width exceeds 52 bits", 0);
                 return;
             }
         } else {
@@ -126,6 +135,8 @@ static void mm_lazy_init(void) {
     g_window_base = mm_find_window();
     if (!g_window_base) {
         log_error("[MM] no free PML4 slot for mmio window");
+        panic_full("MM-E14 NO FREE PML4 SLOT",
+                   "mm_lazy_init: no free PML4 slot for mmio window", 0);
         return;
     }
     g_window_end = g_window_base + MM_WINDOW_SIZE;
@@ -153,6 +164,8 @@ static u64 *mm_walk_create(u64 virt) {
             dkm_dma_buffer buf;
             if (dma_alloc_pages(1, MM_PAGE_SIZE, 0, &buf) != 0) {
                 log_warn("[MM] page table alloc failed");
+                panic_full("MM-E15 PAGE TABLE ALLOC FAILED",
+                           "mm_walk_create: page table page alloc failed", 0);
                 return 0;
             }
             table[idx] = buf.phys | PTE_PRESENT | PTE_RW;
@@ -185,6 +198,8 @@ void *mm_map_mmio(u64 phys, u64 size) {
             log_error("[MM] phys address exceeds CPU MaxPhysAddr");
             log_hex64("[MM] phys=", phys);
             log_hex64("[MM] max_phys=", max_phys);
+            panic_full("MM-E16 PHYS EXCEEDS MAXADDR",
+                       "mm_map_mmio: physical address exceeds CPU MaxPhysAddr", 0);
             return 0;
         }
     }
@@ -197,6 +212,8 @@ void *mm_map_mmio(u64 phys, u64 size) {
     u64 vbase = g_window_next;
     if (vbase < g_window_base || vbase + total > g_window_end) {
         log_error("[MM] mmio window exhausted");
+        panic_full("MM-E17 MMIO WINDOW EXHAUSTED",
+                   "mm_map_mmio: MMIO virtual window exhausted", 0);
         return 0;
     }
 
@@ -207,6 +224,8 @@ void *mm_map_mmio(u64 phys, u64 size) {
         if (!pte || (*pte & PTE_PRESENT)) {
             /* 冲突/失败：回滚本次已建立的映射 */
             log_error("[MM] map conflict");
+            panic_full("MM-E18 MAP CONFLICT",
+                       "mm_map_mmio: page table walk conflict or failure", 0);
             for (u64 j = 0; j < mapped; j++) {
                 u64 v = vbase + j * MM_PAGE_SIZE;
                 u64 *p = mm_walk_query(v);

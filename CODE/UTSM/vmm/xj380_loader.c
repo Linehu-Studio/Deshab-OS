@@ -15,6 +15,7 @@
  */
 
 #include <utsm/xj380_loader.h>
+#include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/log.h>
@@ -86,24 +87,29 @@ static int xj380_parse_elf(const void *img, u64 size,
                            u64 *entry_out, u64 *span_out) {
     if (size < sizeof(xj_elf64_ehdr)) {
         log_error("[XJ380] kernel.krl too small");
+        panic_full("XJ3-E01 KRL IMAGE TOO SMALL", "kernel.krl image smaller than an elf64 header", 0);
         return -1;
     }
     const xj_elf64_ehdr *eh = (const xj_elf64_ehdr *)img;
     if (*(u32 *)eh->e_ident != (u32)ELF_MAGIC) {
         log_error("[XJ380] bad ELF magic");
+        panic_full("XJ3-E02 BAD ELF MAGIC", "kernel.krl elf magic mismatch", 0);
         return -2;
     }
     if (eh->e_ident[4] != 2) {          /* ELFCLASS64 */
         log_error("[XJ380] not a 64-bit ELF");
+        panic_full("XJ3-E03 NOT A 64-BIT ELF", "kernel.krl is not a 64-bit elf image", 0);
         return -3;
     }
     if (eh->e_type != ELF_ET_EXEC) {
         log_error("[XJ380] kernel.krl not ET_EXEC");
+        panic_full("XJ3-E04 KRL NOT ET_EXEC", "kernel.krl is not an ET_EXEC elf image", 0);
         return -4;
     }
     if (eh->e_phnum == 0 || eh->e_phentsize != sizeof(xj_elf64_phdr) ||
         eh->e_phoff + (u64)eh->e_phnum * sizeof(xj_elf64_phdr) > size) {
         log_error("[XJ380] bad program header table");
+        panic_full("XJ3-E05 BAD PROGRAM HEADER TABLE", "kernel.krl program header table is invalid", 0);
         return -5;
     }
 
@@ -114,21 +120,25 @@ static int xj380_parse_elf(const void *img, u64 size,
         if (ph[i].p_vaddr < XJ380_KERNEL_VADDR) {
             log_error("[XJ380] PT_LOAD below kernel base");
             log_hex64("[XJ380] vaddr=", ph[i].p_vaddr);
+            panic_full("XJ3-E06 PT_LOAD BELOW KERNEL BASE", "pt_load segment mapped below the xj380 kernel base", 0);
             return -6;
         }
         u64 off = ph[i].p_vaddr - XJ380_KERNEL_VADDR;
         if (off + ph[i].p_memsz > XJ380_GUEST_KERNEL_MAX) {
             log_error("[XJ380] kernel exceeds reserved window (32MB)");
+            panic_full("XJ3-E07 KERNEL EXCEEDS RESERVED WINDOW", "kernel span exceeds the 32mb reserved window", 0);
             return -7;
         }
         if (ph[i].p_offset + ph[i].p_filesz > size) {
             log_error("[XJ380] PT_LOAD filesz beyond image");
+            panic_full("XJ3-E08 PT_LOAD FILESZ BEYOND IMAGE", "pt_load file size extends beyond the kernel.krl image", 0);
             return -8;
         }
         if (off + ph[i].p_memsz > span) span = off + ph[i].p_memsz;
     }
     if (span == 0) {
         log_error("[XJ380] no PT_LOAD segments");
+        panic_full("XJ3-E09 NO PT_LOAD SEGMENTS", "kernel.krl contains no pt_load segments", 0);
         return -9;
     }
 
@@ -474,6 +484,7 @@ static int xj380_build_boot_config(u64 hpa, u64 mtrr_hpa, u64 stack_gpa, u64 fbc
 void *xj380_find_kernel_module(u64 *size_out) {
     if (!g_module_request.response) {
         log_error("[XJ380] no Limine module response");
+        panic_full("XJ3-E10 NO LIMINE MODULE RESPONSE", "limine did not return a boot module response", 0);
         return (void *)0;
     }
 
@@ -525,34 +536,37 @@ int xj380_loader_init(void) {
     u64 entry, span;
     if (xj380_parse_elf(krl, krl_size, &entry, &span) != 0) {
         log_error("[XJ380] kernel.krl parse failed");
+        panic_full("XJ3-E11 KRL PARSE FAILED", "xj380_parse_elf rejected the kernel.krl image", 0);
         return -2;
     }
     if (entry < XJ380_KERNEL_VADDR || entry >= XJ380_KERNEL_VADDR + span) {
         log_error("[XJ380] entry outside kernel window");
+        panic_full("XJ3-E12 ENTRY OUTSIDE KERNEL WINDOW", "kernel entry point lies outside the reserved kernel window", 0);
         return -3;
     }
 
     /* 3. 分配 boot area 缓冲（按页） */
     dkm_dma_buffer pgt_buf, gdt_buf, madt_buf, fadt_buf, mcfg_buf, hpet_buf;
     dkm_dma_buffer memmap_buf, bootcfg_buf, mtrr_buf, stack_buf, fakeefi_buf, fbc_buf;
-    if (dma_alloc_pages(8, 4096, 0, &pgt_buf)     != 0) { log_error("[XJ380] alloc pgt failed"); return -4; }
-    if (dma_alloc_pages(1, 4096, 0, &gdt_buf)     != 0) { log_error("[XJ380] alloc gdt failed"); return -5; }
-    if (dma_alloc_pages(1, 4096, 0, &madt_buf)    != 0) { log_error("[XJ380] alloc madt failed"); return -6; }
-    if (dma_alloc_pages(1, 4096, 0, &fadt_buf)    != 0) { log_error("[XJ380] alloc fadt failed"); return -7; }
-    if (dma_alloc_pages(1, 4096, 0, &mcfg_buf)    != 0) { log_error("[XJ380] alloc mcfg failed"); return -8; }
-    if (dma_alloc_pages(1, 4096, 0, &hpet_buf)    != 0) { log_error("[XJ380] alloc hpet failed"); return -9; }
-    if (dma_alloc_pages(1, 4096, 0, &memmap_buf)  != 0) { log_error("[XJ380] alloc memmap failed"); return -10; }
-    if (dma_alloc_pages(1, 4096, 0, &bootcfg_buf) != 0) { log_error("[XJ380] alloc bootcfg failed"); return -11; }
-    if (dma_alloc_pages(1, 4096, 0, &mtrr_buf)    != 0) { log_error("[XJ380] alloc mtrr failed"); return -12; }
-    if (dma_alloc_pages(2, 4096, 0, &stack_buf)   != 0) { log_error("[XJ380] alloc stack failed"); return -13; }
-    if (dma_alloc_pages(1, 4096, 0, &fakeefi_buf) != 0) { log_error("[XJ380] alloc fake efi failed"); return -14; }
-    if (dma_alloc_pages(1, 4096, 0, &fbc_buf)     != 0) { log_error("[XJ380] alloc fbc failed"); return -15; }
+    if (dma_alloc_pages(8, 4096, 0, &pgt_buf)     != 0) { log_error("[XJ380] alloc pgt failed"); panic_full("XJ3-E13 ALLOC PGT FAILED", "dma_alloc_pages failed for guest page tables", 0); return -4; }
+    if (dma_alloc_pages(1, 4096, 0, &gdt_buf)     != 0) { log_error("[XJ380] alloc gdt failed"); panic_full("XJ3-E14 ALLOC GDT FAILED", "dma_alloc_pages failed for the guest gdt page", 0); return -5; }
+    if (dma_alloc_pages(1, 4096, 0, &madt_buf)    != 0) { log_error("[XJ380] alloc madt failed"); panic_full("XJ3-E15 ALLOC MADT FAILED", "dma_alloc_pages failed for the madt stub", 0); return -6; }
+    if (dma_alloc_pages(1, 4096, 0, &fadt_buf)    != 0) { log_error("[XJ380] alloc fadt failed"); panic_full("XJ3-E16 ALLOC FADT FAILED", "dma_alloc_pages failed for the fadt stub", 0); return -7; }
+    if (dma_alloc_pages(1, 4096, 0, &mcfg_buf)    != 0) { log_error("[XJ380] alloc mcfg failed"); panic_full("XJ3-E17 ALLOC MCFG FAILED", "dma_alloc_pages failed for the mcfg stub", 0); return -8; }
+    if (dma_alloc_pages(1, 4096, 0, &hpet_buf)    != 0) { log_error("[XJ380] alloc hpet failed"); panic_full("XJ3-E18 ALLOC HPET FAILED", "dma_alloc_pages failed for the hpet stub", 0); return -9; }
+    if (dma_alloc_pages(1, 4096, 0, &memmap_buf)  != 0) { log_error("[XJ380] alloc memmap failed"); panic_full("XJ3-E19 ALLOC MEMMAP FAILED", "dma_alloc_pages failed for the efi memmap page", 0); return -10; }
+    if (dma_alloc_pages(1, 4096, 0, &bootcfg_buf) != 0) { log_error("[XJ380] alloc bootcfg failed"); panic_full("XJ3-E20 ALLOC BOOTCFG FAILED", "dma_alloc_pages failed for the boot_config page", 0); return -11; }
+    if (dma_alloc_pages(1, 4096, 0, &mtrr_buf)    != 0) { log_error("[XJ380] alloc mtrr failed"); panic_full("XJ3-E21 ALLOC MTRR FAILED", "dma_alloc_pages failed for the mtrr buffer", 0); return -12; }
+    if (dma_alloc_pages(2, 4096, 0, &stack_buf)   != 0) { log_error("[XJ380] alloc stack failed"); panic_full("XJ3-E22 ALLOC STACK FAILED", "dma_alloc_pages failed for the guest boot stack", 0); return -13; }
+    if (dma_alloc_pages(1, 4096, 0, &fakeefi_buf) != 0) { log_error("[XJ380] alloc fake efi failed"); panic_full("XJ3-E23 ALLOC FAKE EFI FAILED", "dma_alloc_pages failed for the fake efi table", 0); return -14; }
+    if (dma_alloc_pages(1, 4096, 0, &fbc_buf)     != 0) { log_error("[XJ380] alloc fbc failed"); panic_full("XJ3-E24 ALLOC FBC FAILED", "dma_alloc_pages failed for the framebuffer config page", 0); return -15; }
 
     /* 4. 分配内核缓冲并装入 PT_LOAD 段 */
     u64 kernel_alloc = (span + 4095) & ~4095ULL;
     dkm_dma_buffer kernel_buf;
     if (dma_alloc_pages(kernel_alloc / 4096, 2 * 1024 * 1024, 0, &kernel_buf) != 0) {
         log_error("[XJ380] failed to alloc kernel memory");
+        panic_full("XJ3-E25 ALLOC KERNEL MEMORY FAILED", "dma_alloc_pages failed for the loaded kernel image", 0);
         return -16;
     }
     {
@@ -573,6 +587,7 @@ int xj380_loader_init(void) {
     dkm_dma_buffer fb_buf;
     if (dma_alloc_pages((XJ380_FB_SIZE + 4095) / 4096, 4096, 0, &fb_buf) != 0) {
         log_error("[XJ380] failed to alloc framebuffer");
+        panic_full("XJ3-E26 ALLOC FRAMEBUFFER FAILED", "dma_alloc_pages failed for the guest framebuffer", 0);
         return -17;
     }
     {
@@ -591,6 +606,7 @@ int xj380_loader_init(void) {
             ram_size = XJ380_GUEST_RAM_MIN;
             if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
                 log_error("[XJ380] failed to alloc guest RAM (256MB minimum)");
+                panic_full("XJ3-E27 ALLOC GUEST RAM MINIMUM FAILED", "dma_alloc_pages failed even for the 256mb guest ram floor", 0);
                 return -18;
             }
         }
@@ -630,65 +646,80 @@ int xj380_loader_init(void) {
      * boot area 各缓冲独立分配，逐个按自身 GPA 映射。 */
     if (ept_map_range(XJ380_PGT_GPA, pgt_buf.phys, XJ380_PGT_SIZE, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map page tables failed");
+        panic_full("XJ3-E28 EPT MAP PAGE TABLES FAILED", "ept_map_range failed for guest page tables", 0);
         return -19;
     }
     if (ept_map_range(XJ380_GDT_GPA, gdt_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map GDT failed");
+        panic_full("XJ3-E29 EPT MAP GDT FAILED", "ept_map_range failed for the guest gdt", 0);
         return -20;
     }
     if (ept_map_range(XJ380_MADT_GPA, madt_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map MADT failed");
+        panic_full("XJ3-E30 EPT MAP MADT FAILED", "ept_map_range failed for the madt stub", 0);
         return -21;
     }
     if (ept_map_range(XJ380_FADT_GPA, fadt_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map FADT failed");
+        panic_full("XJ3-E31 EPT MAP FADT FAILED", "ept_map_range failed for the fadt stub", 0);
         return -22;
     }
     if (ept_map_range(XJ380_MCFG_GPA, mcfg_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map MCFG failed");
+        panic_full("XJ3-E32 EPT MAP MCFG FAILED", "ept_map_range failed for the mcfg stub", 0);
         return -23;
     }
     if (ept_map_range(XJ380_HPET_GPA, hpet_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map HPET failed");
+        panic_full("XJ3-E33 EPT MAP HPET FAILED", "ept_map_range failed for the hpet stub", 0);
         return -24;
     }
     if (ept_map_range(XJ380_MEMMAP_GPA, memmap_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map memory map failed");
+        panic_full("XJ3-E34 EPT MAP MEMMAP FAILED", "ept_map_range failed for the efi memmap", 0);
         return -25;
     }
     if (ept_map_range(XJ380_BOOTCFG_GPA, bootcfg_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map BOOT_CONFIG failed");
+        panic_full("XJ3-E35 EPT MAP BOOT CONFIG FAILED", "ept_map_range failed for the boot_config page", 0);
         return -26;
     }
     if (ept_map_range(XJ380_MTRR_GPA, mtrr_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map MTRR buffer failed");
+        panic_full("XJ3-E36 EPT MAP MTRR BUFFER FAILED", "ept_map_range failed for the mtrr buffer", 0);
         return -27;
     }
     if (ept_map_range(XJ380_STACK_GPA, stack_buf.phys, 8192, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map stack failed");
+        panic_full("XJ3-E37 EPT MAP STACK FAILED", "ept_map_range failed for the guest boot stack", 0);
         return -28;
     }
     if (ept_map_range(XJ380_FAKEEFI_GPA, fakeefi_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map fake EFI table failed");
+        panic_full("XJ3-E38 EPT MAP FAKE EFI FAILED", "ept_map_range failed for the fake efi table", 0);
         return -29;
     }
     if (ept_map_range(XJ380_FBC_GPA, fbc_buf.phys, 4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map FrameBufferConfig failed");
+        panic_full("XJ3-E39 EPT MAP FRAMEBUFFER CONFIG FAILED", "ept_map_range failed for the framebuffer config page", 0);
         return -30;
     }
     if (ept_map_range(g_guest.fb_gpa, fb_buf.phys, XJ380_FB_SIZE,
                       EPT_READ | EPT_WRITE) != 0) {
         log_error("[XJ380] EPT map framebuffer failed");
+        panic_full("XJ3-E40 EPT MAP FRAMEBUFFER FAILED", "ept_map_range failed for the guest framebuffer", 0);
         return -31;
     }
     if (ept_map_range(g_guest.kernel_gpa, kernel_buf.phys, kernel_alloc,
                       EPT_RWX) != 0) {
         log_error("[XJ380] EPT map kernel failed");
+        panic_full("XJ3-E41 EPT MAP KERNEL FAILED", "ept_map_range failed for the loaded kernel image", 0);
         return -32;
     }
     if (ept_map_range(g_guest.ram_gpa, ram_buf.phys, ram_size,
                       EPT_RWX) != 0) {
         log_error("[XJ380] EPT map guest RAM failed");
+        panic_full("XJ3-E42 EPT MAP GUEST RAM FAILED", "ept_map_range failed for guest ram", 0);
         return -33;
     }
     /* 低 1MB 恒等映射（BIOS 区，与 linux_loader 一致；<1MB 无需按需分配） */

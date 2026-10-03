@@ -1,6 +1,7 @@
 #include <utsm/dma.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/panic.h>
 #include "../arch/x86_64/limine.h"
 
 #define PAGE_SIZE 4096ULL
@@ -54,6 +55,8 @@ void dma_init(void) {
     }
     if (!g_hhdm_offset || !g_memmap_request.response) {
         log_warn("[DMA] missing HHDM or memmap response");
+        panic_full("MM-E20 MISSING HHDM OR MEMMAP",
+                   "dma_init: HHDM or memmap response missing", 0);
         return;
     }
 
@@ -84,6 +87,8 @@ void dma_init(void) {
 
     if (g_free_pages == 0) {
         log_warn("[DMA] no usable low pages found");
+        panic_full("MM-E21 NO USABLE LOW PAGES",
+                   "dma_init: no usable low-4G pages in memmap", 0);
         return;
     }
 
@@ -133,6 +138,8 @@ int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer 
     log_warn("[DMA] alloc failed");
     log_hex64("[DMA] req pages=", page_count);
     log_hex64("[DMA] free pages=", g_free_pages);
+    panic_full("MM-E22 DMA ALLOC FAILED",
+               "dma_alloc_pages: no free pages satisfying request", 0);
     return -2;
 }
 

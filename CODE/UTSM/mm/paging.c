@@ -15,6 +15,7 @@
 #include <utsm/paging.h>
 #include <utsm/dma.h>
 #include <utsm/log.h>
+#include <utsm/panic.h>
 #include "../arch/x86_64/limine.h"
 
 extern volatile struct limine_hhdm_request g_hhdm_request;
@@ -90,7 +91,12 @@ static int paging_map_mmio_impl(u64 phys, u64 size) {
         u64 idx4 = (v >> 39) & 0x1FF;
         if (!(pml4[idx4] & PTE_PRESENT)) {
             u64 t = paging_alloc_table();
-            if (!t) { log_error("[PAGING] alloc PDPT failed"); return -2; }
+            if (!t) {
+                log_error("[PAGING] alloc PDPT failed");
+                panic_full("MM-E01 PDPT ALLOC FAILED",
+                           "paging_map_mmio: PDPT page alloc failed", 0);
+                return -2;
+            }
             pml4[idx4] = t | PTE_PRESENT | PTE_RW;
         }
 
@@ -100,7 +106,12 @@ static int paging_map_mmio_impl(u64 phys, u64 size) {
             if (pdpt[idx3] & PTE_PS) { skipped++; continue; }   /* 1G 大页已覆盖 */
         } else {
             u64 t = paging_alloc_table();
-            if (!t) { log_error("[PAGING] alloc PD failed"); return -3; }
+            if (!t) {
+                log_error("[PAGING] alloc PD failed");
+                panic_full("MM-E02 PD ALLOC FAILED",
+                           "paging_map_mmio: PD page alloc failed", 0);
+                return -3;
+            }
             pdpt[idx3] = t | PTE_PRESENT | PTE_RW;
         }
 
@@ -110,7 +121,12 @@ static int paging_map_mmio_impl(u64 phys, u64 size) {
             if (pd[idx2] & PTE_PS) { skipped++; continue; }     /* 2M 大页已覆盖 */
         } else {
             u64 t = paging_alloc_table();
-            if (!t) { log_error("[PAGING] alloc PT failed"); return -4; }
+            if (!t) {
+                log_error("[PAGING] alloc PT failed");
+                panic_full("MM-E03 PT ALLOC FAILED",
+                           "paging_map_mmio: PT page alloc failed", 0);
+                return -4;
+            }
             pd[idx2] = t | PTE_PRESENT | PTE_RW;
         }
 

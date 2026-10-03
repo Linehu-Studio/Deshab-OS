@@ -14,6 +14,7 @@
  */
 
 #include <utsm/linux_loader.h>
+#include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
 #include <utsm/log.h>
@@ -472,6 +473,7 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
 
     if (size < 0x300) {
         log_error("[LINUX] bzImage too small");
+        panic_full("LIN-E01 BZIMAGE TOO SMALL", "bzImage smaller than the real-mode setup header", 0);
         return -1;
     }
 
@@ -494,6 +496,7 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
     log_hex64("[LINUX] boot protocol version=", version);
     if (version < 0x020c) {
         log_error("[LINUX] boot protocol too old");
+        panic_full("LIN-E02 BOOT PROTOCOL TOO OLD", "bzImage boot protocol older than 2.12", 0);
         return -4;
     }
 
@@ -502,6 +505,7 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
     log_hex64("[LINUX] xloadflags=", xloadflags);
     if (!(xloadflags & XLF_KERNEL_64)) {
         log_error("[LINUX] not a 64-bit kernel");
+        panic_full("LIN-E03 NOT A 64-BIT KERNEL", "bzImage xloadflags lacks the 64-bit kernel flag", 0);
         return -5;
     }
 
@@ -514,6 +518,7 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
     u64 setup_size = ((u64)setup_sects + 1) * 512;
     if (setup_size >= size) {
         log_error("[LINUX] setup sectors exceed bzImage");
+        panic_full("LIN-E04 SETUP SECTORS EXCEED BZIMAGE", "setup sector count extends beyond the bzImage size", 0);
         return -6;
     }
 
@@ -523,6 +528,7 @@ int linux_parse_bzimage(const void *bzimage, u64 size,
     if (payload_file_offset > size ||
         payload_length > size - payload_file_offset) {
         log_error("[LINUX] compressed payload exceeds bzImage");
+        panic_full("LIN-E05 PAYLOAD EXCEEDS BZIMAGE", "compressed payload extends beyond the bzImage size", 0);
         return -7;
     }
     log_hex64("[LINUX] payload_offset(in protected image)=", payload_offset);
@@ -642,6 +648,7 @@ int linux_loader_init(void) {
                             &kernel_offset, &kernel_length,
                             &init_size, &entry_offset) != 0) {
         log_error("[LINUX] bzImage parse failed");
+        panic_full("LIN-E06 BZIMAGE PARSE FAILED", "linux_parse_bzimage rejected the bzImage header", 0);
         return -2;
     }
 
@@ -653,6 +660,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer kernel_buf;
     if (dma_alloc_pages(kernel_alloc_size / 4096, 2 * 1024 * 1024, 0, &kernel_buf) != 0) {
         log_error("[LINUX] failed to alloc kernel memory");
+        panic_full("LIN-E07 ALLOC KERNEL MEMORY FAILED", "dma_alloc_pages failed for the guest kernel image", 0);
         return -3;
     }
     log_hex64("[LINUX] kernel HPA=", kernel_buf.phys);
@@ -662,6 +670,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer bp_buf;
     if (dma_alloc_pages(1, 4096, 0, &bp_buf) != 0) {
         log_error("[LINUX] failed to alloc boot_params");
+        panic_full("LIN-E08 ALLOC BOOT PARAMS FAILED", "dma_alloc_pages failed for boot_params", 0);
         return -4;
     }
 
@@ -669,6 +678,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer pgt_buf;
     if (dma_alloc_pages(PGT_TOTAL_PAGES, 4096, 0, &pgt_buf) != 0) {
         log_error("[LINUX] failed to alloc page tables");
+        panic_full("LIN-E09 ALLOC PAGE TABLES FAILED", "dma_alloc_pages failed for guest page tables", 0);
         return -5;
     }
 
@@ -676,6 +686,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer gdt_buf;
     if (dma_alloc_pages(1, 4096, 0, &gdt_buf) != 0) {
         log_error("[LINUX] failed to alloc GDT");
+        panic_full("LIN-E10 ALLOC GDT FAILED", "dma_alloc_pages failed for the guest gdt", 0);
         return -6;
     }
 
@@ -683,6 +694,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer stack_buf;
     if (dma_alloc_pages(1, 4096, 0, &stack_buf) != 0) {
         log_error("[LINUX] failed to alloc stack");
+        panic_full("LIN-E11 ALLOC STACK FAILED", "dma_alloc_pages failed for the guest boot stack", 0);
         return -7;
     }
 
@@ -690,6 +702,7 @@ int linux_loader_init(void) {
     dkm_dma_buffer cmdline_buf;
     if (dma_alloc_pages(1, 4096, 0, &cmdline_buf) != 0) {
         log_error("[LINUX] failed to alloc cmdline");
+        panic_full("LIN-E12 ALLOC CMDLINE FAILED", "dma_alloc_pages failed for the kernel command line", 0);
         return -8;
     }
 
@@ -708,6 +721,7 @@ int linux_loader_init(void) {
             ram_size = 512 * 1024 * 1024;  /* 512MB floor for Phase 3 MVP */
             if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
                 log_error("[LINUX] failed to alloc guest RAM (512MB minimum)");
+                panic_full("LIN-E13 ALLOC GUEST RAM MINIMUM FAILED", "dma_alloc_pages failed even for the 512mb guest ram floor", 0);
                 return -9;
             }
         }
@@ -759,12 +773,14 @@ int linux_loader_init(void) {
                 dkm_dma_buffer initrd_buf;
                 if (dma_alloc_pages(initrd_pages, 4096, 0, &initrd_buf) != 0) {
                     log_error("[LINUX] failed to alloc initrd memory");
+                    panic_full("LIN-E14 ALLOC INITRD MEMORY FAILED", "dma_alloc_pages failed for the initrd image", 0);
                     return -17;
                 }
                 mem_copy(initrd_buf.virt, initrd, initrd_size);
                 if (ept_map_range(LINUX_GUEST_INITRD_GPA, initrd_buf.phys,
                                   initrd_pages * 4096, EPT_READ | EPT_WRITE) != 0) {
                     log_error("[LINUX] EPT map initrd failed");
+                    panic_full("LIN-E15 EPT MAP INITRD FAILED", "ept_map_range failed for the initrd image", 0);
                     return -18;
                 }
                 g_guest.initrd_gpa = LINUX_GUEST_INITRD_GPA;
@@ -790,6 +806,7 @@ int linux_loader_init(void) {
     if (ept_map_range(g_guest.kernel_gpa, kernel_buf.phys,
                       kernel_alloc_size, EPT_RWX) != 0) {
         log_error("[LINUX] EPT map kernel failed");
+        panic_full("LIN-E16 EPT MAP KERNEL FAILED", "ept_map_range failed for the guest kernel image", 0);
         return -10;
     }
 
@@ -797,6 +814,7 @@ int linux_loader_init(void) {
     if (ept_map_range(g_guest.bootparams_gpa, bp_buf.phys,
                       4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[LINUX] EPT map boot_params failed");
+        panic_full("LIN-E17 EPT MAP BOOT PARAMS FAILED", "ept_map_range failed for boot_params", 0);
         return -11;
     }
 
@@ -804,6 +822,7 @@ int linux_loader_init(void) {
     if (ept_map_range(g_guest.pgt_gpa, pgt_buf.phys,
                       PGT_TOTAL_SIZE, EPT_READ | EPT_WRITE) != 0) {
         log_error("[LINUX] EPT map page tables failed");
+        panic_full("LIN-E18 EPT MAP PAGE TABLES FAILED", "ept_map_range failed for guest page tables", 0);
         return -12;
     }
 
@@ -811,6 +830,7 @@ int linux_loader_init(void) {
     if (ept_map_range(g_guest.gdt_gpa, gdt_buf.phys,
                       4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[LINUX] EPT map GDT failed");
+        panic_full("LIN-E19 EPT MAP GDT FAILED", "ept_map_range failed for the guest gdt", 0);
         return -13;
     }
 
@@ -818,6 +838,7 @@ int linux_loader_init(void) {
     if (ept_map_range(LINUX_GUEST_STACK_GPA, stack_buf.phys,
                       4096, EPT_READ | EPT_WRITE) != 0) {
         log_error("[LINUX] EPT map stack failed");
+        panic_full("LIN-E20 EPT MAP STACK FAILED", "ept_map_range failed for the guest boot stack", 0);
         return -14;
     }
 
@@ -825,6 +846,7 @@ int linux_loader_init(void) {
     if (ept_map_range(g_guest.cmdline_gpa, cmdline_buf.phys,
                       4096, EPT_READ) != 0) {
         log_error("[LINUX] EPT map cmdline failed");
+        panic_full("LIN-E21 EPT MAP CMDLINE FAILED", "ept_map_range failed for the kernel command line", 0);
         return -15;
     }
 
@@ -840,6 +862,7 @@ int linux_loader_init(void) {
     u64 ram_gpa = LINUX_GUEST_RAM_GPA;
     if (ept_map_range(ram_gpa, ram_buf.phys, ram_size, EPT_RWX) != 0) {
         log_error("[LINUX] EPT map guest RAM failed");
+        panic_full("LIN-E22 EPT MAP GUEST RAM FAILED", "ept_map_range failed for guest ram", 0);
         return -16;
     }
     log_hex64("[LINUX] guest RAM mapped GPA=", ram_gpa);
@@ -890,10 +913,12 @@ int linux_loader_init(void) {
             dkm_dma_buffer hole;
             if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0, &hole) != 0) {
                 log_warn("[LINUX] low-RAM hole fill OOM");
+                panic_full("LIN-E23 LOW RAM HOLE FILL OOM", "dma_alloc_pages failed while filling low ram ept holes", 0);
                 break;
             }
             if (ept_map_range(gpa, hole.phys, EPT_PAGE_SIZE, EPT_RWX) != 0) {
                 log_warn("[LINUX] low-RAM hole fill map failed");
+                panic_full("LIN-E24 LOW RAM HOLE FILL MAP FAILED", "ept_map_range failed while filling low ram ept holes", 0);
                 break;
             }
             filled++;

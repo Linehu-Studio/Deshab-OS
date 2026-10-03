@@ -15,6 +15,7 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/arena.h>
+#include <utsm/panic.h>
 #include "ini_parser.h"
 
 /* ---- 探测缓冲状态 ---- */
@@ -39,6 +40,8 @@ void probe_init(const void *cfg_ptr) {
     if (!g_probe_buf) {
         g_instr_probe_enable = 0;
         log_warn("[PROBE] arena alloc failed, probe disabled");
+        panic_full("PRB-E01 PROBE ARENA ALLOC FAILED",
+                   "probe_init: probe buffer arena allocation failed", 0);
         return;
     }
 

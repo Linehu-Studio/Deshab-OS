@@ -15,6 +15,7 @@
  */
 
 #include <utsm/linux_compat.h>
+#include <utsm/panic.h>
 #include <utsm/linux_resume.h>
 #include <utsm/linux_loader.h>   /* VSCode Phase 5: linux_find_vscode_module */
 #include <utsm/ipc_shm.h>
@@ -196,6 +197,7 @@ static int lxc_exec_internal(const char *path, int argc,
     /* 2. 发送 EXEC_REQUEST */
     if (ipc_shm_send(UTSM_MSG_EXEC_REQUEST, &req, sizeof(req)) != 0) {
         log_warn("[LNXC] exec: failed to enqueue request");
+        panic_full("LNX-E10 EXEC ENQUEUE FAILED", "ipc_shm_send rejected the exec request", 0);
         return -2;
     }
 
@@ -287,6 +289,7 @@ static int lxc_file_roundtrip(u32 msg_type, const char *path, u64 offset,
 
     if (ipc_shm_send(msg_type, &req, sizeof(req)) != 0) {
         log_warn("[LNXC] file: failed to enqueue request");
+        panic_full("LNX-E11 FILE ENQUEUE FAILED", "ipc_shm_send rejected the file request", 0);
         return -2;
     }
 
@@ -798,11 +801,13 @@ int lxc_sync_lib_dir(const char *guest_lib_path) {
     if (!guest_lib_path) return -1;
     if (!lxc_is_available()) {
         log_warn("[LNXC] sync_lib_dir: service not available");
+        panic_full("LNX-E12 SYNC LIB SERVICE UNAVAILABLE", "lib sync invoked while the compat service is unavailable", 0);
         return -1;
     }
     int rc = lxc_f32_ensure();
     if (rc != 0) {
         log_warn("[LNXC] sync_lib_dir: FAT32 not available");
+        panic_full("LNX-E13 SYNC LIB FAT32 UNAVAILABLE", "lib sync invoked without a usable fat32 block device", 0);
         return rc;
     }
 
@@ -811,6 +816,7 @@ int lxc_sync_lib_dir(const char *guest_lib_path) {
     if (f32_find_path_dir_lfn(g_compat_lib_path, &lib_clus) != 0) {
         log_warn("[LNXC] sync_lib_dir: lib dir not found:");
         log_warn(g_compat_lib_path);
+        panic_full("LNX-E14 LIB DIR NOT FOUND", "fat32 lib directory for the guest is missing on the system disk", 0);
         return -2;  /* 目录不存在（容忍：可能是首次启动未放库） */
     }
     log_info("[LNXC] sync_lib_dir: lib dir found");
@@ -862,6 +868,7 @@ static int lxc_guest_path_exists(const char *path) {
 int lxc_vscode_install(void) {
     if (!lxc_is_available()) {
         log_warn("[LNXC] vscode install: service not available");
+        panic_full("LNX-E15 VSCODE SERVICE UNAVAILABLE", "vscode install invoked while the compat service is unavailable", 0);
         return -1;
     }
     log_info("[LNXC] vscode: probe /opt/vscode/bin/code");
@@ -894,6 +901,7 @@ int lxc_vscode_install(void) {
         if (rc != 0 || written != chunk) {
             log_warn("[LNXC] vscode: tarball push failed");
             log_hex64("[LNXC] vscode: push off=", off);
+            panic_full("LNX-E16 VSCODE TARBALL PUSH FAILED", "streaming the vscode tarball into the guest failed", 0);
             return -12;
         }
         off += written;
@@ -910,6 +918,7 @@ int lxc_vscode_install(void) {
         int rc = lxc_exec("/bin/mkdir", 3, argv, 0, 0, 0, &ec);
         if (rc != 0 || ec != 0) {
             log_warn("[LNXC] vscode: mkdir /opt/vscode failed");
+            panic_full("LNX-E17 VSCODE MKDIR FAILED", "mkdir -p /opt/vscode failed inside the guest", 0);
             return -13;
         }
     }
@@ -956,12 +965,14 @@ int lxc_vscode_install(void) {
 
     if (!unpacked) {
         log_warn("[LNXC] vscode: extract failed");
+        panic_full("LNX-E18 VSCODE EXTRACT FAILED", "tar extraction of the vscode tarball failed in the guest", 0);
         return -13;
     }
 
     /* 7. 验证：/opt/vscode/bin/code 存在即可启动 */
     if (!lxc_guest_path_exists("/opt/vscode/bin/code")) {
         log_warn("[LNXC] vscode: verify failed (bin/code missing)");
+        panic_full("LNX-E19 VSCODE VERIFY FAILED", "/opt/vscode/bin/code missing after the install", 0);
         return -14;
     }
 

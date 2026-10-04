@@ -133,7 +133,7 @@ void cursor_draw(int mx, int my) {
     for (int r = 0; r < CURSOR_SIZE; r++) {
         for (int c = 0; c < CURSOR_SIZE; c++) {
             if (cursor_shape[r][c]) {
-                du_pixel(&g_fb, mx + c, my + r, KS_ACCENT);
+                du_pixel(&g_fb, mx + c, my + r, 0xFFFFFFFFu);   /* 白色指针 */
             }
         }
     }

@@ -349,7 +349,7 @@ static void cursor_restore_bg(u32 *fb) {
 }
 
 static void cursor_draw(u32 *fb, int mx, int my) {
-    u32 fg = ACCENT;
+    u32 fg = 0xFFFFFFFF;   /* 白色指针 */
     for (int r = 0; r < CURSZ; r++) {
         for (int c = 0; c < CURSZ; c++) {
             if (!cursor_shape[r][c]) continue;

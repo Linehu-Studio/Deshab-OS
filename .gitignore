@@ -1,18 +1,26 @@
-ISO/deshab.img
-ISO/deshab-dev.img
-ISO/deshab-realtest.img
-ISO/deshab-release.img
 *.o
-.build_tmp/
-.trae/
-docs/workbuddy-planning/
-sata_fat32_dsk.img
+*.obj
+*.elf
+*.drv
 
+*.img
+*.iso
+*.vhd
+*.raw
+*.ppm
 
+target/
+*.rlib
+*.rmeta
+*.pdb
 
-# Large binary images (regenerate from build)
-SYSTEM/boot/linux-rootfs.img
+*.dbf
+*.rgba
 
 SYSTEM/boot/linux-extra-rootfs.img
 *.d
 target/
+# ---- 本地工作区 ----
+.build_tmp/
+.trae/
+docs/workbuddy-planning/

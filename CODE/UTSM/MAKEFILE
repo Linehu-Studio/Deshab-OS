@@ -1,5 +1,5 @@
-CC := clang
-LD := ld.lld
+CC ?= clang
+LD ?= ld.lld
 OBJCOPY := llvm-objcopy
 
 ROOT := ../..

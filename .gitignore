@@ -14,3 +14,5 @@ sata_fat32_dsk.img
 SYSTEM/boot/linux-rootfs.img
 
 SYSTEM/boot/linux-extra-rootfs.img
+*.d
+target/

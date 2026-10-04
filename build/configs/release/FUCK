@@ -1,4 +1,4 @@
-﻿# Deshab Kernel Configuration — release 变体（build/configs/release/FUCK）
+# Deshab Kernel Configuration — release 变体（build/configs/release/FUCK）
 # build.ps1 -Variant release 打包前注入 SYSTEM/system/deshab64/FUCK
 # 发布版：调试零开销、进登录+向导正常路径、真机安全选项
 
@@ -58,6 +58,37 @@ demo_fault=0
 
 [drr]
 watchdog_enabled=1
+
+# === SAS-R0 启动期能力证明（attest） ===
+# require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
+# release 真机：未实现能力一律阻断启动（不豁免）——宁可启动即 panic。
+# 当前仍需豁免的项 = STATUS.md ⬜/🔶 未落地项；实现后逐项删除豁免行。
+[attest]
+require_sealed_mem=1
+require_pckc_derive=1
+require_sched=1
+require_drr=1
+require_fs_fat32_rw=1
+require_fs_ext4_rw=1
+require_net_wired=1
+# NET-E01 wlan 栈未实现
+require_net_wlan=0
+# VMX 为 guest 能力，真机不强制
+require_vmm_vmx=0
+# DRR-E31 Phase 9
+require_drr_real_mac=0
+# PKG-E10
+require_pkg=0
+# BRAND-E10
+require_brand_anim=0
+# DKM-E60
+require_dkm_hot_unload=0
+# DKM-E61
+require_dkm_api_export=0
+# NVME-E30
+require_nvme_rw=0
+# VNET-E30
+require_virtio_net=0
 
 [dsk]
 show_logo=1

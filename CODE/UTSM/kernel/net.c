@@ -36,6 +36,16 @@ static u32 net_device_count_impl(void) {
     return g_net_device_count;
 }
 
+/* attest: 有线/无线设备计数（is_wireless 回调非空即视为无线） */
+void net_attest_counts(u32 *out_total, u32 *out_wireless) {
+    u32 wireless = 0;
+    for (u32 i = 0; i < g_net_device_count; i++) {
+        if (g_net_devices[i].is_wireless) wireless++;
+    }
+    if (out_total) *out_total = g_net_device_count;
+    if (out_wireless) *out_wireless = wireless;
+}
+
 static int net_device_info_impl(u32 index, dkm_net_device_info *out) {
     if (!out) return -1;
     if (index >= g_net_device_count) return -2;

@@ -1,4 +1,4 @@
-﻿# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
+# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
 # build.ps1 -Variant dev 打包前注入 SYSTEM/system/deshab64/FUCK
 # 开发者模式：selftest 开、dev_mode 自动跑 shell.elf 测试、日志持久化、跳过向导直达桌面
 
@@ -60,6 +60,32 @@ demo_fault=0
 
 [drr]
 watchdog_enabled=1
+
+# === SAS-R0 启动期能力证明（attest） ===
+# require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
+# require_<name>=0 是设计内白名单：仅限"该构建环境不可能具备"或
+# "该能力尚未实现且已登记 STATUS.md ⬜/🔶"的项，须在 CLAUDE.md §3 说明。
+[attest]
+require_sealed_mem=1
+require_pckc_derive=1
+require_sched=1
+require_drr=1
+require_fs_fat32_rw=1
+require_fs_ext4_rw=1
+require_net_wired=1
+# QEMU 无 wlan 硬件（ath9k=0），wlan 栈未实现（NET-E01）
+require_net_wlan=0
+# WHPX/TCG 无嵌套 VMX，QEMU 必无
+require_vmm_vmx=0
+# DRR 真 MAC = Phase 9（当前 CRC64 占位，DRR-E31）
+require_drr_real_mac=0
+# 以下为设计已定未实现（STATUS.md ⬜），实现后翻转 require=1
+require_pkg=0
+require_brand_anim=0
+require_dkm_hot_unload=0
+require_dkm_api_export=0
+require_nvme_rw=0
+require_virtio_net=0
 
 [dsk]
 show_logo=1

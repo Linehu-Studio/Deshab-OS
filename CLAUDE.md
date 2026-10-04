@@ -299,6 +299,7 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 - 每次只处理 **一个文件** 的 STUB→panic，改完输出：改动行号 + 剩余 STUB 计数。
 - 骨架允许"不接线"（无人调用的 skeleton 函数），但接线后行为必须是 panic。
 - 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过。新增白名单项必须改本文件并说明理由。
+- 启动期能力证明（attest，CODE/UTSM/kernel/attest.c）：FUCK `[attest]` `require_<name>=1`（默认）而能力未就绪 → 交接 DSK 前 panic（莲花屏，错误码=该能力登记码）。`require_<name>=0` 豁免行是设计内白名单，仅限两类：① 该构建环境不可能具备（QEMU 无 wlan/嵌套 VMX）；② STATUS.md ⬜/🔶 未落地项（实现后逐项删除豁免行）。当前豁免清单见 build/configs/*/FUCK [attest]。
 
 ### 4. 自检命令（验收只认这个输出，不认自然语言保证）
 ```

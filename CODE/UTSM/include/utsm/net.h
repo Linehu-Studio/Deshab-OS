@@ -84,6 +84,9 @@ typedef struct dkm_net_api {
 } dkm_net_api;
 
 void net_init(void);
+
+/* attest: 有线/无线设备计数（启动期能力证明用，见 utsm/attest.h） */
+void net_attest_counts(u32 *out_total, u32 *out_wireless);
 const dkm_net_api *net_get_api(void);
 
 #endif

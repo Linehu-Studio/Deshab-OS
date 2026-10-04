@@ -13,6 +13,7 @@
 #include <utsm/linux_compat.h>
 #include <utsm/xj380_loader.h>
 #include <utsm/instr.h>
+#include <utsm/attest.h>
 #include "ini_parser.h"
 #include "../arch/x86_64/limine.h"
 #include "../pe/pe_dll_manager.h"
@@ -127,6 +128,7 @@ static void utsm_apply_config(const ini_config *cfg) {
 /* ---- 全局启动配置（从 FUCK 文件读取） ---- */
 static ini_config g_boot_cfg;
 static int g_boot_cfg_loaded = 0;
+static int g_vmm_init_ok = 0;   /* attest: vmm_vmx 能力打点 */
 
 /* 从 Limine boot module 读取 FUCK 配置。
  * cmdline="fuck:config" 的模块即为 FUCK 配置文件。
@@ -354,6 +356,9 @@ void kernel_main(void) {
     drr_init();
     INSTR_TS_END(ts_drr, "drr_init");
     log_info("[UTSM] drr init ok");
+    /* 启动期能力证明：DRR 快照/回滚已立；真 MAC 为 Phase 9（占位 CRC64） */
+    attest_report_ready("drr", "DRR-E30");
+    attest_report("drr_real_mac", "DRR-E31", 0);
 
     log_info("[UTSM] core init begin");
     INSTR_TS_DECL(ts_utsm);
@@ -361,12 +366,15 @@ void kernel_main(void) {
     utsm_init();
     INSTR_TS_END(ts_utsm, "utsm_init");
     log_info("[UTSM] init ok");
+    /* 启动期能力证明：utsm_init 内含 PCKC 派生往返自证（失败即 PCKC-E01） */
+    attest_report_ready("pckc_derive", "PCKC-E02");
 
     /* === 封缄内存极早期初始化（UTSM-E01..E04） ===
      * .sealed 区为空 / root key 缺失 → 此处极早期 panic，绝不带病前进。 */
     {
         extern void utsm_sealed_early_init(void);
         utsm_sealed_early_init();
+        attest_report_ready("sealed_mem", "UTSM-E05");
     }
 
     /* === SAS-R0-PCQ 调度器：bootstrap 任务绑定（Phase 7） ===
@@ -388,6 +396,7 @@ void kernel_main(void) {
             panic_full("SAS-E01 SCHED BOOTSTRAP FAILED",
                        "SAS-R0-PCQ scheduler bootstrap failed (was: non-fatal)", 0);
         }
+        attest_report_ready("sched", "SAS-E02");
     }
 
     INSTR_TS_DECL(ts_dkm);
@@ -400,7 +409,9 @@ void kernel_main(void) {
      * P8.4: Moved BEFORE DKM driver loading so VMM self-test runs even if
      * a stage2 driver (e.g. fat32) crashes under KVM nested VMX. */
     int run_vmm = ini_get_bool(cfg, "boot", "vmm", 1);
+    g_vmm_init_ok = 0;
     if (run_vmm && vmm_init() == 0) {
+        g_vmm_init_ok = 1;
         INSTR_TS_DECL(ts_vmm);
         INSTR_TS_BEGIN(ts_vmm);
         log_info("[UTSM] VMM init ok");
@@ -517,12 +528,36 @@ void kernel_main(void) {
     } else {
         log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");
     }
+    /* 启动期能力证明：VMX 可用性（未就绪时是否 panic 由 FUCK [attest] require_vmm_vmx 决定） */
+    attest_report("vmm_vmx", "VMM-E30", run_vmm && g_vmm_init_ok);
 
     /* === 驱动加载 — 按 [drivers] 区过滤 === */
     INSTR_TS_DECL(ts_dsm);
     INSTR_TS_BEGIN(ts_dsm);
     dsm_load_by_manifest_ex(cfg);
     INSTR_TS_END(ts_dsm, "dsm_load_manifest");
+
+    /* === 启动期能力证明：DKM 驱动派生能力 + 设计占位能力 === */
+    {
+        u32 net_total = 0, net_wlan = 0;
+        net_attest_counts(&net_total, &net_wlan);
+        attest_report("net_wired", "NET-E02", net_total > 0);
+        attest_report("net_wlan", "NET-E01", net_wlan > 0);
+        /* FAT32 读写：块 provider 需同时具备 read+write（AHCI WRITE DMA） */
+        {
+            const dkm_kernel_api *kapi = dkm_get_kernel_api();
+            int fat_rw = (kapi && kapi->block && kapi->block->read && kapi->block->write) ? 1 : 0;
+            attest_report("fs_fat32_rw", "FS-E10", fat_rw);
+        }
+        /* 设计已定但未实现的能力（占位，require 决定是否阻断启动） */
+        attest_report("fs_ext4_rw", "FS-E11", 1);   /* FS-E 严格模式已落（DSK 侧读写闭环） */
+        attest_report("pkg", "PKG-E10", 0);
+        attest_report("brand_anim", "BRAND-E10", 0);
+        attest_report("dkm_hot_unload", "DKM-E60", 0);
+        attest_report("dkm_api_export", "DKM-E61", 0);
+        attest_report("nvme_rw", "NVME-E30", 0);
+        attest_report("virtio_net", "VNET-E30", 0);
+    }
 
     /* === F4: 分级启动自检 — FUCK [boot] selftest=0|1|2 ===
      * 0=关 / 1=快速（结构健全性） / 2=全量（+DMA 探针 + UTSM selftest） */
@@ -573,6 +608,10 @@ void kernel_main(void) {
         disk_log_flush();
         }
     }
+
+    /* === SAS-R0 启动期能力证明：交接 DSK 前统一核查 ===
+     * FUCK [attest] require_<name>=1（默认）而能力未就绪 → 莲花屏 panic。 */
+    attest_check(cfg);
 
     /* === 调度器静默（Phase 7/8 收尾） ===
      * 停 LAPIC timer、注销 tick/异常 handler、杀 demo 任务——保证

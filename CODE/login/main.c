@@ -14,11 +14,14 @@
 
 #include "../UTSM/include/utsm/dsk.h"
 
-/* 防篡改：linker 导出的 .text 段范围与预期哈希存储位置 */
-extern const u8 __text_start[];
-extern const u8 __text_end[];
-extern const u8 __expected_hash[];
-extern const u8 __expected_hash_end[];
+/* 防篡改：linker 导出的 .text 段范围与预期哈希存储位置。
+ * hidden 可见性强制 PIE 下用 lea rip 取址（基址无关），禁止走 GOT——
+ * GOT slot 若被 DSK 侧后续 IO 破坏（BUG：ibuf+0x1EAE10 被清零），
+ * len 将计算成天文数字导致 integrity 误报 LOGIN-E01。 */
+extern const u8 __text_start[] __attribute__((visibility("hidden")));
+extern const u8 __text_end[] __attribute__((visibility("hidden")));
+extern const u8 __expected_hash[] __attribute__((visibility("hidden")));
+extern const u8 __expected_hash_end[] __attribute__((visibility("hidden")));
 
 typedef signed char        i8;
 typedef unsigned char      u8;
@@ -777,6 +780,20 @@ static void login_mouse_init(void) {
 }
 
 __attribute__((visibility("default")))
+/* [DSK-E70 布局雷区规避 · 白名单登记]
+ * DSK 加载链路存在未定位的写零破坏：跳转 login 后 image 尾部
+ * （ibuf+0x1EAE10 附近，≥ 数百字节）被清零。.text ≤ ~16.5KB 时
+ * 雷区覆盖 .got/.bss 关键数据，导致 len 计算错误 → LOGIN-E01 误报；
+ * .text ≥ ~17KB 时雷区落在 .rodata/logo 数据上无害。
+ * 此填充把 .text 显式推入安全布局。根因修复登记 docs/STATUS.md DSK-E70，
+ * 修复后应删除本函数。 */
+__attribute__((noinline, used)) static void dsk_e70_layout_guard(void) {
+    /* 1024B nop 序列，编译器不可消除 */
+    __asm__ volatile(
+        ".rept 341\n\tnop\n\tnop\n\tnop\n\t.endr\n"
+        ::: "memory");
+}
+
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[login] boot");
@@ -862,12 +879,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
     pass[0] = 0;
     int plen = 0;
 
-    /* Draw initial UI */
+    /* Draw initial UI（draw_login_card 内部已含光标 save+draw，
+     * 此处不得重复 save——否则会把光标像素当背景存入，移动后留残影） */
     draw_login_card(fb, card_x, card_y, pass, 1, msg, msg_color, fg);
-
-    /* 初始鼠标光标 */
-    cursor_save_bg(fb, g_mouse_x, g_mouse_y);
-    cursor_draw(fb, g_mouse_x, g_mouse_y);
 
     /* Input loop */
     int shift = 0;

@@ -88,6 +88,15 @@
 | 主镜像改挂 SATA（run_qemu.bat） | ✅ | DSK/AHCI 块层必须可见 GPT 盘才能访问 p2 ext4；边车退居 ide.1 | run_qemu.bat |
 | 开机画面去 Logo | ✅ | 移除 Logo.png 图像，仅保留居中 "DESHAB P01" 文字；dcp/xj logo 改由 TEXTURES/ 重新生成 | build 日志 |
 
+## DSK-E70：ibuf 尾部写零破坏（2026-10-05 · 未解）
+
+| 项 | 状态 | 说明 | 证据 |
+|----|------|------|------|
+| 现象 | 🔶 | DSK 经 `dsk_load_elf` 载入 login.elf 并跳转后，image 尾部（ibuf+0x1EAE10 附近，≥ 数百字节）被清零。`.text` ≤ ~16.5KB 时雷区覆盖 .got/.bss 关键数据 → login integrity 校验 len 计算错误 → LOGIN-E01 误报；`.text` ≥ ~17KB 时雷区落在 .rodata 无害 | `.build_tmp/qemu_dbg.log`（boot 矩阵：16248B FAIL×4 / 16504B FAIL×2 / 17352、17608B OK；DSK 侧 checksum 跳转前位精确 + QMP 物理内存 dump 停机后 .text 位精确与 got[0]=0 并存） |
+| login 侧加固 | ✅ | ① `__text_start/end/__expected_hash` 加 hidden 可见性 → PIE 下 lea rip 取址，len 计算零 GOT 依赖；② `dsk_e70_layout_guard` 显式将 .text 推入安全布局（白名单登记，根因修复后删除） | CODE/login/main.c |
+| patch 侧加固 | ✅ | patch_login_hash.ps1 改按 PT_LOAD filesz 计算 hash 范围（与 DSK loader 加载范围/运行时 [__text_start,__text_end) 严格一致），并用 e_shstrndx 定位 .shstrtab | CODE/login/patch_login_hash.ps1 |
+| 根因（写零者） | ⬜ | 嫌疑面：AHCI DMA PRDT 边界 / fat32_read_sectors 缓冲边界 / DSK .bss 内大缓冲（g_fdata 10MB、ibuf 8MB）相邻越界。写零发生在跳转后、sha256 前；确切写者与范围待断点级排查 | — |
+
 ## 文档体系
 
 | 文档 | 状态 | 说明 |

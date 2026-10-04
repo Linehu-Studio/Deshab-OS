@@ -766,7 +766,7 @@ if (Test-Path $GenTex) {
     $TexSrc   = Join-Path $Root 'SYSTEM\system\deshab64\desktop\textures\startMenuLogo.png'
     $TexStamp = Join-Path $Root 'SYSTEM\system\deshab64\desktop\textures\startMenuLogo.rgba'
     $needTex = -not (Test-Path $TexStamp)
-    if ($needTex -and (Test-Path $TexSrc)) {
+    if ($needTex -and (Test-Path $TexSrc) -and (Test-Path $TexStamp)) {
         $needTex = (Get-Item $TexSrc).LastWriteTime -gt (Get-Item $TexStamp).LastWriteTime
     }
     if ($needTex) {

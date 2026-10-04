@@ -16,7 +16,7 @@ target/
 
 *.dbf
 *.rgba
-
+IDEA.md
 SYSTEM/boot/linux-extra-rootfs.img
 *.d
 target/

@@ -350,6 +350,27 @@ static void cursor_restore_bg(u32 *fb) {
 
 static void cursor_draw(u32 *fb, int mx, int my) {
     u32 fg = 0xFFFFFFFF;   /* 白色指针 */
+    /* 黑色描边：空心像素且 8 邻域有实心 */
+    for (int r = 0; r < CURSZ; r++) {
+        for (int c = 0; c < CURSZ; c++) {
+            if (cursor_shape[r][c]) continue;
+            int near = 0;
+            for (int dy = -1; dy <= 1 && !near; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int rr = r + dy, cc = c + dx;
+                    if (rr < 0 || rr >= CURSZ || cc < 0 || cc >= CURSZ) continue;
+                    if (cursor_shape[rr][cc]) { near = 1; break; }
+                }
+            }
+            if (near) {
+                int x = mx + c, y = my + r;
+                if (x >= 0 && (u64)x < fb_w && y >= 0 && (u64)y < fb_h) {
+                    u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+                    line[x] = 0xFF000000u;
+                }
+            }
+        }
+    }
     for (int r = 0; r < CURSZ; r++) {
         for (int c = 0; c < CURSZ; c++) {
             if (!cursor_shape[r][c]) continue;

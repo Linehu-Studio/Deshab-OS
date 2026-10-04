@@ -499,8 +499,8 @@ static void cursor_draw(u32 *fb, i64 mx, i64 my) {
     cursor_bg_valid = 1;
     cursor_cur_x = mx;
     cursor_cur_y = my;
-    /* draw cursor shape（全白指针，深色描边改白） */
-    u32 white = 0xFFFFFFFF, dark = 0xFFFFFFFF;
+    /* draw cursor shape（白色指针 + 纯黑描边，'X'=描边 'O'=填充） */
+    u32 white = 0xFFFFFFFF, dark = 0xFF000000;
     for (i64 y = 0; y < CUR_H; y++) {
         i64 py = my + y;
         if (py < 0 || (u64)py >= fb_h) continue;

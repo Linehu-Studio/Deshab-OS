@@ -130,6 +130,21 @@ void cursor_restore_bg(void) {
 }
 
 void cursor_draw(int mx, int my) {
+    /* 白色指针 + 黑色描边：描边 = 空心像素且 8 邻域有实心（不出保存区） */
+    for (int r = 0; r < CURSOR_SIZE; r++) {
+        for (int c = 0; c < CURSOR_SIZE; c++) {
+            if (cursor_shape[r][c]) continue;
+            int near = 0;
+            for (int dy = -1; dy <= 1 && !near; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int rr = r + dy, cc = c + dx;
+                    if (rr < 0 || rr >= CURSOR_SIZE || cc < 0 || cc >= CURSOR_SIZE) continue;
+                    if (cursor_shape[rr][cc]) { near = 1; break; }
+                }
+            }
+            if (near) du_pixel(&g_fb, mx + c, my + r, 0xFF000000u);
+        }
+    }
     for (int r = 0; r < CURSOR_SIZE; r++) {
         for (int c = 0; c < CURSOR_SIZE; c++) {
             if (cursor_shape[r][c]) {

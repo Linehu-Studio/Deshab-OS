@@ -1,32 +1,25 @@
-# ============================================================
-# Deshab .gitignore — 只防二进制构建产物（可再生成）
-# 源资产（png/ttf/webp）、演示视频（mp4）、文本构建日志（.d/.timestamp）
-# 一律入库。二进制产物由 build.ps1 / mkfont.py / gen_textures.py 再生成。
-# ============================================================
-
-# ---- C 编译产物 ----
 *.o
 *.obj
 *.elf
 *.drv
 
-# ---- 磁盘镜像 / 打包产物 ----
 *.img
 *.iso
 *.vhd
 *.raw
 *.ppm
 
-# ---- Rust 构建产物 ----
 target/
 *.rlib
 *.rmeta
 *.pdb
 
-# ---- 生成资产（源文件在 CODE/desktop/*.png、CODE/font/simhei.ttf、CODE/dsk/logo_data.c） ----
 *.dbf
 *.rgba
 
+SYSTEM/boot/linux-extra-rootfs.img
+*.d
+target/
 # ---- 本地工作区 ----
 .build_tmp/
 .trae/

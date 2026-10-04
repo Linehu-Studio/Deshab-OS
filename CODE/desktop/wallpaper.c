@@ -1,15 +1,14 @@
 /* wallpaper.c — 壁纸背景层缓存实现（M2：磁盘加载版）
  *
- * 流程：FAT32 流式读 system/wallpaper.rgba（1000×700 RGBA 字节流）
+ * 流程：FAT32 流式读桌面材质包 textures/back.rgba（889×500 RGBA 字节流）
  *   → WALLPAPER_STAGING_ADDR 暂存 → 双线性缩放（对齐像素中心，8.8 定点）
  *   → WALLPAPER_ADDR 背景层缓存。
- * 数组字节序 R,G,B,A；framebuffer u32 = 0xAARRGGBB（R 在 bit16）。
- */
+ * 数组字节序 R,G,B,A；framebuffer u32 = 0xAARRGGBB（R 在 bit16）。 */
 #include "wallpaper.h"
 
-/* 嵌入资产尺寸（与 gen_wallpaper.py 的 W×H 一致；运行时按文件大小校验） */
-#define WP_SRC_W 1000
-#define WP_SRC_H 700
+/* 材质包 back.rgba 尺寸（与 gen_textures.py 的 back 889×500 一致；运行时按文件大小校验） */
+#define WP_SRC_W 889
+#define WP_SRC_H 500
 
 static wp_u32 *g_wp_layer = 0;
 static int g_wp_w = 0, g_wp_h = 0;
@@ -23,7 +22,7 @@ int wallpaper_init(wallpaper_read_fn read_to, int fb_w, int fb_h) {
     wp_u32 src_total = g_wp_src_w * g_wp_src_h * 4u;
     if (src_total > WALLPAPER_STAGING_MAX) return -3;
     wp_u32 got = 0;
-    if (read_to("system/wallpaper.rgba",
+    if (read_to("system/deshab64/desktop/textures/back.rgba",
                 (wp_u8 *)WALLPAPER_STAGING_ADDR, src_total, &got) != 0)
         return -4;
     if (got < src_total) {

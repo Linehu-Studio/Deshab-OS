@@ -7,6 +7,7 @@
  * 原 "Winux-Kate 结构完整复刻" 布局说明见 pages.c 头注释；
  * M2-M4 将按 Win11 Fluent 桌面重构计划逐页替换。
  */
+#include "ascii_font.h"  /* 顺序敏感：先于 desktop.h（g_ascii 导出） */
 #include "desktop.h"
 #include "zhfont.h"       /* M1: 中文位图字库（dbf 加载 + 中英混排渲染） */
 #include "wallpaper.h"   /* M2: 壁纸背景层缓存 */
@@ -78,84 +79,89 @@ static void load_fuck_config(void) {
 }
 
 /* ============================================================
- *  Boot 屏（打字机）
+ *  登录 → 桌面 crossfade（渐隐渐显）
+ *  登录最后一帧已在真实 fb 上；桌面首帧已由 redraw_all() 绘入
+ *  sprite buffer。复用 WALLPAPER_STAGING（wallpaper_init 后已空闲）
+ *  保存登录帧，按 alpha 混合 16 步直写真实 fb。
  * ============================================================ */
 
-static const char *BOOT_LINES[] = {
-    "DESHAB DESKTOP v0.1.0",
-    "DEAICUP STUDIO && LINEHU STUDIO",
-    "https://deaicup.com",
-    "https://github.com/Linehu-Studio",
-};
-#define BOOT_LINE_COUNT 4
+#define XFADE_ADDR   WALLPAPER_STAGING_ADDR   /* 8MB 区，init 后空闲 */
+#define XFADE_STEPS  16
 
 static void busy_delay(u32 cycles) {
     for (volatile u32 i = 0; i < cycles; i++) __asm__("pause");
 }
 
-static void boot_screen(void) {
+static void crossfade_login_to_desktop(void) {
     int W = (int)g_fb_w, H = (int)g_fb_h;
+    u32 *src = (u32 *)XFADE_ADDR;          /* 登录帧 */
+    const u32 *dst = (const u32 *)g_fb.fb; /* 桌面帧（sprite buffer） */
+    u32 *out = (u32 *)g_real_fb;
+    u64 n = (u64)W * (u64)H;
 
-    /* M2 修复：保留 DSK 已绘制的启动画面（渐变背景 + 居中开机 Logo +
-     * dcp/xj 角标），boot 屏叠加在其上下空白区——logo 不跳位、不重复、
-     * 不被覆盖。DSK logo 居中 157px：占据 H/2-78 .. H/2+78。 */
+    /* 1. 保存登录最后一帧 */
     {
         u64 pitch_u32 = g_fb_pitch / 4;
         for (u64 y = 0; y < g_fb_h; y++) {
-            const u32 *src = (const u32 *)((const u8 *)g_real_fb + y * g_fb_pitch);
-            u32 *dst = (u32 *)SPRITE_BUF_ADDR + y * pitch_u32;
-            for (u64 x = 0; x < g_fb_w; x++) dst[x] = src[x];
+            const u32 *s = (const u32 *)((const u8 *)g_real_fb + y * g_fb_pitch);
+            u32 *d = (u32 *)((u8 *)src + y * (u64)W * 4);
+            for (u64 x = 0; x < g_fb_w; x++) d[x] = s[x];
         }
+        (void)pitch_u32;
     }
 
-    int lw = 46 * (int)DU_ASCII_STEP;
-    int lx = (W - lw) / 2;
-    int ty = H / 2 - 220;
+    /* 2. 桌面首帧绘入 sprite buffer（由调用方 redraw_all() 完成后进入本函数） */
 
-    /* boot-title（logo 上方空白区）——一次性整行绘制（打字机效果已删） */
-    const char *title = "DESHAB";
-    int tl = kstrlen(title);
-    du_draw_string(&g_fb, title, W / 2 - tl * (int)DU_ASCII_STEP, ty,
-                   KS_ACCENT, 0, DU_ASCII_STEP * 2);
-    du_divider_h(&g_fb, W / 2 - 120, ty + 30, 240, KS_ACCENT);
-
-    /* boot-subtitle（对应 Kate "由 Deaicup 工作室制作"） */
-    draw_centered("DEAICUP STUDIO", W / 2, ty + 44, KS_ACCENT2, 0);
-
-    /* boot-lines（logo 下方空白区，H/2+110 起）——整屏一次绘制 */
-    int ly = H / 2 + 110;
-    int bar_y = ly + BOOT_LINE_COUNT * ((int)DU_ASCII_LINE_H + 2) + 12;
-    int bw = 260;
-    for (int li = 0; li < BOOT_LINE_COUNT; li++) {
-        const char *s = BOOT_LINES[li];
-        u32 fg = (li == 1 || li == BOOT_LINE_COUNT - 1) ? KS_TEXT_DIM : KS_ACCENT2;
-        du_draw_string(&g_fb, ">", lx, ly, KS_ACCENT, 0, DU_ASCII_STEP);
-        du_draw_string(&g_fb, s, lx + (int)DU_ASCII_STEP, ly, fg, 0, DU_ASCII_STEP);
-        ly += (int)DU_ASCII_LINE_H + 2;
-        /* boot-bar: 渐变填充（accent → accent2） */
-        int fill = bw * (li + 1) / BOOT_LINE_COUNT;
-        du_rect_outline(&g_fb, W / 2 - bw / 2, bar_y, bw, 6, KS_BORDER, 1);
-        if (fill > 2) du_fill_rect_gradient(&g_fb, W / 2 - bw / 2 + 1, bar_y + 1,
-                                            fill - 2, 4, KS_ACCENT, KS_ACCENT2);
+    /* 3. alpha 混合直写真实 fb：out = src*(1-a) + dst*a */
+    for (int step = 1; step <= XFADE_STEPS; step++) {
+        u32 a = (u32)(step * 256 / XFADE_STEPS);
+        u32 ia = 256 - a;
+        for (u64 i = 0; i < n; i++) {
+            u32 s = src[i], d = dst[i];
+            u32 sr = (s >> 16) & 0xFF, sg = (s >> 8) & 0xFF, sb = s & 0xFF;
+            u32 dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
+            out[i] = 0xFF000000u |
+                     (((sr * ia + dr * a) >> 8) << 16) |
+                     (((sg * ia + dg * a) >> 8) << 8) |
+                     ((sb * ia + db * a) >> 8);
+        }
+        busy_delay(40000);
     }
-    flip_buffer();
-
-    /* boot-hint + credit（对应 Kate "SYSTEM ONLINE" + "© 2026 Deaicup Studio"） */
-    draw_centered("SYSTEM ONLINE", W / 2, H - 64, KS_ACCENT2, 0);
-    draw_centered("(C) 2026 DEAICUP STUDIO", W / 2, H - 40, KS_TEXT_DIM, 0);
-    flip_buffer();
-    busy_delay(10000000);
 }
 
 /* ============================================================
  *  严格错误策略插桩（D 系列）：错误不再降级，整屏 fatal + 错误码。
- *  每个插桩点唯一 symbol（DSK-E<nn>）。
+ *  每个插桩点唯一 symbol（DESK-E<nn>）。
  * ============================================================ */
 
 static void desktop_fatal(const char *sym) {
-    /* 严格错误策略：任何错误不再降级，串口留档 + 停机。
-     * （UI 层 fatal 屏由各 UI 组件就绪后的路径使用；此处不依赖任何子系统） */
+    /* 严格错误策略：串口留档 + 深红 fatal 屏（ASCII 18px 直写真实 fb）+ 停机 */
     slog(sym);
+    if (g_real_fb && g_fb_w && g_fb_h) {
+        u32 *fb = (u32 *)g_real_fb;
+        u64 pitch_u32 = g_fb_pitch / 4;
+        for (u64 y = 0; y < g_fb_h; y++)
+            for (u64 x = 0; x < g_fb_w; x++)
+                fb[y * pitch_u32 + x] = 0xFF3A0A0Au;   /* 深红 */
+        /* 居中绘制 symbol（ASCII 字符走 11x18 位图，其余跳过） */
+        int len = 0;
+        while (sym[len]) len++;
+        int cw = 11, ch = 18;
+        int x0 = (int)(g_fb_w - (u64)len * cw) / 2;
+        int y0 = (int)g_fb_h / 2 - ch / 2;
+        for (int i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)sym[i];
+            if (c < 32 || c > 126) continue;
+            const unsigned char *g = g_ascii[c - 32];
+            for (int py = 0; py < ch; py++) {
+                u32 *row = fb + (u64)(y0 + py) * pitch_u32;
+                for (int px = 0; px < cw; px++) {
+                    if (g[py * cw + px])
+                        row[x0 + i * cw + px] = 0xFFF2F2F2u;   /* 白 */
+                }
+            }
+        }
+    }
     for (;;) __asm__("cli; hlt");
 }
 
@@ -220,8 +226,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
             slog("[zhfont] dbf loaded (16px ok)");
         } else {
             slog_num("[zhfont] dbf load failed rc=", zrc);
-            slog("[zhfont] CJK disabled (ASCII fallback)");
-            for (;;) __asm__("hlt");
+            desktop_fatal("DESK-E04 FONT PACK MISSING");
         }
     }
 
@@ -233,13 +238,16 @@ void dsk_entry(const dsk_boot_context *ctx) {
             slog("[wallpaper] loaded + scaled");
         } else {
             slog_num("[wallpaper] load failed rc=", wrc);
-            slog("[wallpaper] gradient fallback");
+            /* 严格错误策略：材质包（壁纸）缺失不降级，fatal 屏 + 错误码 */
+            desktop_fatal("DESK-E02 TEXTURE PACK MISSING");
         }
         /* M2: 开始菜单 logo（textures/startMenuLogo.rgba → 0x8700000） */
         if (taskbar_init(f32_read_path_lfn_to_w) == 0)
             slog("[taskbar] startMenu logo loaded");
-        else
-            slog("[taskbar] startMenu logo missing (glyph fallback)");
+        else {
+            /* 严格错误策略：材质包（开始菜单 logo）缺失不降级 */
+            desktop_fatal("DESK-E03 STARTMENU LOGO MISSING");
+        }
         g_page = 3;   /* Fluent 默认进 DESKTOP 页 */
     }
 
@@ -278,11 +286,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     files_refresh();
 
-    boot_screen();
+    /* 桌面首帧绘入 sprite buffer，然后从登录帧渐隐渐显到桌面（无 boot 屏） */
+    redraw_all();
+    crossfade_login_to_desktop();
     g_booted = 1;
 
-    redraw_all();
-    flip_buffer();          /* M2 修复：boot 后立即上屏，打字机残留清屏 */
     slog("desktop ready");
     desktop_launch_pending_native();
 

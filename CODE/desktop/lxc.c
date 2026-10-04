@@ -385,7 +385,7 @@ void blit_scanout_to_ide(int hx, int hy, int hw, int hh) {
     const struct linux_compat_scanout_info *si = ide_scanout_state();
     if (!si || !si->enabled || !si->host_vaddr) {
         /* scanout 未就绪：X server 尚未 SET_SCANOUT，显示等待提示 */
-        du_fill_rect(&g_fb, hx, hy, hw, hh, 0xFF051828u);
+        du_fill_rect(&g_fb, hx, hy, hw, hh, KS_BG_SECONDARY);
         draw_centered("WAITING FOR GUEST X SERVER . . .",
                       hx + hw / 2, hy + hh / 2 - 8, KS_TEXT_DIM, 0);
         return;
@@ -433,9 +433,9 @@ void blit_scanout_to_ide(int hx, int hy, int hw, int hh) {
         int cov_w = (hw < sw) ? hw : sw;
         int cov_h = (hh < sh) ? hh : sh;
         if (cov_w < hw)
-            du_fill_rect(&g_fb, hx + cov_w, hy, hw - cov_w, cov_h, 0xFF051828u);
+            du_fill_rect(&g_fb, hx + cov_w, hy, hw - cov_w, cov_h, KS_BG_SECONDARY);
         if (cov_h < hh)
-            du_fill_rect(&g_fb, hx, hy + cov_h, hw, hh - cov_h, 0xFF051828u);
+            du_fill_rect(&g_fb, hx, hy + cov_h, hw, hh - cov_h, KS_BG_SECONDARY);
     }
 
     /* P7.6: 叠加 guest 硬件光标（ARGB alpha-blend 到 framebuffer）。

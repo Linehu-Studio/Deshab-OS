@@ -32,7 +32,7 @@ int g_tb2_clk_rect[4];
 #define TB_APPBTN 44             /* 应用钮边长 */
 #define TB_PAD    8              /* 条内边距 */
 
-static const wf_theme *tb_theme(void) { return &g_wf_dark; }
+static const wf_theme *tb_theme(void) { return &g_wf_light; }
 
 /* ---- 开始菜单 logo（textures/startMenuLogo.rgba，加载失败回退字形） ---- */
 static int g_smlogo_ok = 0;
@@ -151,8 +151,8 @@ void taskbar_draw(void) {
         g_tb2_app_rect[i][0] = x; g_tb2_app_rect[i][1] = byy;
         g_tb2_app_rect[i][2] = TB_APPBTN; g_tb2_app_rect[i][3] = TB_APPBTN;
         wf_btn_state st = tb_hover_state(g_tb2_app_rect[i]);
-        if (w->focused) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22FFFFFFu);
-        else if (st == WF_BTN_HOVER) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22FFFFFFu);
+        if (w->focused) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22000000u);
+        else if (st == WF_BTN_HOVER) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22000000u);
         du_wf_icon(&g_fb, tb_app_icon(w->app_id), x + (TB_APPBTN - 22) / 2,
                    byy + (TB_APPBTN - 22) / 2, 22, t->text_primary);
         /* 运行指示条：底部 accent，聚焦加宽 */

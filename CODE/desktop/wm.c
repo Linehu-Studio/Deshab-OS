@@ -250,7 +250,7 @@ void draw_window_frame(desktop_window *w) {
     du_fill_rounded_rect(&g_fb, w->x, w->y, w->w, w->h, KS_BG_SECONDARY, 2);
 
     du_fill_rect_gradient(&g_fb, w->x + 1, w->y + 1, w->w - 2, KATE_TITLEBAR_H - 1,
-                          0xFF0A3050u, KS_BG_SECONDARY);
+                          KS_BG_TERTIARY, KS_BG_SECONDARY);
     du_divider_h(&g_fb, w->x, w->y + KATE_TITLEBAR_H, w->w, KS_BORDER);
 
     du_fill_rect(&g_fb, w->x + 6, w->y + KATE_TITLEBAR_H / 2 - 2, 4, 4, KS_ACCENT2);
@@ -258,7 +258,7 @@ void draw_window_frame(desktop_window *w) {
     du_draw_string(&g_fb, w->title,
                    w->x + 14,
                    w->y + (KATE_TITLEBAR_H - (i64)DU_ASCII_LINE_H) / 2 + 1,
-                   KS_ACCENT, 0xFF0A3050u, DU_ASCII_STEP);
+                   KS_ACCENT, KS_BG_SECONDARY, DU_ASCII_STEP);
 
     int bx = w->x + w->w - CLOSE_BTN_OFFSET;
     int by = w->y + (KATE_TITLEBAR_H - CLOSE_BTN_SIZE) / 2;

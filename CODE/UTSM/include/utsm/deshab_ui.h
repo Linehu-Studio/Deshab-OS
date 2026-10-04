@@ -738,27 +738,28 @@ static inline du_u32 du_theme_accent(du_theme t) {
 #define DP_KATE_DANGER      0xFFFF4D6Du   /* --danger: #ff4d6d */
 
 /* ===================================================================
- *  L1 — Winux-Kate 语义色值
+ *  L1 — 桌面语义色值（白色调主题，去 winux-Kate 深色风）
+ *  底色白/浅灰，组件白卡片 + 浅灰描边，文字深灰，强调色深板岩。
  * =================================================================== */
 
-#define KS_BG_PRIMARY       DP_KATE_BG
-#define KS_BG_SECONDARY     DP_KATE_PANEL_SOLID
-#define KS_BG_TERTIARY      DP_KATE_BG2
+#define KS_BG_PRIMARY       0xFFF3F4F6u   /* 页面底：浅灰 */
+#define KS_BG_SECONDARY     0xFFFFFFFFu   /* 面板：白 */
+#define KS_BG_TERTIARY      0xFFE9ECF0u   /* 三级底：稍深浅灰 */
 
-#define KS_TEXT_PRIMARY     DP_KATE_TEXT
-#define KS_TEXT_DIM         DP_KATE_TEXT_DIM
-#define KS_TEXT_INVERT      DP_KATE_BG
+#define KS_TEXT_PRIMARY     0xFF1A1A1Au   /* 主文字：近黑 */
+#define KS_TEXT_DIM         0xFF6B7280u   /* 次文字：中灰 */
+#define KS_TEXT_INVERT      0xFFFFFFFFu   /* accent 上的文字：白 */
 
-#define KS_ACCENT           DP_KATE_ACCENT
-#define KS_ACCENT2          DP_KATE_ACCENT2
-#define KS_ACCENT_DIM       DP_KATE_ACCENT_DIM_SOLID
+#define KS_ACCENT           0xFF111827u   /* 强调：深板岩（白底上高对比） */
+#define KS_ACCENT2          0xFF4B5563u   /* 次强调：中板岩 */
+#define KS_ACCENT_DIM       0xFFE5E7EBu   /* 强调淡底：浅灰 */
 
-#define KS_BORDER           DP_KATE_PANEL_BORDER_SOLID
-#define KS_BORDER_FOCUS     DP_KATE_ACCENT
-#define KS_BORDER_DIM       0xFF1A2840u   /* 暗边框 */
+#define KS_BORDER           0xFFD1D5DBu   /* 边框：浅灰 */
+#define KS_BORDER_FOCUS     0xFF111827u   /* 聚焦边框：深板岩 */
+#define KS_BORDER_DIM       0xFFE5E7EBu   /* 暗边框：极浅灰 */
 
-#define KS_DANGER           DP_KATE_DANGER
-#define KS_WARN             DP_KATE_WARN
+#define KS_DANGER           0xFFDC2626u   /* 红 */
+#define KS_WARN             0xFFD97706u   /* 琥珀 */
 
 /* ===================================================================
  *  Winux-Kate 布局常量（源自 theme.css / pages.css）

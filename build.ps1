@@ -759,6 +759,40 @@ if (Test-Path $PanicLogoPng) {
 } else {
     Write-Host '[build] WARNING: ohMyLogo.png not found (panic screen keeps embedded data)'
 }
+
+# Generate desktop textures (PNG/webP -> raw RGBA for the desktop material pack)
+$GenTex = Join-Path $Root 'CODE\desktop\gen_textures.py'
+if (Test-Path $GenTex) {
+    $TexSrc   = Join-Path $Root 'SYSTEM\system\deshab64\desktop\textures\startMenuLogo.png'
+    $TexStamp = Join-Path $Root 'SYSTEM\system\deshab64\desktop\textures\startMenuLogo.rgba'
+    $needTex = -not (Test-Path $TexStamp)
+    if ($needTex -and (Test-Path $TexSrc)) {
+        $needTex = (Get-Item $TexSrc).LastWriteTime -gt (Get-Item $TexStamp).LastWriteTime
+    }
+    if ($needTex) {
+        Write-Host '[build] Generating desktop textures (gen_textures.py)...'
+        $texDone = $false
+        $Python = $null
+        foreach ($p in @('C:\Users\林濬哲\AppData\Local\Programs\Python\Python312\python.exe',
+                         'C:\msys64\mingw64\bin\python.exe',
+                         'python', 'python3')) {
+            try { $cmd = Get-Command $p -ErrorAction Stop; $Python = $cmd.Source; break } catch {}
+        }
+        if ($Python) {
+            & $Python $GenTex
+            if ($LASTEXITCODE -eq 0) { $texDone = $true }
+        }
+        if (-not $texDone) {
+            # Fallback: WSL python3 (has Pillow on this machine)
+            $wslPath = ($GenTex -replace '^([A-Za-z]):', '/mnt/$1').ToLower()
+            & wsl python3 $wslPath
+            if ($LASTEXITCODE -eq 0) { $texDone = $true }
+        }
+        if (-not $texDone) {
+            Write-Host '[build] WARNING: desktop texture generation failed (material pack may be incomplete)'
+        }
+    }
+}
 try {
     & $make -C "$DskDir" -f MAKEFILE "CC=$clang" "LD=$lld"
     if ($LASTEXITCODE -ne 0) {

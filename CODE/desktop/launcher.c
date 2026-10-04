@@ -342,7 +342,7 @@ void launch_pe_app(int app_id) {
     {
         u32 *p = (u32 *)g_pe_surf;
         u64 n = (u64)cw * (u64)ch;
-        for (u64 i = 0; i < n; i++) p[i] = 0xFF101418u;
+        for (u64 i = 0; i < n; i++) p[i] = 0xFFF3F4F6u;
     }
 
     win->app_state = &g_pe_state_dummy;   /* draw_desktop_page 要求非空才调 on_draw */

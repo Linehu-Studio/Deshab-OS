@@ -188,7 +188,7 @@ static void redraw_all_fluent(void) {
                 for (u64 x = 0; x < g_fb_w; x++) line[x] = srcline[x];
             }
         } else {
-            du_fill_bg_gradient(&g_fb, 0xFF0A0E1Cu, 0xFF16264Au);
+            du_fill_bg_gradient(&g_fb, 0xFFE9ECF0u, 0xFFF3F4F6u);
         }
     }
 

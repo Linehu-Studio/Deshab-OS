@@ -14,7 +14,7 @@
 void draw_topbar(void) {
     int W = (int)g_fb_w;
     du_fill_rect_gradient(&g_fb, 0, 0, W, KATE_TOPBAR_H,
-                          0xFF0A2840u, KS_BG_PRIMARY);
+                          0xFFFFFFFFu, KS_BG_PRIMARY);
     du_divider_h(&g_fb, 0, KATE_TOPBAR_H, W, KS_BORDER);
 
     int x = 12;
@@ -180,7 +180,7 @@ static void draw_slider(int x, int y, int w, int val, int rect_out[4]) {
 static void draw_statusbar_full(void) {
     int W = (int)g_fb_w;
     int y = (int)g_fb_h - KATE_STATUSBAR_H;
-    du_fill_rect(&g_fb, 0, y, W, KATE_STATUSBAR_H, 0xFF051828u);
+    du_fill_rect(&g_fb, 0, y, W, KATE_STATUSBAR_H, KS_BG_SECONDARY);
     du_divider_h(&g_fb, 0, y, W, KS_BORDER);
 
     int x = 12;
@@ -420,7 +420,7 @@ void draw_ide(void) {
     int top = KATE_TOPBAR_H;
 
     /* ide-tabs（36px）：dot + 实例标签 + "+ NEW IDE" + ide-hint（Kate 结构） */
-    du_fill_rect(&g_fb, 0, top, W, 36, 0xFF051828u);
+    du_fill_rect(&g_fb, 0, top, W, 36, KS_BG_SECONDARY);
     du_divider_h(&g_fb, 0, top + 36, W, KS_BORDER);
     int x = 12;
     int ty = top + (36 - (int)DU_ASCII_LINE_H) / 2 + 1;
@@ -507,7 +507,7 @@ void draw_ide(void) {
                 blit_scanout_to_ide(hx + 2, hy + 2, hw - 4, hh - 4);
             } else {
                 /* P8.1: 启动中--显示分阶段状态 + 详细信息 */
-                du_fill_rect(&g_fb, hx + 2, hy + 2, hw - 4, hh - 4, 0xFF051828u);
+                du_fill_rect(&g_fb, hx + 2, hy + 2, hw - 4, hh - 4, KS_BG_SECONDARY);
                 draw_centered(g_launch_status[0] ? g_launch_status :
                               "STARTING VSCODE . . .",
                               W / 2, hy + hh / 2 - 20, KS_TEXT_DIM, 0);
@@ -598,7 +598,7 @@ void draw_desktop_page(void) {
     int W = (int)g_fb_w;
     int tb_y = (int)g_fb_h - KATE_TASKBAR_H;
     du_fill_rect_gradient(&g_fb, 0, tb_y, W, KATE_TASKBAR_H,
-                          0xFF0A2840u, KS_BG_PRIMARY);
+                          0xFFFFFFFFu, KS_BG_PRIMARY);
     du_divider_h(&g_fb, 0, tb_y, W, KS_BORDER);
 
     int x = 8;
@@ -683,7 +683,7 @@ void draw_custom_page(int cp_idx) {
     cpage *cp = &g_cpages[cp_idx];
 
     /* ide-tabs 栏（36px）：dot + 页名 + "+ NEW INSTANCE" + ide-hint（Kate 结构） */
-    du_fill_rect(&g_fb, 0, top, W, 36, 0xFF051828u);
+    du_fill_rect(&g_fb, 0, top, W, 36, KS_BG_SECONDARY);
     du_divider_h(&g_fb, 0, top + 36, W, KS_BORDER);
     int ty = top + (36 - (int)DU_ASCII_LINE_H) / 2 + 1;
 
@@ -836,7 +836,7 @@ void draw_ctx_menu(void) {
     g_ctx_rect[0] = x; g_ctx_rect[1] = y;
     g_ctx_rect[2] = mw; g_ctx_rect[3] = mh;
 
-    du_fill_rect(&g_fb, x, y, mw, mh, 0xFF050A18u);
+    du_fill_rect(&g_fb, x, y, mw, mh, KS_BG_SECONDARY);
     du_rect_outline(&g_fb, x, y, mw, mh, KS_ACCENT, 1);
     du_kate_glow_border(&g_fb, x, y, mw, mh, KS_ACCENT);
 

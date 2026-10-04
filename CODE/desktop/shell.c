@@ -482,6 +482,17 @@ int handle_key(u8 sc) {
     if (sc == 0x01) {
         if (g_taskview) { g_taskview = 0; return 1; }
         if (g_ctx_open) { g_ctx_open = 0; return 1; }
+        /* IDE 页：Esc = detach + 退回桌面页（IDE 退出通道） */
+        if (g_page == 2) {
+            if (g_ide_attached) {
+                g_ide_attached = 0;
+                g_input_forward_enabled = 0;
+                ide_attach_invalidate();
+                slog("ide detached (esc), input forwarding off");
+            }
+            page_switch(3);
+            return 1;
+        }
         return 0;
     }
     if (g_taskview || g_ctx_open) return 0;   /* 模态期间吞掉按键 */

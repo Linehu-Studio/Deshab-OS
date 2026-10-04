@@ -789,8 +789,18 @@ static inline int f32_read_file_by_clus(u32 clus, u32 size, u8 *out_buf, u32 buf
         for (u32 b = 0; b < fc_bytes; b++) dst[b] = fb[b];
         dst += fc_bytes; remaining -= fc_bytes;
         u32 fo = fat_byte_off + fc * 4;
-        if (fo + 4 > sizeof(f32_disk)) break;
-        fc = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+        if (fo + 4 <= sizeof(f32_disk)) {
+            fc = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+        } else {
+            /* BUG-031 修复：FAT 超出 128KB 预读缓冲（sidecar FAT ~2.1MB）。
+             * 旧逻辑直接越界读 f32_disk 尾部得到垃圾簇号，链路走飞导致
+             * 大文件（字库/壁纸）第二簇起数据损坏。按需读取单 FAT 扇区
+             * （fo 为相对 LBA0 的字节偏移，直接换算扇区号）。 */
+            u8 fat_sec[512];
+            if (f32_read_sectors(fo / 512, 1, fat_sec) != 0)
+                return -7;
+            fc = f32_r32(fat_sec + (fo % 512)) & 0x0FFFFFFF;
+        }
     }
     return 0;
 }

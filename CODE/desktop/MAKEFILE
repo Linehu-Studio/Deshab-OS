@@ -20,7 +20,7 @@ $(OUT): $(OBJECTS) linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
-%.o: %.c
+%.o: %.c ../tools/fat32_io.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

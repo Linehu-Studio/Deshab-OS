@@ -1,1 +1,8 @@
 *.mp4 filter=lfs diff=lfs merge=lfs -text
+
+# Shell scripts are executed by bash (WSL / Linux / CI). CRLF line endings
+# break them outright ("$'\r': command not found", and a stray CR in a shebang
+# or in `set -euo pipefail` makes the whole script unrunnable) - the packing
+# step of this project's build died on exactly that. Pin LF for every checkout
+# regardless of the developer's core.autocrlf setting.
+*.sh text eol=lf

@@ -961,19 +961,39 @@ foreach ($tool in $toolApps) {
 Write-Host '[build] Building DKM framebuffer driver...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\console_fb\console_fb.c') (Join-Path $SystemDir 'driver\console\console_fb.drv')
 
+# stage0: platform + bus — timer 提供 PIT 校准，acpi 枚举 RSDP/XSDT，pci 扫描配置空间。
+# 这三个驱动 manifest.json 里是必需的；055c521 把它们从 git 移除后此处必须重新编译，
+# 否则 limine 会 panic「Failed to open module boot():/driver/platform/timer.drv」。
+Write-Host '[build] Building DKM platform/bus drivers...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\timer\timer.c') (Join-Path $SystemDir 'driver\platform\timer.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\acpi\acpi.c')   (Join-Path $SystemDir 'driver\platform\acpi.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\pci\pci.c')     (Join-Path $SystemDir 'driver\bus\pci.drv')
+
 # B7: apic.drv 纳入构建 (原 platform/apic.drv 为预置二进制, 不随 apic.c 更新)
 Write-Host '[build] Building DKM platform apic driver...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\apic\apic.c') (Join-Path $SystemDir 'driver\platform\apic.drv')
 
 Write-Host '[build] Building DKM storage drivers...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\ahci\ahci.c') (Join-Path $SystemDir 'driver\block\ahci.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\nvme\nvme.c') (Join-Path $SystemDir 'driver\block\nvme.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\ehci\ehci.c') (Join-Path $SystemDir 'driver\block\ehci.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\xhci\xhci.c') (Join-Path $SystemDir 'driver\block\xhci.drv')
+
+# stage2: filesystem — bootfs 挂 boot module，vfs 汇总，fat32 只读 FAT32，devfs 暴露 /dev。
+Write-Host '[build] Building DKM filesystem drivers...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\bootfs\bootfs.c') (Join-Path $SystemDir 'driver\fs\bootfs.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\vfs\vfs.c')       (Join-Path $SystemDir 'driver\fs\vfs.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\fat32\fat32.c')   (Join-Path $SystemDir 'driver\fs\fat32.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\devfs\devfs.c')   (Join-Path $SystemDir 'driver\fs\devfs.drv')
 
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir 'driver\net\ath9k.drv')
+
+# stage3: input — ps2kbd 注册 IRQ1。
+Write-Host '[build] Building DKM input drivers...'
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\ps2kbd\ps2kbd.c') (Join-Path $SystemDir 'driver\input\ps2kbd.drv')
 
 Write-Host "[build] Output: $Output"
 Write-Host "[build] DSK Output: $DskOutput"

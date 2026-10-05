@@ -5,7 +5,7 @@
 # 用途: 在 WSL/Linux 中运行，验证构建 Linux 6.6 LTS bzImage 所需依赖
 #
 # 使用:
-#   ! wsl bash /mnt/d/Code/Deshab/CODE/linux/check_env.sh
+#   ! wsl bash CODE/linux/check_env.sh
 #
 # 退出码:
 #   0 = 所有依赖已满足
@@ -15,6 +15,10 @@ set -e
 
 echo "[check] Linux 内核构建环境检查"
 echo "[check] ==========================="
+
+# 仓库根目录：按脚本自身位置推导，不依赖当前工作目录，也不认死任何盘符路径。
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+echo "[check] 仓库根: $REPO_ROOT"
 
 # 1. 检查操作系统
 if [ -f /etc/os-release ]; then
@@ -32,6 +36,18 @@ echo "[check]"
 echo "[check] 检查构建依赖..."
 MISSING=()
 for pkg in build-essential bc flex bison libelf-dev libssl-dev cpio gzip git; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then
+        echo "[check]   ✓ $pkg"
+    else
+        echo "[check]   ✗ $pkg (缺失)"
+        MISSING+=("$pkg")
+    fi
+done
+
+# 2b. 检查镜像打包工具（pack_system_image.sh 硬依赖，不在上面那组内核依赖里）
+echo "[check]"
+echo "[check] 检查镜像打包工具..."
+for pkg in dosfstools e2fsprogs fdisk rsync; do
     if dpkg -s "$pkg" >/dev/null 2>&1; then
         echo "[check]   ✓ $pkg"
     else
@@ -60,7 +76,7 @@ fi
 
 # 4. 检查磁盘空间（需要 ~3GB）
 echo "[check]"
-PROJECT_ROOT="/mnt/d/Code/Deshab"
+PROJECT_ROOT="$REPO_ROOT"
 if [ -d "$PROJECT_ROOT" ]; then
     AVAILABLE_KB=$(df "$PROJECT_ROOT" | awk 'NR==2 {print $4}')
     AVAILABLE_GB=$((AVAILABLE_KB / 1024 / 1024))
@@ -73,13 +89,13 @@ if [ -d "$PROJECT_ROOT" ]; then
     fi
 fi
 
-# 5. 检查访问 Windows D: 盘
+# 5. 检查 WSL 能否访问当前仓库（不认死盘符路径）
 echo "[check]"
-if [ -d "/mnt/d/Code/Deshab" ]; then
-    echo "[check] ✓ WSL 可访问 /mnt/d/Code/Deshab"
+if [ -d "$REPO_ROOT/CODE/linux" ] && [ -d "$REPO_ROOT/SYSTEM" ]; then
+    echo "[check] ✓ WSL 可访问当前仓库 ($REPO_ROOT)"
 else
-    echo "[check] ✗ WSL 无法访问 /mnt/d/Code/Deshab"
-    echo "[check]   请确认在 WSL 中执行，且 D: 盘已挂载"
+    echo "[check] ✗ WSL 无法访问当前仓库 ($REPO_ROOT)"
+    echo "[check]   请从仓库内运行本脚本，且 Windows 盘已挂载到 /mnt/<盘符>"
     MISSING+=("wsl_mount")
 fi
 
@@ -107,11 +123,12 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     echo "[check] 请运行以下命令安装依赖:"
     echo "[check]   sudo apt update"
     echo "[check]   sudo apt install -y build-essential bc flex bison libelf-dev libssl-dev cpio gzip git"
+    echo "[check]   sudo apt install -y dosfstools e2fsprogs fdisk rsync"
     exit 1
 fi
 
 echo "[check] ✓ 所有依赖已满足，可以构建 Linux 内核"
 echo "[check]"
 echo "[check] 下一步执行:"
-echo "[check]   cd /mnt/d/Code/Deshab/CODE/linux && chmod +x build.sh && ./build.sh"
+echo "[check]   cd $REPO_ROOT/CODE/linux && chmod +x build.sh && ./build.sh"
 exit 0

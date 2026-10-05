@@ -2,8 +2,9 @@
 # Build initramfs only (assumes bzImage already built)
 set -e
 
-SCRIPT_DIR="/mnt/d/Code/Deshab/CODE/linux"
-PROJECT_ROOT="/mnt/d/Code/Deshab"
+# 按脚本自身位置推导，不认死盘符路径。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
 INITRAMFS_DIR="$SCRIPT_DIR/initramfs"
 LINUX_SRC="${LINUX_SRC:-$HOME/linux-6.6}"

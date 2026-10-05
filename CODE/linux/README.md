@@ -24,8 +24,8 @@ the UTSM hypervisor (VMX root).
 ### 1. From WSL
 
 ```bash
-# Navigate to the project (adjust path for your WSL mount)
-cd /mnt/d/Code/Deshab/CODE/linux
+# Navigate to the project from your repo root in WSL
+cd CODE/linux
 
 # Make the build script executable
 chmod +x build.sh

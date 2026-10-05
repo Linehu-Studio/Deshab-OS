@@ -3,9 +3,9 @@ setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
 
-REM ===== Variant selection: dev / release / realtest =====
+REM ===== Variant selection: dev / release =====
 REM Priority: argument > QEMU_VARIANT env > interactive menu > default dev
-REM Usage: run_qemu.bat [dev|release|realtest]
+REM Usage: run_qemu.bat [dev|release]
 set "VARIANT="
 if not "%~1"=="" set "VARIANT=%~1"
 if not defined VARIANT if defined QEMU_VARIANT set "VARIANT=%QEMU_VARIANT%"
@@ -13,18 +13,15 @@ if not defined VARIANT (
     echo [qemu] Select image variant to boot:
     echo   1. dev      ^(deshab-dev.img, debug all on, auto test^)
     echo   2. release  ^(deshab-release.img, desktop + login^)
-    echo   3. realtest ^(deshab-realtest.img, real-machine safe options^)
-    set /p CHOICE="Choice [1-3, Enter=dev]: "
+    set /p CHOICE="Choice [1-2, Enter=dev]: "
     if "!CHOICE!"=="2" set "VARIANT=release"
-    if "!CHOICE!"=="3" set "VARIANT=realtest"
     if not defined VARIANT set "VARIANT=dev"
 )
-REM Validate variant name (also accepts passing 1/2/3 as argument)
+REM Validate variant name (also accepts passing 1/2 as argument)
 if "%VARIANT%"=="1" set "VARIANT=dev"
 if "%VARIANT%"=="2" set "VARIANT=release"
-if "%VARIANT%"=="3" set "VARIANT=realtest"
-if not "%VARIANT%"=="dev" if not "%VARIANT%"=="release" if not "%VARIANT%"=="realtest" (
-    echo [qemu] Unknown variant: %VARIANT% ^(expected dev / release / realtest^)
+if not "%VARIANT%"=="dev" if not "%VARIANT%"=="release" (
+    echo [qemu] Unknown variant: %VARIANT% ^(expected dev / release^)
     exit /b 1
 )
 

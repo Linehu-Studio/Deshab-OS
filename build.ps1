@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('dev','release','realtest','both')][string]$Variant = 'both',
+    [ValidateSet('dev','release','both')][string]$Variant = 'both',
     [switch]$Vhd
 )
 
@@ -15,7 +15,6 @@ $Output = Join-Path $SystemDir 'boot\utsm.elf'
 $DskOutput = Join-Path $SystemDir 'system\deshab64\deshab.elf'
 $DevImagePath = Join-Path $IsoDir 'deshab-dev.img'
 $ReleaseImagePath = Join-Path $IsoDir 'deshab-release.img'
-$RealtestImagePath = Join-Path $IsoDir 'deshab-realtest.img'
 $BuildTmp = Join-Path $Root '.build_tmp'
 
 # Legacy single-FAT32 ESP size helper (New-GptFat32Image). Dual-partition
@@ -1065,11 +1064,6 @@ if ($Variant -in @('release','both')) {
     Write-Host '[build] === Building RELEASE image (real hardware, dev_mode=0, debug off) ==='
     Build-ImageVariant 'release' $ReleaseImagePath
     Write-Host "[build] RELEASE image done: $ReleaseImagePath"
-}
-if ($Variant -in @('realtest','both')) {
-    Write-Host '[build] === Building REALTEST image (real hardware, disk_log=1, debug on) ==='
-    Build-ImageVariant 'realtest' $RealtestImagePath
-    Write-Host "[build] REALTEST image done: $RealtestImagePath"
 }
 # Restore SYSTEM to dev config (dev is the primary development target)
 if ($Variant -eq 'both') {

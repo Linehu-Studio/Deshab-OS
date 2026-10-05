@@ -167,17 +167,25 @@ if [[ -z "$p1" || -z "$p2" ]]; then
     exit 1
 fi
 
-# 簇大小交给 mkfs.vfat 自动选择。
+# ESP 的簇大小必须显式指定为 4 个扇区（2KiB），不能交给 mkfs 自动选。
 #
-# 历史坑一：这里曾经强制 -s 8（4KiB 簇）。256MiB 的 ESP 恰好被算成 65535
-# 个簇（FAT32 的 0xFFF5 边界），该几何下 OVMF(EDK2 FatPkg) 拒挂该卷 ——
-# 现象是 BdsDxe "Not Found"，Shell 里分区只显示 BLKn、没有对应 FS。
-# 对照实验：sidecar（CODE/linux/make_sata_sidecar.sh）用不带 -s 的
-# mkfs.vfat 就一切正常，所以这里也不再手工指定簇大小。
+# 历史坑一（OVMF 挂不上）：曾经写死 -s 8（4KiB 簇）。256MiB 的 ESP 在该几何下
+# 恰好得到 65535 个簇 —— 正是 FAT32 的 0xFFF5 边界 —— OVMF(EDK2 FatPkg) 拒挂
+# 该卷，现象是 BdsDxe "Not Found"，Shell 里分区只有 BLKn 没有 FS。
 #
-# 历史坑二：不要加 -f 1。UEFI 规范建议 ESP 用单 FAT 表，但实测 OVMF 对
-# nfat=1/2 都能挂，加 -f 1 并不能解决上面的问题，反而偏离 sidecar 的行为。
-mkfs.vfat -F 32 -n DESHABBOOT "$p1" >/dev/null
+# 历史坑二（根目录写满）：修坑一时改成不指定 -s 交给 mkfs 自动选，它给出
+# spc=1（512B/簇）。根目录每簇只能放 16 个目录项，而打包进 ESP 根目录的内容
+# （DESHABBOOT/EFI/LIMINE/BOOT/DRIVER/SYSTEM/USER/NVVARS + 它们的 LFN 项）
+# 正好 16 项，根目录链又只有单簇 —— 于是 DSK 首次启动写 USER.CONF 时必然
+# 拿到 "no free dir entry"（-4）→ FS-E02 panic，系统进不去。
+#
+# 256MiB ESP 各档簇大小的安全性（每档都算过）：
+#   spc=1  16 项/簇  524288 簇  根目录一簇就满（坑二）
+#   spc=4  64 项/簇  131072 簇  ✅ 远离 FAT32 下限 65525 与 0xFFF5 边界
+#   spc=8  128 项/簇  65536 簇  ❌ 落在 65535 边界（坑一）
+#   spc=16 256 项/簇  32768 簇  ❌ 低于 FAT32 下限 65525
+# 所以固定 -s 4：既让根目录有 64 项余量，又不碰任何边界。
+mkfs.vfat -F 32 -s 4 -n DESHABBOOT "$p1" >/dev/null
 # DSK 内嵌 ext4 读写驱动支持范围：4K block / 256B inode / extent 树，
 # 不支持 journal、metadata_csum、64bit（遇到即 panic FS-E28）——
 # 因此这里必须显式关闭这三个 feature。

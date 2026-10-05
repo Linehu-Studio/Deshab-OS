@@ -150,44 +150,63 @@ static void login_fatal(const char *sym) {
     for (;;) __asm__("cli; hlt");
 }
 
-/* ohMyLogo 开场：登录卡片之前显示 DEAICUP 莲花 Logo（ohMyLogo.png 内嵌） */
+/* ohMyLogo 数据保留（panic/其它界面可复用），登录界面不再显示 logo 开场，
+ * logo_intro_screen/draw_logo_rgba 已随需求移除 */
 #include "ohmylogo_data.c"
 
-static void draw_logo_rgba(u32 *fb, i64 x, i64 y) {
-    for (i64 r = 0; r < g_panic_logo_h; r++) {
-        for (i64 c = 0; c < g_panic_logo_w; c++) {
-            const unsigned char *px4 =
-                g_panic_logo_rgba + ((u64)r * g_panic_logo_w + (u64)c) * 4;
-            u32 a = px4[3];
-            if (a < 8) continue;
-            u32 col = 0xFF000000u | ((u32)px4[0] << 16) | ((u32)px4[1] << 8) | px4[2];
-            if (a < 250) {
-                /* 简单 alpha 混合到深蓝底 */
-                u32 bg = 0xFF020F22u;
-                u32 na = 256 - a;
-                u32 rr = (((bg >> 16) & 0xFF) * na + ((col >> 16) & 0xFF) * a) >> 8;
-                u32 gg = (((bg >> 8) & 0xFF) * na + ((col >> 8) & 0xFF) * a) >> 8;
-                u32 bb = ((bg & 0xFF) * na + (col & 0xFF) * a) >> 8;
-                col = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
-            }
-            i64 xx = x + c, yy = y + r;
-            if (xx < 0 || (u64)xx >= fb_w || yy < 0 || (u64)yy >= fb_h) continue;
-            *(u32 *)((u8 *)fb + (u64)yy * fb_p + (u64)xx * 4) = col;
+/* 模糊化的桌面壁纸（back.rgba 构建期盒模糊 x3 @1/4 分辨率），登录卡片背景 */
+#include "back_blur_data.c"
+
+/* 把模糊壁纸最近邻拉伸铺满整个 framebuffer */
+static void draw_blur_wallpaper(u32 *fb) {
+    for (u64 y = 0; y < fb_h; y++) {
+        u32 *line = (u32 *)((u8 *)fb + y * fb_p);
+        u64 sy = y * WALLPAPER_BLUR_H / fb_h;
+        const unsigned char *srow = g_wall_blur_rgba + sy * WALLPAPER_BLUR_W * 4;
+        for (u64 x = 0; x < fb_w; x++) {
+            u64 sx = x * WALLPAPER_BLUR_W / fb_w;
+            const unsigned char *px = srow + sx * 4;
+            line[x] = 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
         }
     }
 }
 
-static void logo_intro_screen(u32 *fb) {
-    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
-    i64 lx = ((i64)fb_w - g_panic_logo_w) / 2;
-    i64 ly = ((i64)fb_h - g_panic_logo_h) / 2 - 30;
-    if (ly < 0) ly = 0;
-    draw_logo_rgba(fb, lx, ly);
-    fb_text(fb, "DESHAB LOGIN", ((i64)fb_w - 12 * ASCII_STEP) / 2,
-            ly + g_panic_logo_h + 16, 0xFFF0D080u, 0);
-    for (int i = 0; i < 40; i++) delay_frame();   /* ~1.3s 开场 */
+/* 从模糊壁纸重采样一小块（spinner 每帧清除残迹用） */
+static void restore_wallpatch(u32 *fb, i64 cx, i64 cy, i64 r) {
+    for (i64 y = cy - r; y <= cy + r; y++) {
+        if (y < 0 || (u64)y >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+        u64 sy = (u64)y * WALLPAPER_BLUR_H / fb_h;
+        const unsigned char *srow = g_wall_blur_rgba + sy * WALLPAPER_BLUR_W * 4;
+        for (i64 x = cx - r; x <= cx + r; x++) {
+            if (x < 0 || (u64)x >= fb_w) continue;
+            u64 sx = (u64)x * WALLPAPER_BLUR_W / fb_w;
+            const unsigned char *px = srow + sx * 4;
+            line[x] = 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
+        }
+    }
 }
 
+/* 登录成功后的加载圆圈：卡片下方 8 段拖尾 spinner（16 分圆整数查表，禁 SSE） */
+static const i32 SIN16[17] = {0,383,707,924,1000,924,707,383,0,-383,-707,-924,-1000,-924,-707,-383,0};
+static void draw_spinner(u32 *fb, i64 cx, i64 cy, i64 frame) {
+    const i64 R = 22;
+    for (int seg = 0; seg < 8; seg++) {
+        int idx = (int)((frame + seg) & 15);
+        u32 alpha = 255 - seg * 28;
+        u32 color = 0xFF000000u
+                  | (u32)(0xE0 * alpha / 255) << 16
+                  | (u32)(0xE0 * alpha / 255) << 8
+                  | (u32)(0xE0 * alpha / 255);
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                i64 px = cx + SIN16[(idx + 4) & 15] * R / 1000 + dx;
+                i64 py = cy + SIN16[idx] * R / 1000 + dy;
+                if (px < 0 || (u64)px >= fb_w || py < 0 || (u64)py >= fb_h) continue;
+                *(u32 *)((u8 *)fb + (u64)py * fb_p + (u64)px * 4) = color;
+            }
+    }
+}
 
 static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color) {
     for (i64 r=0; r<h; r++) {
@@ -780,19 +799,8 @@ static void login_mouse_init(void) {
 }
 
 __attribute__((visibility("default")))
-/* [DSK-E70 布局雷区规避 · 白名单登记]
- * DSK 加载链路存在未定位的写零破坏：跳转 login 后 image 尾部
- * （ibuf+0x1EAE10 附近，≥ 数百字节）被清零。.text ≤ ~16.5KB 时
- * 雷区覆盖 .got/.bss 关键数据，导致 len 计算错误 → LOGIN-E01 误报；
- * .text ≥ ~17KB 时雷区落在 .rodata/logo 数据上无害。
- * 此填充把 .text 显式推入安全布局。根因修复登记 docs/STATUS.md DSK-E70，
- * 修复后应删除本函数。 */
-__attribute__((noinline, used)) static void dsk_e70_layout_guard(void) {
-    /* 1024B nop 序列，编译器不可消除 */
-    __asm__ volatile(
-        ".rept 341\n\tnop\n\tnop\n\tnop\n\t.endr\n"
-        ::: "memory");
-}
+/* [DSK-E70] 原布局 guard 已删除：内嵌模糊壁纸（~1.8MB 数据）将雷区
+ * （image+0x1EAE10 附近）整体吸收进壁纸像素区，写零不再可见/有害。 */
 
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
@@ -819,9 +827,6 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fb_p = ctx->framebuffer_pitch;
 
     logl("[login] framebuffer ready");
-
-    /* D 系列：登录界面之前的 ohMyLogo 开场（DEAICUP 莲花） */
-    logo_intro_screen((u32 *)(u64)fb_a);
 
     /* Get conf data from boot context (passed by DSK) */
     const u8 *conf_buf = (const u8 *)(u64)ctx->reserved[0];
@@ -863,8 +868,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
     u32 fg = TEXT_FG;
     u32 *fb = (u32 *)(u64)fb_a;
 
-    /* Fill background */
-    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
+    /* 背景：模糊化的桌面壁纸铺满全屏（卡片浮于其上） */
+    draw_blur_wallpaper(fb);
 
     /* Card position (centered) */
     i64 card_x = ((i64)fb_w - CARD_W) / 2;
@@ -938,10 +943,19 @@ void dsk_entry(const dsk_boot_context *ctx) {
             if (ok) {
                 logl("[login] password correct");
                 ((dsk_boot_context *)ctx)->reserved[2] = 1;
-                /* Show success message briefly */
+                /* "Login successful" + 卡片下方旋转加载圆圈：
+                 * DSK 在 login 返回后加载 desktop，圆圈给出加载反馈 */
                 draw_login_card(fb, card_x, card_y, pass, 0,
                                 "Login successful", 0xFF5FAF6Fu, fg);
-                for (int i = 0; i < 30; i++) delay_frame();
+                i64 scx = card_x + CARD_W / 2;
+                i64 scy = card_y + CARD_H + 40;
+                if (scy > (i64)fb_h - 30) scy = (i64)fb_h - 30;
+                for (int f = 0; f < 90; f++) {   /* ~3s，转 90/8 圈 */
+                    restore_wallpatch(fb, scx, scy, 30);  /* 清上一帧残迹 */
+                    draw_spinner(fb, scx, scy, f);
+                    delay_frame();
+                }
+                restore_wallpatch(fb, scx, scy, 30);      /* 停转后清干净 */
                 return;
             } else {
                 logl("[login] password wrong");

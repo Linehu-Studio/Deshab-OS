@@ -310,6 +310,22 @@ static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
     }
 }
 
+/* 模糊化的桌面壁纸（与 login 共用，构建期盒模糊 back.rgba） */
+#include "../login/back_blur_data.c"
+
+static void draw_blur_wallpaper(u32 *fb) {
+    for (i64 y = 0; y < (i64)fb_h; y++) {
+        u32 *line = (u32 *)((u8 *)fb + (u64)y * fb_p);
+        u64 sy = (u64)y * WALLPAPER_BLUR_H / fb_h;
+        const unsigned char *srow = g_wall_blur_rgba + sy * WALLPAPER_BLUR_W * 4;
+        for (i64 x = 0; x < (i64)fb_w; x++) {
+            u64 sx = (u64)x * WALLPAPER_BLUR_W / fb_w;
+            const unsigned char *px = srow + sx * 4;
+            line[x] = 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
+        }
+    }
+}
+
 static int rounded_rect_contains(i64 px, i64 py, i64 x, i64 y, i64 w, i64 h, i64 radius) {
     if (px < x || py < y || px >= x + w || py >= y + h) return 0;
     if (radius <= 0) return 1;
@@ -1444,7 +1460,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
     u32 bg = BG_MID, fg = TEXT_FG;
     i64 cx=(i64)fb_w/2, cy=(i64)fb_h/2;
     u32 *fb = (u32 *)(u64)fb_a;
-    fill_gradient_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h);
+    /* 背景：模糊化的桌面壁纸铺满全屏（向导卡片浮于其上） */
+    draw_blur_wallpaper(fb);
 
     /* fade out loading ring */
     logl("[FirstInit] fading out ring");

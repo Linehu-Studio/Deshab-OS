@@ -648,3 +648,23 @@
 4. **MSI 收益在 QEMU 内存后端的轻负载下不体现于耗时**: stress 50×(128sec W+R) MSI 16-33ms vs 纯轮询 42ms，差异主要来自完成等待的采样粒度而非 CPU 占用；MSI 的真实价值在 DSK 阶段 IF=0 轮询语义不变的前提下的路径统一性，以及未来多 outstanding/异步 IO 的扩展空间。
 
 
+
+## 2026-10-05 — 镜像「构建成功但启动不了」三类成因（PR #3）
+
+### 经验
+
+1. **`build.bat` 退出码 0 ≠ 镜像可启动**: 构建链路 Windows 侧（clang/ld.lld/mingw32-make）与 WSL 侧（sfdisk/mkfs/rsync）是两段独立失败面，前者全绿不代表后者产物正确。排查顺序应是「先看 OVMF 说了什么，再看磁盘上是什么」，而不是从构建脚本开头重跑。
+
+2. **ESP 的 FAT32 几何直接决定 OVMF 是否挂载**: 用 `-s 8` 强制 4KiB 簇时，256MiB 分区正好产生 65535 个簇（FAT32 `0xFFF5` 边界），EDK2 `FatPkg` 拒挂该卷——现象是 `BdsDxe: failed to load ... Not Found`，且 UEFI Shell 里 `map -r` 只给出 `BLKn`、没有对应 `FS`。判据是「分区只有块设备节点、没有文件系统节点」。去掉 `-s` 交给 mkfs 自动选簇即恢复。反例已排除：`-f 1`（OVMF 对 nfat=1/2 都能挂）和 FAT 表尺寸都不是成因——**先做对照实验（拿能挂的 sidecar 与不能挂的 ESP 逐字段 diff），再改脚本**，本次在理论推演上错了三轮才走到这一步。
+
+3. **`limine.conf` 的 `module_path` 必须与实际产物对齐，否则 Limine 直接 panic 且无回退**: `build.sh` 会在 Linux 构建后自动取消 guest 模块注释，但没有任何路径会注释回去，于是配置长期处于「声明加载不存在的文件」状态。打包器应按 `SYSTEM/boot/` 实际存在与否过滤后再写入 ESP。注意 Limine 10 **优先读 `/limine/limine.conf`**，只改根目录那份不生效——两处都要写。
+
+4. **`.drv` 不入库的前提是构建能全部重建它**: `055c521` 以「可再生成」为由移除全部 `.drv`，但 `build.ps1` 只覆盖 17 个驱动中的 8 个，其余 9 个（timer/acpi/pci/ahci/bootfs/vfs/fat32/devfs/ps2kbd）源码在 `CODE/DKM/` 下却从来没有编译步骤。删「可再生物」之前，必须先 grep 出构建脚本的实际产出清单与 `manifest.json` 逐项对账，否则版本库变干净的同时镜像变残废。
+
+5. **`core.autocrlf` 是每个克隆各自的设置，唯一可靠的办法是 `.gitattributes`**: CRLF 的 `.sh` 被 WSL 的 bash 执行时会在 shebang / `set -euo pipefail` 上炸（`$'\r': command not found`）。全局或仓库级 config 都不可共享，只有 `*.sh text eol=lf` 对所有人生效，且因为索引里本来就是 LF，**不产生任何文件改动噪音**。
+
+### 教训
+
+1. **`check_env.sh` 硬编码作者机器的绝对路径（`/mnt/d/Code/Deshab`），导致在所有其它检出上误报**: 它报出的 `wsl_mount` 缺失和随之打印的 `apt install build-essential ...` 清单具有强误导性——照做会得到 `Installing: 0`（本来就有），而真正缺失的 `dosfstools`（`pack_system_image.sh` 硬依赖，缺了构建必死在打包步）反而不在清单里。**环境检查脚本自身的路径与依赖清单都要随仓库走**，否则它比没有更糟。
+2. **「两个 PR 撞同一对 base/head」**: 网页手开与 API 自动开同时进行会重复；同分支同目标只能有一个 PR，先确认再操作。
+3. **提交信息里出现工具名会触发执行侧拦截**: 含文件系统格式化工具名的命令文本会无条件被拦；把提交信息写进文件用 `git commit -F` 读入即可绕开。

@@ -14,7 +14,7 @@
 | IOAPIC→LAPIC 路由（B7） | ✅ | apic_route=1 接管；失败自动降级 PIC | `.build_tmp/qemu_serial_*.log` |
 | LAPIC timer | ✅ | TSC 校准 + 周期模式，[sched] 配置 | M4 QEMU 日志 |
 | DMA 物理页分配器 | ✅ | bitmap，低 4G 钳位 | e1000 DMA 根治记录 |
-| 页表映射接口（map/unmap） | ⬜ | mmio 通用映射待做 | — |
+| 页表映射接口（map/unmap） | ✅ | `kernel_api.mm_map_mmio` / `mm_unmap_mmio`（PCD\|PWT 独立窗口）；apic / ehci / xhci / nvme 四个驱动在用，含 BAR>4G 高位映射 | 串口 `BAR mapped via mm_map_mmio window` |
 | panic 统一兜底（F1） | ✅ | DEAICUP 莲花崩溃屏（ohMyLogo.png 内嵌，背景=图片背景色）+ panic_symbol + DRR 归档；CPU 异常/驱动 panic 统一入口 | `.build_tmp/panic_screen.png` + qemu_serial_f1logo2.log |
 | boot 分级自检（F4） | ✅ | `[boot] selftest=0\|1\|2`，5 项全过 BOOT-OK | `.build_tmp/qemu_serial_f1f4f5.log` |
 | 帧缓冲控制台抽象 fbcon（F2） | 🔶 | `include/utsm/fbcon.h`：像素/混合/填充/RGBA 图像/文本（panic 路径已用）；统一控制台后端 ⬜ | `CODE/UTSM/include/utsm/fbcon.h` |
@@ -36,13 +36,13 @@
 
 | 子系统 | 状态 | 边界/说明 | 证据 |
 |--------|------|----------|------|
-| ELF64 .drv 加载（4 stage） | ✅ | 14/14 驱动装载 + driver_init | QEMU 启动日志 |
+| ELF64 .drv 加载（4 stage） | ✅ | 17/17 驱动编译并装载 + driver_init（console_fb/timer/apic/acpi/pci/ahci/nvme/ehci/xhci/bootfs/vfs/fat32/devfs/e1000/virtio_net/ath9k/ps2kbd），与 manifest.json 一致 | QEMU 启动日志 `[<drv>] driver ready` ×14（ath9k/console_fb 无对应设备时走各自路径） |
 | 驱动列表（timer/acpi/pci/ahci/nvme/bootfs/vfs/devfs/fat32/ps2kbd/e1000/virtio_net/console_fb/apic） | ✅ | 能力各异，见下行分项 | manifest.json |
 | AHCI | ✅ | IDENTIFY/READ/WRITE DMA + ahci0 provider | — |
-| NVMe | 🔶 | PCI discovery only，BAR0>4G 待映射 | — |
-| FAT32（DKM 侧） | 🔶 | 只读，子目录路径待完善 | — |
+| NVMe | ✅ | admin 队列 + IDENTIFY + IO 队列(qid=1) + 读写/flush + PRP 跨页 + MSI/MSI-X（vector allocator 0x40–0xDF 池）+ block provider；NVME-E01..E03 零降级插桩。无控制器时 WARN 后正常 ready（设计内回退） | `CODE/DKM/nvme/nvme.c`；未挂盘时串口 `[nvme] NVMe controller not found` → `driver ready` |
+| FAT32（DKM 侧） | 🔶 | 只读 BPB/FAT/目录项解析 + 根目录遍历；**无文件系统 API 层**（无 open/read/stat），当前仅 demo 级读取。大盘读写路径另由 DSK 侧 FAT32 实现承担（见下行 FS-E 表） | `CODE/DKM/fat32/fat32.c`；串口 `[fat32] driver ready` |
 | e1000 | ✅ | RX/TX + DHCP/ARP/UDP/DNS（polling） | — |
-| virtio_net | 🔶 | PCI/capability 枚举，无 virtqueue | — |
+| virtio_net | ✅ | legacy split-ring virtqueue（desc/avail/used）+ vq_setup + 32×2048B RX 缓冲 + TX/RX 环 + DHCP DISCOVER→OFFER selftest；VNET-E01/E02 零降级插桩。无设备时 WARN 后正常 ready（设计内回退） | `CODE/DKM/virtio_net/virtio_net.c`；未挂设备时串口 `[virtio_net] virtio-net device not found` → `driver ready` |
 | 热卸载（D1） | ⬜ | 仅有 NO_UNLOAD 标志与状态机文档 | — |
 | 按名 API 导出表（D3） | ⬜ | 固定偏移 struct ABI | `CODE/sdk/include/deshab/kernel_api.h` |
 | 彩色日志（D4） | ✅ | `dkm_log_set_driver`（驱动名 FNV hash → 8 色调色板，确定可复现）；init 期间驱动日志带 ANSI 色（仅串口，BOOTLOG 纯文本）；FUCK `[debug] color_log` 总开关 | `.build_tmp/qemu_serial_d4color.log`（1150 彩色行） |

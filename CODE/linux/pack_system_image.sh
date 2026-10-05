@@ -167,13 +167,17 @@ if [[ -z "$p1" || -z "$p2" ]]; then
     exit 1
 fi
 
-# 4KiB clusters on a ~5GiB ESP; 32KiB if the ESP is 4GiB or larger.
-fat_cluster_sectors=8
-if [[ "$esp_bytes" -ge $((4096 * 1024 * 1024)) ]]; then
-    fat_cluster_sectors=64
-fi
-
-mkfs.vfat -F 32 -n DESHABBOOT -s "$fat_cluster_sectors" "$p1" >/dev/null
+# 簇大小交给 mkfs.vfat 自动选择。
+#
+# 历史坑一：这里曾经强制 -s 8（4KiB 簇）。256MiB 的 ESP 恰好被算成 65535
+# 个簇（FAT32 的 0xFFF5 边界），该几何下 OVMF(EDK2 FatPkg) 拒挂该卷 ——
+# 现象是 BdsDxe "Not Found"，Shell 里分区只显示 BLKn、没有对应 FS。
+# 对照实验：sidecar（CODE/linux/make_sata_sidecar.sh）用不带 -s 的
+# mkfs.vfat 就一切正常，所以这里也不再手工指定簇大小。
+#
+# 历史坑二：不要加 -f 1。UEFI 规范建议 ESP 用单 FAT 表，但实测 OVMF 对
+# nfat=1/2 都能挂，加 -f 1 并不能解决上面的问题，反而偏离 sidecar 的行为。
+mkfs.vfat -F 32 -n DESHABBOOT "$p1" >/dev/null
 # DSK 内嵌 ext4 读写驱动支持范围：4K block / 256B inode / extent 树，
 # 不支持 journal、metadata_csum、64bit（遇到即 panic FS-E28）——
 # 因此这里必须显式关闭这三个 feature。
@@ -190,7 +194,54 @@ echo "[pack] copying p1 FAT32 ESP (EFI/ limine/ boot/ driver/ system/)"
 # vfat has no Unix owners/perms; -a would fail with rsync code 23.
 rsync -rltD --info=progress2 "$SYSTEM/EFI/" "$MNT_ESP/EFI/"
 rsync -rltD --info=progress2 "$SYSTEM/limine/" "$MNT_ESP/limine/"
-cp -f "$SYSTEM/limine/limine.conf" "$MNT_ESP/limine.conf"
+
+# limine.conf 的 Linux 兼容层 module_path 段必须与 SYSTEM/boot/ 的实际产物一致。
+# CODE/linux/build.sh 建完 Linux 内核会自动取消那几行注释，但没有任何地方会关回去；
+# 而 055c521 之后 .drv / Linux 产物都不入库，于是「注释开着但文件不存在」会让
+# Limine 直接 panic（Failed to open module ...），系统根本进不去。
+# 这里按实际存在的文件过滤后再写进 ESP —— 源文件 SYSTEM/limine/limine.conf 保持不动。
+#
+# 注意：Limine 10 优先读 ESP 上的 /limine/limine.conf（目录形式），其次才是
+# 根目录 /limine.conf。上面 rsync 已经把未过滤的原版拷进 /limine/ 了，所以
+# 两处都必须写过滤后的副本，否则改根目录那份不起作用。
+filter_limine_conf() {
+    local dst="$1"
+    python3 - "$SYSTEM/limine/limine.conf" "$SYSTEM/boot" "$dst" <<'PYEOF'
+import os, re, sys
+
+src, bootdir, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+# Linux/guest 内核段的 module_path（其它 module_path 靠路径前缀区分）
+GUEST_PREFIXES = ('/boot/linux-', '/boot/xj380.krl')
+
+lines = open(src, 'r', encoding='utf-8').read().splitlines(keepends=True)
+out, dropped, kept = [], [], []
+
+for line in lines:
+    m = re.match(r'^(\s*)module_path:\s*boot\(\):(\S+)\s*$', line)
+    if m and m.group(2).startswith(GUEST_PREFIXES):
+        host = os.path.join(bootdir, m.group(2).split('/boot/', 1)[1])
+        if os.path.exists(host):
+            kept.append(m.group(2))
+            out.append(line)
+        else:
+            # 产物不存在 → 注释掉，避免 Limine 加载失败 panic
+            out.append('%s# [pack] module missing on disk, disabled: %s' % (m.group(1), line))
+            dropped.append(m.group(2))
+    else:
+        out.append(line)
+
+open(dst, 'w', encoding='utf-8').write(''.join(out))
+for p in kept:
+    print('[pack]   limine module kept: %s' % p)
+for p in dropped:
+    print('[pack]   limine module DISABLED (file absent): %s' % p)
+PYEOF
+}
+
+mkdir -p "$MNT_ESP/limine"
+filter_limine_conf "$MNT_ESP/limine.conf"        # 根目录副本
+filter_limine_conf "$MNT_ESP/limine/limine.conf" # Limine 10 实际优先读的那份
+
 rsync -rltD --info=progress2 "$SYSTEM/boot/" "$MNT_ESP/boot/"
 rsync -rltD --info=progress2 "$SYSTEM/driver/" "$MNT_ESP/driver/"
 rsync -rltD --info=progress2 "$SYSTEM/system/" "$MNT_ESP/system/"

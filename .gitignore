@@ -24,3 +24,11 @@ target/
 .build_tmp/
 .trae/
 docs/workbuddy-planning/
+
+# IDE 配置（JetBrains 自动生成的 .idea/.gitignore 只覆盖了部分文件）
+.idea/*.iml
+.idea/inspectionProfiles/
+
+# 本地运行日志（如 run_qemu.bat > deshab_log.log 的串口输出）
+*.log
+deshab_log.log

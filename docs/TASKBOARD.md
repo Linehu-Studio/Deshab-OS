@@ -48,8 +48,8 @@
 
 ## 遗留工程债（Phase 存档，非五期编号）
 
-- [ ] Vector allocator / MSI-X
-- [ ] NVMe 高位 BAR MMIO（BAR0>4G）
-- [ ] virtio-net virtqueue RX/TX
-- [ ] FAT32 完整子目录路径解析（DKM 侧）
+- [x] Vector allocator / MSI-X（NVMe 使用 IDT 向量池 0x40–0xDF + MSI-X 表项编程）
+- [x] NVMe 高位 BAR MMIO（BAR0>4G，`mm_map_mmio` 独立窗口映射）
+- [x] virtio-net virtqueue RX/TX（legacy split-ring + DHCP selftest）
+- [ ] FAT32 文件系统 API 层（DKM 侧当前只有 BPB/目录 demo，无 open/read/stat）
 - [ ] DKM 零 warning + 统一 ABI 头

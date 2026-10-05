@@ -44,7 +44,7 @@
 | e1000 | ✅ | RX/TX + DHCP/ARP/UDP/DNS（polling） | — |
 | virtio_net | ✅ | legacy split-ring virtqueue（desc/avail/used）+ vq_setup + 32×2048B RX 缓冲 + TX/RX 环 + DHCP DISCOVER→OFFER selftest；VNET-E01/E02 零降级插桩。无设备时 WARN 后正常 ready（设计内回退） | `CODE/DKM/virtio_net/virtio_net.c`；未挂设备时串口 `[virtio_net] virtio-net device not found` → `driver ready` |
 | 热卸载（D1） | ⬜ | 仅有 NO_UNLOAD 标志与状态机文档 | — |
-| 按名 API 导出表（D3） | ⬜ | 固定偏移 struct ABI | `CODE/sdk/include/deshab/kernel_api.h` |
+| 按名 API 导出表（D3） | ✅ | `dkm_kapi_table`（magic/version/count/entries/lookup）挂在 `kernel_api->kapi` 尾部（ABI 兼容追加）；14 条按名导出（log.*/dma.alloc_pages/irq.register/irq.vector_*/mm.map_mmio/mm.unmap_mmio/apic.register_eoi/drr.*/utrw.debug_dump）；selftest 含正例调用 + 未命中负例 + TST-E21..E24 插桩 | `CODE/UTSM/dkm/kernel_api.c` + `test/utsm_selftest.c`（需 FUCK `[boot] selftest=2` 才执行该段） |
 | 彩色日志（D4） | ✅ | `dkm_log_set_driver`（驱动名 FNV hash → 8 色调色板，确定可复现）；init 期间驱动日志带 ANSI 色（仅串口，BOOTLOG 纯文本）；FUCK `[debug] color_log` 总开关 | `.build_tmp/qemu_serial_d4color.log`（1150 彩色行） |
 
 ## DSK 主内核 / 用户态
@@ -52,7 +52,7 @@
 | 子系统 | 状态 | 边界/说明 | 证据 |
 |--------|------|----------|------|
 | 启动 Logo（静态莲花） | ✅ | 旋转加载环已移除 | QEMU 现象 |
-| FirstInit 向导 | 🔶 | 输入+SHA256+写盘闭环；按键崩溃未复现（B6） | `.build_tmp/qemu_serial_b6.log` |
+| FirstInit 向导 | ✅ | 输入+SHA256+写盘闭环；**联网不是进系统的前置条件**：检测到无无线设备直接跳过网络页，有设备时提供 Skip 按钮（渲染+鼠标+键盘三路），Connect 仍为零降级 NET-E01 panic | `.build_tmp/d2.log`（`no wireless device; skipping network setup page` → `USER.CONF` → login → desktop）|
 | 可跳过 FirstInit（F5） | ✅ | `[dsk] skip_firstinit=1` 直达 desktop，跳过向导与登录 | `.build_tmp/qemu_serial_f1f4f5.log` |
 | mouseInit（PS/2 鼠标） | ✅ | IRQ12 + 包解码 + 光标（M1） | `.build_tmp/qemu_serial_mouse.log` |
 | desktop.elf | ✅ | 三页面+窗口+任务栏+双缓冲；打字机效果已删（整屏一次绘制）；DSK-E01 fatal 插桩 | — |
@@ -81,7 +81,9 @@
 | 项 | 状态 | 说明 | 证据 |
 |----|------|------|------|
 | ext4 读写驱动（CODE/dsk/ext4.c） | ✅ | GPT 定位 p2 + feature 校验 + extent 树(depth0/1)读写 + 块/inode 分配回收 + 目录项插入 + 写后回读校验；启动自检 PASS | `.build_tmp/qemu_run.log`（[EXT4] selftest PASS） |
-| FAT32 大盘写修复 | ✅ | 按需 FAT 表项 RMW（fat32_fat_read/write_entry）+ 块状空闲簇扫描（fat32_find_free_cluster）；修复 rec_len +4 收缩偏移与 chunk 对齐两处错位 | 同上（USER.CONF verify ok → firstInit.txt flip ok） |
+| FAT32 大盘写修复 | ✅ | 按需 FAT 表项 RMW（fat32_fat_read/write_entry）+ 块状空闲簇扫描（fat32_find_free_cluster）；修复 rec_len +4 收缩偏移与 chunk 对齐两处错位；**根目录链满时自动扩展**（分配新簇挂链尾后写条目，不再直接 `-4` no free dir entry）| 同上（USER.CONF verify ok → firstInit.txt flip ok）|
+| ESP 簇大小（打包侧） | ✅ | `-s 4`（2KiB 簇 / 64 目录项）固定：避开 `spc=8` 的 65535 簇 OVMF 拒绝边界，也避开 `spc=16` 的 FAT32 下限，同时给 ESP 根目录留出 64 项余量（`spc=1` 只有 16 项，打包内容正好塞满导致首次启动写 USER.CONF 必失败）| `CODE/linux/pack_system_image.sh`；`.build_tmp/d2.log` |
+| 中文字体位图字库（.dbf） | ✅ | `build.ps1` 调用 `CODE/font/mkfont.py` 由 `simhei.ttf` 生成 `simhei_16.dbf` / `simhei_24.dbf`（GB2312+ASCII）；此前无人生成，桌面必 panic DESK-E04 FONT PACK MISSING | `.build_tmp/d2.log`（`[zhfont] dbf loaded (16px ok)` → `desktop ready`）|
 | FS-E01..E07 / FS-E2x / FS-E3x 插桩 | ✅ | 写失败/校验不符/feature 不支持/路径缺失 → 莲花 panic 零降级 | `.build_tmp/qemu_run.log`（FS-E02/E06/E22 复现） |
 | 向导后强制重登 | ✅ | first-boot 分支 FirstInit→persist→login；登录跳过/失败 → FS-E06 panic | 同上（login success → desktop ready） |
 | NET-E01 网络页 Connect panic | ✅ | 无 wlan 栈，Connect 即 panic；Save(仅存配置) 为唯一前进路径 | 同上（NET-E01 复现，fb pmemsave 确认莲花屏） |

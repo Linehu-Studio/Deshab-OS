@@ -793,6 +793,55 @@ if (Test-Path $GenTex) {
         }
     }
 }
+# Generate CJK bitmap font packs (.dbf) for the desktop / login / FirstInit.
+# CODE/font/mkfont.py renders a TTF (GB2312 + ASCII by default) into the packed
+# .dbf format read by CODE/font/dbf.h. Same class of artifact as the textures
+# above: generated, gitignored (*.dbf), and therefore MUST be produced here —
+# nothing else in the build regenerates it. Without it the desktop panics with
+# DESK-E04 FONT PACK MISSING ([f32io] read_to rc=-3 on system/font/simhei_16.dbf).
+$GenFont  = Join-Path $Root 'CODE\font\mkfont.py'
+$FontTtf  = Join-Path $SystemDir 'system\font\simhei.ttf'
+if ((Test-Path $GenFont) -and (Test-Path $FontTtf)) {
+    $fontPacks = @(
+        @{ Name = 'simhei_16.dbf'; Size = 16 },
+        @{ Name = 'simhei_24.dbf'; Size = 24 }
+    )
+    $fontTodo = @()
+    foreach ($fp in $fontPacks) {
+        $out = Join-Path $SystemDir ("system\font\" + $fp.Name)
+        if (-not (Test-Path $out) -or
+            ((Get-Item $FontTtf).LastWriteTime -gt (Get-Item $out).LastWriteTime)) {
+            $fontTodo += ,@($fp.Name, $fp.Size, $out)
+        }
+    }
+    if ($fontTodo.Count -gt 0) {
+        Write-Host "[build] Generating CJK bitmap fonts ($($fontTodo.Count) pack(s))..."
+        $Python = $null
+        foreach ($p in @('python', 'python3',
+                         'C:\msys64\mingw64\bin\python.exe')) {
+            try { $cmd = Get-Command $p -ErrorAction Stop; $Python = $cmd.Source; break } catch {}
+        }
+        foreach ($job in $fontTodo) {
+            $fname = $job[0]; $fsize = $job[1]; $fout = $job[2]
+            $ok = $false
+            if ($Python) {
+                & $Python $GenFont $FontTtf $fsize $fout
+                if ($LASTEXITCODE -eq 0) { $ok = $true }
+            }
+            if (-not $ok) {
+                # Fallback: WSL python3 (has Pillow on this machine)
+                $py = ($GenFont -replace '^([A-Za-z]):', '/mnt/$1')
+                $tt = ($FontTtf -replace '^([A-Za-z]):', '/mnt/$1')
+                $ou = ($fout    -replace '^([A-Za-z]):', '/mnt/$1')
+                & wsl python3 $py $tt $fsize $ou
+                if ($LASTEXITCODE -eq 0) { $ok = $true }
+            }
+            if (-not $ok) {
+                Write-Host "[build] WARNING: font pack generation failed: $fname (desktop will panic DESK-E04)"
+            }
+        }
+    }
+}
 try {
     & $make -C "$DskDir" -f MAKEFILE "CC=$clang" "LD=$lld"
     if ($LASTEXITCODE -ne 0) {

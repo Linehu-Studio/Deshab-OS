@@ -1132,7 +1132,8 @@ static void draw_wifi_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int r
 #define NET_ACT_PASS      5
 #define NET_ACT_SAVE      6
 #define NET_ACT_CONNECT   7
-#define NET_ACT_COUNT     8
+#define NET_ACT_SKIP      8
+#define NET_ACT_COUNT     9
 
 static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int active, i64 mx, i64 my, u32 bg, u32 fg) {
     u32 card = CARD_BG;
@@ -1167,6 +1168,13 @@ static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net,
         stroke_rounded_rect(fb, card_x + 680, card_y + 310, 180, 44, 3, 1, active == NET_ACT_CONNECT ? 0xFF6A8AAA : 0xFF404060);
         fb_text(fb, "Connect", card_x + 725, card_y + 322, 0xFFE0E0E0, btn_bg);
     }
+    /* 跳过按钮：联网从不是进系统的前置条件，任何时刻都必须有退路。 */
+    {
+        u32 btn_bg = active == NET_ACT_SKIP ? 0xFF45454A : 0xFF303034;
+        fill_rounded_rect(fb, card_x + 890, card_y + 310, 150, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 890, card_y + 310, 150, 44, 3, 1, active == NET_ACT_SKIP ? 0xFF6C6C72 : 0xFF38383C);
+        fb_text(fb, "Skip", card_x + 935, card_y + 322, 0xFFB0B0B8, btn_bg);
+    }
 
     /* 状态提示 */
     if (net->connected) {
@@ -1178,6 +1186,7 @@ static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net,
     }
     fb_text(fb, "Save=save config only", card_x + 470, card_y + 510, 0xFF606068, card);
     fb_text(fb, "Connect=save and connect", card_x + 470, card_y + 535, 0xFF606068, card);
+    fb_text(fb, "Skip=set up network later", card_x + 470, card_y + 560, 0xFF606068, card);
 
     cursor_draw(fb, mx, my);
 }
@@ -1254,6 +1263,14 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                     for (int i=0;i<30;i++) delay_frame();
                     return;
                 }
+                /* 跳过按钮：不配网络直接进系统（网络留到以后） */
+                if (*mx >= card_x + 890 && *mx < card_x + 1040 && *my >= card_y + 310 && *my < card_y + 354) {
+                    net->connected = 0;
+                    logl("[FirstInit] network setup skipped by user");
+                    redraw_network_card(fb, card_x, card_y, net, NET_ACT_SKIP, *mx, *my, bg, fg);
+                    for (int i=0;i<30;i++) delay_frame();
+                    return;
+                }
             }
             prev_btns = btns;
             continue;
@@ -1297,6 +1314,13 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
                 net->connected = 1;
                 logl("[FirstInit] network connect requested");
+                redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
+                for (int i=0;i<30;i++) delay_frame();
+                return;
+            } else if (active == NET_ACT_SKIP) {
+                /* 不配网络直接进系统（网络留到以后） */
+                net->connected = 0;
+                logl("[FirstInit] network setup skipped by user");
                 redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                 for (int i=0;i<30;i++) delay_frame();
                 return;
@@ -1607,13 +1631,20 @@ void dsk_entry(const dsk_boot_context *ctx) {
     net.connected = 0;
     net.ssid[0] = 0;
     net.password[0] = 0;
-    /* 始终显示网络设置页面，即使无无线设备也展示页面让用户确认 */
-    cursor_bg_valid = 0;
-    cursor_cur_x = -100;
-    cursor_cur_y = -100;
-    logl("[FirstInit] entering network setup page");
-    read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
-    logl("[FirstInit] network setup page returned");
+    /* 无无线设备则直接跳过网络页：联网从来不是进系统的前置条件，
+     * 让用户在一个没有任何可选网络的页面上只能按 Save（或误按 Connect 吃
+     * NET-E01 panic）是设计缺陷。有设备时仍展示页面供确认/配置。 */
+    if (g_no_wireless_device) {
+        logl("[FirstInit] no wireless device; skipping network setup page");
+        net.connected = 0;
+    } else {
+        cursor_bg_valid = 0;
+        cursor_cur_x = -100;
+        cursor_cur_y = -100;
+        logl("[FirstInit] entering network setup page");
+        read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+        logl("[FirstInit] network setup page returned");
+    }
     build_user_conf(pc, user, pass, &prefs, &net);
 
     /* Pass config buffer to DSK via boot context reserved fields */

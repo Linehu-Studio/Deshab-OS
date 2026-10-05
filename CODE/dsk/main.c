@@ -950,7 +950,86 @@ static int fat32_write_root_file(const char *name11, const u8 *data, u32 size) {
         }
     } else {
         /* Allocate new clusters */
-        if (free_entry < 0) { logl("[DSK] fat32 write: no free dir entry"); return -4; }
+        if (free_entry < 0) {
+            /* 根目录链里没有空位 —— 按 FAT32 规范扩展目录链：分配一个新簇，
+             * 挂到根目录链尾，在新簇的第一个条目里放目录项。（原来这里直接
+             * return -4，导致 ESP 根目录一簇写满后 USER.CONF 永远写不进去。） */
+            u32 tail = root_clus;
+            if (tail < 2) { logl("[DSK] fat32 write: bad root cluster"); return -4; }
+            for (;;) {
+                u32 nxt = fat32_fat_read_entry(fat_byte_off, tail);
+                if (nxt >= 2 && nxt < 0x0FFFFFF8) { tail = nxt; continue; }
+                break;
+            }
+            u32 newdir = fat32_find_free_cluster(fat_byte_off, (fat_sectors * 512) / 4);
+            if (newdir == 0) { logl("[DSK] fat32 write: no free cluster for dir growth"); return -3; }
+            if (fat32_fat_write_entry(fat_byte_off, newdir, 0x0FFFFFF8) != 0) return -7;
+            if (fat32_fat_write_entry(fat_byte_off, tail, newdir) != 0) return -7;
+            logh("[DSK] fat32 write: root dir grown, new clus=", newdir);
+
+            /* 新簇整簇清零（0x00 = 目录结束标记），再把目录项写在首项 */
+            u8 *nb = g_cluster;
+            for (u32 b = 0; b < cluster_bytes; b++) nb[b] = 0;
+            fat32_de *nd = (fat32_de *)nb;
+            for (int i = 0; i < 11; i++) nd[0].name[i] = name11[i];
+            nd[0].attr = 0x20;
+            nd[0].ntr = 0; nd[0].ctenth = 0; nd[0].ctime = 0; nd[0].cdate = 0;
+            nd[0].adate = 0; nd[0].wtime = 0; nd[0].wdate = 0;
+
+            /* 数据簇先分配好，再填进目录项（与下方 !found 分支同序） */
+            u32 dfirst = 0, dprev = 0;
+            for (u32 i = 0; i < clusters_needed; i++) {
+                u32 newc = fat32_find_free_cluster(fat_byte_off, (fat_sectors * 512) / 4);
+                if (newc == 0) { logl("[DSK] fat32 write: no free clusters"); return -3; }
+                logh("[DSK] fat32 write: alloc clus=", newc);
+                if (fat32_fat_write_entry(fat_byte_off, newc, 0x0FFFFFF8) != 0) return -7;
+                if (i == 0) dfirst = newc;
+                if (dprev >= 2) {
+                    if (fat32_fat_write_entry(fat_byte_off, dprev, newc) != 0) return -7;
+                }
+                dprev = newc;
+            }
+            nd[0].chigh = (u16)((dfirst >> 16) & 0xFFFF);
+            nd[0].clow = (u16)(dfirst & 0xFFFF);
+            nd[0].fsize = size;
+
+            u32 nlba = data_lba + (newdir - 2) * spc;
+            if (fat32_write_sectors(nlba, spc, nb) != 0) {
+                logl("[DSK] fat32 write: new dir cluster write failed");
+                return -8;
+            }
+
+            /* 写数据簇 */
+            u32 rem2 = size;
+            const u8 *s2 = data;
+            u32 c2 = dfirst;
+            u32 ci2 = 0;
+            while (c2 >= 2 && c2 < 0x0FFFFFF8 && ci2 < clusters_needed) {
+                u32 clba2 = data_lba + (c2 - 2) * spc;
+                u32 chunk2 = rem2 < cluster_bytes ? rem2 : cluster_bytes;
+                if (fat32_read_sectors(clba2, spc, g_cluster) != 0) return -5;
+                for (u32 b = 0; b < chunk2; b++) g_cluster[b] = s2[b];
+                for (u32 b = chunk2; b < cluster_bytes; b++) g_cluster[b] = 0;
+                if (fat32_write_sectors(clba2, spc, g_cluster) != 0) return -6;
+                s2 += chunk2; rem2 -= chunk2; ci2++;
+                c2 = fat32_fat_read_entry(fat_byte_off, c2);
+            }
+
+            /* FAT 表写回（与下方第 6 步同逻辑：只写 g_disk 缓冲覆盖得到的那些 FAT 副本） */
+            {
+                u32 max_fat_sectors_in_buffer = (256 - fat_lba) / fat_sectors;
+                if (max_fat_sectors_in_buffer > bpb->fc) max_fat_sectors_in_buffer = bpb->fc;
+                for (u32 f = 0; f < max_fat_sectors_in_buffer; f++) {
+                    u32 flba = fat_lba + f * fat_sectors;
+                    u32 sectors_to_write = fat_sectors;
+                    if (flba + sectors_to_write > 256) sectors_to_write = 256 - flba;
+                    if (sectors_to_write > 0 && flba < 256) {
+                        if (fat32_write_sectors(flba, sectors_to_write, disk + (u64)flba * 512) != 0) return -7;
+                    }
+                }
+            }
+            return 0;   /* 已自行完成写入，跳过下方通用路径 */
+        }
         for (u32 i = 0; i < clusters_needed; i++) {
             u32 newc = fat32_find_free_cluster(fat_byte_off, (fat_sectors * 512) / 4);
             if (newc == 0) { logl("[DSK] fat32 write: no free clusters"); return -3; }

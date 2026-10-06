@@ -26,11 +26,23 @@ int g_tb2_vol_rect[4];
 int g_tb2_pwr_rect[4];
 int g_tb2_clk_rect[4];
 
+/* ---- M3: 开始菜单状态与命中矩形 ---- */
+int  g_start_menu_open = 0;
+int  g_tb2_sm_shutdown_rect[4];
+int  g_tb2_sm_restart_rect[4];
+static int g_tb2_sm_panel[4];       /* 面板整体（吞掉面板内空白点击） */
+
 #define TB_H      48
 #define TB_BOTTOM_GAP 8
 #define TB_BTN    40             /* 开始/任务视图/托盘钮边长 */
 #define TB_APPBTN 44             /* 应用钮边长 */
 #define TB_PAD    8              /* 条内边距 */
+
+/* 开始菜单面板尺寸 */
+#define SM_W      320
+#define SM_H      176
+#define SM_ROW_H  44
+#define SM_GAP    8
 
 static const wf_theme *tb_theme(void) { return &g_wf_light; }
 
@@ -73,6 +85,60 @@ static wf_btn_state tb_hover_state(const int r[4]) {
         g_mouse_y >= r[1] && g_mouse_y < r[1] + r[3])
         return WF_BTN_HOVER;
     return WF_BTN_NORMAL;
+}
+
+/* ---- M3: 开始菜单面板 ----
+ * 面板贴在任务栏上方，左对齐开始按钮。含两个电源项（Shutdown / Restart），
+ * 复用 CODE/shell 里已验证的原语：
+ *   Restart = 8042 复位线（outb(0x64,0xFE)）
+ *   Shutdown = hlt 死循环（与 shell 的 halt 语义一致） */
+static void tb_sm_row(int x, int y, int w, const char *label, int r[4]) {
+    const wf_theme *t = tb_theme();
+    r[0] = x; r[1] = y; r[2] = w; r[3] = 32;
+    int hot = (g_mouse_x >= x && g_mouse_x < x + w &&
+               g_mouse_y >= y && g_mouse_y < y + 32);
+    du_wf_list_item(&g_fb, x, y, w, label, t, hot, 0);
+}
+
+static void tb_start_menu_draw(void) {
+    const wf_theme *t = tb_theme();
+    int W = (int)g_fb_w, H = (int)g_fb_h;
+    int by = H - TB_H - TB_BOTTOM_GAP;
+
+    int px = g_tb2_start_rect[0];
+    int py = by - SM_H - SM_GAP;
+    if (px + SM_W > W) px = W - SM_W;
+    if (px < 0) px = 0;
+    if (py < 0) py = 0;
+
+    g_tb2_sm_panel[0] = px; g_tb2_sm_panel[1] = py;
+    g_tb2_sm_panel[2] = SM_W; g_tb2_sm_panel[3] = SM_H;
+
+    du_wf_card(&g_fb, px, py, SM_W, SM_H, 232, t);
+
+    int x = px + 8, w = SM_W - 16;
+    int y = py + 8;
+    tb_sm_row(x, y, w, "Shutdown", g_tb2_sm_shutdown_rect);
+    y += 32 + 4;
+    tb_sm_row(x, y, w, "Restart",  g_tb2_sm_restart_rect);
+}
+
+/* 返回 1 = 事件已消费 */
+static int tb_start_menu_click(int mx, int my) {
+    if (rect_hit(g_tb2_sm_shutdown_rect, mx, my)) {
+        slog("[taskbar] shutdown from start menu");
+        /* 与 shell cmd_halt 同语义：停 CPU */
+        for (;;) __asm__ volatile("hlt");
+    }
+    if (rect_hit(g_tb2_sm_restart_rect, mx, my)) {
+        slog("[taskbar] restart from start menu");
+        /* 与 shell cmd_reboot 同语义：8042 复位线 */
+        outb(0x64, 0xFE);
+        for (;;) __asm__ volatile("hlt");
+    }
+    /* 面板内空白：吞掉点击，不落到桌面 */
+    if (rect_hit(g_tb2_sm_panel, mx, my)) return 1;
+    return 0;
 }
 
 /* ============================================================
@@ -195,6 +261,9 @@ void taskbar_draw(void) {
     }
     g_tb2_tray_rect[0] = tx; g_tb2_tray_rect[1] = by;
     g_tb2_tray_rect[2] = tray_w; g_tb2_tray_rect[3] = TB_H;
+
+    /* ---- M3: 开始菜单面板（叠加在任务栏之上，最后绘制） ---- */
+    if (g_start_menu_open) tb_start_menu_draw();
 }
 
 /* ============================================================
@@ -202,9 +271,13 @@ void taskbar_draw(void) {
  * ============================================================ */
 
 int taskbar_click(int mx, int my) {
+    /* M3：菜单打开时先给它（面板/菜单项优先于任务栏与桌面） */
+    if (g_start_menu_open && tb_start_menu_click(mx, my)) return 1;
     /* 主任务栏 */
     if (rect_hit(g_tb2_start_rect, mx, my)) {
-        slog("[taskbar] start button (start menu: M3)");
+        g_start_menu_open = !g_start_menu_open;
+        slog(g_start_menu_open ? "[taskbar] start menu opened"
+                               : "[taskbar] start menu closed");
         return 1;
     }
     if (rect_hit(g_tb2_tv_rect, mx, my)) {
@@ -227,7 +300,7 @@ int taskbar_click(int mx, int my) {
     }
     /* 托盘 */
     if (rect_hit(g_tb2_pwr_rect, mx, my)) {
-        g_quit = 1;                       /* M7：电源菜单（睡眠/重启/关机） */
+        g_start_menu_open = !g_start_menu_open;   /* M3：电源钮弹开始菜单（含 Shutdown/Restart） */
         return 1;
     }
     if (rect_hit(g_tb2_net_rect, mx, my)) {

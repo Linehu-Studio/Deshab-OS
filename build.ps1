@@ -1038,6 +1038,7 @@ Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir 'driver\net\ath9k.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\wlan\wlan.c') (Join-Path $SystemDir 'driver\net\wlan.drv')
 
 # stage3: input — ps2kbd 注册 IRQ1。
 Write-Host '[build] Building DKM input drivers...'

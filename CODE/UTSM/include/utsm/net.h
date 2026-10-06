@@ -38,6 +38,12 @@ typedef int (*dkm_net_scan_count_fn)(void *ctx);
 typedef int (*dkm_net_scan_result_fn)(void *ctx, u32 n, dkm_net_scan_result *out);
 typedef int (*dkm_net_is_wireless_fn)(void *ctx);
 
+/* 无线关联回调（wlan 驱动填；实施 802.11 认证/关联 + WPA 握手）。
+ * connect: ssid/password 关联请求，返回 0 = 已关联。
+ * disconnect: 解除关联。 */
+typedef int (*dkm_net_connect_fn)(void *ctx, const char *ssid, const char *password);
+typedef int (*dkm_net_disconnect_fn)(void *ctx);
+
 typedef struct dkm_net_device_desc {
     const char *name;
     u8 mac[6];
@@ -50,6 +56,9 @@ typedef struct dkm_net_device_desc {
     dkm_net_scan_count_fn   scan_count;
     dkm_net_scan_result_fn  scan_result;
     dkm_net_is_wireless_fn  is_wireless;
+    /* 关联扩展（尾部追加，ABI 兼容）。 */
+    dkm_net_connect_fn      connect;
+    dkm_net_disconnect_fn   disconnect;
 } dkm_net_device_desc;
 
 typedef struct dkm_net_device_info {
@@ -79,6 +88,9 @@ typedef struct dkm_net_api {
     int (*scan_count)(u32 index);
     int (*scan_result)(u32 index, u32 n, dkm_net_scan_result *out);
     int (*is_wireless)(u32 index);
+    /* 无线关联（dispatch 到 wlan 驱动回调；尾部追加，ABI 兼容）。 */
+    int (*connect)(u32 index, const char *ssid, const char *password);
+    int (*disconnect)(u32 index);
     /* 网络统计查询（返回 0 成功，-1 索引越界）。 */
     int (*device_stats)(u32 index, dkm_net_stats *out);
 } dkm_net_api;

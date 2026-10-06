@@ -107,6 +107,9 @@ struct dkm_net_device_desc {
     int (*scan_count)(void *ctx);
     int (*scan_result)(void *ctx, u32 n, struct dkm_net_scan_result *out);
     int (*is_wireless)(void *ctx);
+    /* 关联扩展（尾部追加，ABI 兼容；与 UTSM/include/utsm/net.h 布局一致）。 */
+    int (*connect)(void *ctx, const char *ssid, const char *password);
+    int (*disconnect)(void *ctx);
 };
 
 struct dkm_net_stats {
@@ -128,6 +131,8 @@ struct dkm_net_api {
     int (*scan_count)(u32 index);
     int (*scan_result)(u32 index, u32 n, struct dkm_net_scan_result *out);
     int (*is_wireless)(u32 index);
+    int (*connect)(u32 index, const char *ssid, const char *password);
+    int (*disconnect)(u32 index);
     int (*device_stats)(u32 index, struct dkm_net_stats *out);
 };
 

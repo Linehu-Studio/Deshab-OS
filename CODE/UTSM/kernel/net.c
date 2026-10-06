@@ -102,6 +102,25 @@ static int net_is_wireless_impl(u32 index) {
     return (dev->flags & DKM_NET_F_WIRELESS) ? 1 : 0;
 }
 
+static int net_connect_impl(u32 index, const char *ssid, const char *password) {
+    if (index >= g_net_device_count) return -2;
+    const dkm_net_device_desc *dev = &g_net_devices[index];
+    /* 严格错误策略：无线设备未提供关联回调 = 驱动后端未实现，零降级 panic */
+    if (!dev->connect)
+        panic_full("NET-E20 WLAN CONNECT NOT SUPPORTED",
+                   "wireless netdev has no connect backend (native chip driver pending)", 0);
+    return dev->connect(dev->ctx, ssid, password);
+}
+
+static int net_disconnect_impl(u32 index) {
+    if (index >= g_net_device_count) return -2;
+    const dkm_net_device_desc *dev = &g_net_devices[index];
+    if (!dev->disconnect)
+        panic_full("NET-E21 WLAN DISCONNECT NOT SUPPORTED",
+                   "wireless netdev has no disconnect backend (native chip driver pending)", 0);
+    return dev->disconnect(dev->ctx);
+}
+
 /* 统计查询：返回驱动层累计的收发统计。
  * 严格错误策略插桩：全零统计占位 = 向上层谎报"网卡零流量"，
  * 零降级 panic（NETST-E01）。驱动层统计区接入（driver_ctx 共享统计）
@@ -127,6 +146,8 @@ static const dkm_net_api g_net_api = {
     .scan_count = net_scan_count_impl,
     .scan_result = net_scan_result_impl,
     .is_wireless = net_is_wireless_impl,
+    .connect = net_connect_impl,
+    .disconnect = net_disconnect_impl,
     .device_stats = net_device_stats_impl
 };
 

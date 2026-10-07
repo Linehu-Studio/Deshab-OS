@@ -38,7 +38,7 @@ static int g_tb2_sm_panel[4];       /* 面板整体（吞掉面板内空白点�
 #define TB_APPBTN 44             /* 应用钮边长 */
 #define TB_PAD    8              /* 条内边距 */
 
-/* ---- 开始菜单：宽度固定 320，高度由内容推导 ----
+/* ---- 开始菜单：宽度固定 200，高度由内容推导 ----
  * 菜单项就在这里加/删，高度与命中矩形自动跟着变。 */
 static const char *const g_sm_items[] = { "Shutdown", "Restart" };
 #define SM_NITEMS  ((int)(sizeof(g_sm_items) / sizeof(g_sm_items[0])))

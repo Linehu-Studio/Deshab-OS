@@ -152,10 +152,13 @@ static int tb_start_menu_click(int mx, int my) {
     if (rect_hit(g_tb2_sm_restart_rect, mx, my)) {
         slog("[taskbar] restart from start menu");
         /* 与 CODE/shell cmd_reboot 完全同序（含 int3 兜底 —— 8042 复位未生效时
-         * 由异常路径触发 panic 复位），并在发复位前等 8042 输入缓冲空，
-         * 避免在桌面有 IRQ/APIC 路由的状态下复位线被吃掉而卡死。 */
-        for (int i = 0; i < 1000000; i++) {
+         * 由异常路径触发 panic 复位）。发复位前等 8042 输入缓冲空：桌面状态下
+         * APIC/IRQ 已在跑，不等待直接写 0x64 的复位线可能被吃掉而卡死。
+         * 有界等待而不是死循环：最多自旋 100k 次，每次 pause 让出流水线；
+         * 真超时也照样发复位线，由 int3 兜底。 */
+        for (int i = 0; i < 100000; i++) {
             if (!(inb(0x64) & 0x02)) break;
+            __asm__ volatile("pause");
         }
         outb(0x64, 0xFE);
         __asm__ volatile("int $0x03");

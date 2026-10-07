@@ -939,6 +939,38 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 continue;
             }
             logl("[login] verifying password");
+            /* 先给用户反馈再算：verify_password 是 SHA256 派生 + 解密比对，
+             * 慢环境下要几百毫秒，不提示会像卡死。
+             * 浮在登录卡片正中的独立提示层（不占用卡片本身的文案区）。
+             * 关键：先作废光标背景备份，否则光标下次 cursor_restore_bg()
+             * 会把浮层画上去之前的旧背景贴回来，在浮层上挖出一个洞。 */
+            {
+                g_cursor_saved = 0;
+                const char *tip = "Logging in...";
+                i64 tw = (i64)(sizeof("Logging in...") - 1) * ASCII_STEP;  /* 12 字符 */
+                i64 bw = tw + 56, bh = 56;
+                i64 bx = card_x + (CARD_W - bw) / 2;
+                i64 by = card_y + (CARD_H - bh) / 2;               /* 卡片正中 */
+                /* 半透明遮罩压暗底下的卡片（含阴影外扩 24px），再画提示框 */
+                for (i64 r = -24; r < CARD_H + 24; r++) {
+                    i64 yy = card_y + r;
+                    if (yy < 0 || (u64)yy >= fb_h) continue;
+                    u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+                    for (i64 c = -24; c < CARD_W + 24; c++) {
+                        i64 xx = card_x + c;
+                        if (xx < 0 || (u64)xx >= fb_w) continue;
+                        u32 px = line[(u64)xx];
+                        /* 压暗到 25%：每通道取高 6 位后右移 2 位 */
+                        u32 dim = ((px >> 2) & 0x3F3F3Fu) | 0xFF000000u;
+                        line[(u64)xx] = dim;
+                    }
+                }
+                fill_rounded_rect(fb, bx, by, bw, bh, 10, 0xFF30303Au);
+                stroke_rounded_rect(fb, bx, by, bw, bh, 10, 1, 0xFF6A6A78u);
+                fb_text(fb, tip, bx + 28, by + (bh - ASCII_H) / 2, 0xFFE8E8F0, 0xFF30303Au);
+                g_cursor_old_x = -100;   /* 让下次光标重画到当前位置 */
+                g_cursor_old_y = -100;
+            }
             int ok = verify_password(conf_buf, conf_size, pass);
             if (ok) {
                 logl("[login] password correct");

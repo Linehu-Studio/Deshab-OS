@@ -38,11 +38,21 @@ static int g_tb2_sm_panel[4];       /* 面板整体（吞掉面板内空白点�
 #define TB_APPBTN 44             /* 应用钮边长 */
 #define TB_PAD    8              /* 条内边距 */
 
-/* 开始菜单面板尺寸 */
-#define SM_W      320
-#define SM_H      176
-#define SM_ROW_H  44
-#define SM_GAP    8
+/* ---- 开始菜单：宽度固定 320，高度由内容推导 ----
+ * 菜单项就在这里加/删，高度与命中矩形自动跟着变。 */
+static const char *const g_sm_items[] = { "Shutdown", "Restart" };
+#define SM_NITEMS  ((int)(sizeof(g_sm_items) / sizeof(g_sm_items[0])))
+
+#define SM_W       200                                 /* 面板宽度（固定） */
+#define SM_PAD     14                                  /* 面板上下内边距 */
+#define SM_ROW_GAP 4                                   /* 行间距 */
+#define SM_ROW_H   ((int)DU_ASCII_CELL_H + 26)         /* 行高 = 字高 + 上下留白 */
+#define SM_GAP     8                                   /* 面板与任务栏的间距 */
+
+/* 面板高 = 上下 padding + N 行 + (N-1) 个行间距（加菜单项自动变高） */
+static int sm_panel_h(void) {
+    return SM_PAD * 2 + SM_NITEMS * SM_ROW_H + (SM_NITEMS - 1) * SM_ROW_GAP;
+}
 
 static const wf_theme *tb_theme(void) { return &g_wf_light; }
 
@@ -94,33 +104,42 @@ static wf_btn_state tb_hover_state(const int r[4]) {
  *   Shutdown = hlt 死循环（与 shell 的 halt 语义一致） */
 static void tb_sm_row(int x, int y, int w, const char *label, int r[4]) {
     const wf_theme *t = tb_theme();
-    r[0] = x; r[1] = y; r[2] = w; r[3] = 32;
+    r[0] = x; r[1] = y; r[2] = w; r[3] = SM_ROW_H;
     int hot = (g_mouse_x >= x && g_mouse_x < x + w &&
-               g_mouse_y >= y && g_mouse_y < y + 32);
-    du_wf_list_item(&g_fb, x, y, w, label, t, hot, 0);
+               g_mouse_y >= y && g_mouse_y < y + SM_ROW_H);
+    /* 常态给一层半透明黑底（让文字在壁纸上可读），hover 再加深。 */
+    du_wf_overlay(&g_fb, x, y, w, SM_ROW_H, hot ? 0x66000000u : 0x40000000u);
+    du_draw_string(&g_fb, label, x + 16,
+                   y + (SM_ROW_H - (du_i64)DU_ASCII_CELL_H) / 2,
+                   hot ? 0xFFFFFFFFu : t->text_primary,
+                   0, DU_ASCII_STEP);
 }
 
 static void tb_start_menu_draw(void) {
     const wf_theme *t = tb_theme();
     int W = (int)g_fb_w, H = (int)g_fb_h;
     int by = H - TB_H - TB_BOTTOM_GAP;
+    int h  = sm_panel_h();                 /* 高度由菜单项数量推导 */
 
-    int px = g_tb2_start_rect[0];
-    int py = by - SM_H - SM_GAP;
+    /* 面板水平居中于开始按钮 */
+    int px = g_tb2_start_rect[0] + g_tb2_start_rect[2] / 2 - SM_W / 2;
+    int py = by - h - SM_GAP;
     if (px + SM_W > W) px = W - SM_W;
     if (px < 0) px = 0;
     if (py < 0) py = 0;
 
     g_tb2_sm_panel[0] = px; g_tb2_sm_panel[1] = py;
-    g_tb2_sm_panel[2] = SM_W; g_tb2_sm_panel[3] = SM_H;
+    g_tb2_sm_panel[2] = SM_W; g_tb2_sm_panel[3] = h;
 
-    du_wf_card(&g_fb, px, py, SM_W, SM_H, 232, t);
+    du_wf_card(&g_fb, px, py, SM_W, h, 232, t);
 
     int x = px + 8, w = SM_W - 16;
-    int y = py + 8;
-    tb_sm_row(x, y, w, "Shutdown", g_tb2_sm_shutdown_rect);
-    y += 32 + 4;
-    tb_sm_row(x, y, w, "Restart",  g_tb2_sm_restart_rect);
+    int y = py + SM_PAD;
+    for (int i = 0; i < SM_NITEMS; i++) {
+        int *r = (i == 0) ? g_tb2_sm_shutdown_rect : g_tb2_sm_restart_rect;
+        tb_sm_row(x, y, w, g_sm_items[i], r);
+        y += SM_ROW_H + SM_ROW_GAP;
+    }
 }
 
 /* 返回 1 = 事件已消费 */
@@ -132,8 +151,14 @@ static int tb_start_menu_click(int mx, int my) {
     }
     if (rect_hit(g_tb2_sm_restart_rect, mx, my)) {
         slog("[taskbar] restart from start menu");
-        /* 与 shell cmd_reboot 同语义：8042 复位线 */
+        /* 与 CODE/shell cmd_reboot 完全同序（含 int3 兜底 —— 8042 复位未生效时
+         * 由异常路径触发 panic 复位），并在发复位前等 8042 输入缓冲空，
+         * 避免在桌面有 IRQ/APIC 路由的状态下复位线被吃掉而卡死。 */
+        for (int i = 0; i < 1000000; i++) {
+            if (!(inb(0x64) & 0x02)) break;
+        }
         outb(0x64, 0xFE);
+        __asm__ volatile("int $0x03");
         for (;;) __asm__ volatile("hlt");
     }
     /* 面板内空白：吞掉点击，不落到桌面 */
@@ -271,8 +296,21 @@ void taskbar_draw(void) {
  * ============================================================ */
 
 int taskbar_click(int mx, int my) {
-    /* M3：菜单打开时先给它（面板/菜单项优先于任务栏与桌面） */
-    if (g_start_menu_open && tb_start_menu_click(mx, my)) return 1;
+    /* M3：菜单打开时优先处理 ——
+     *   面板内 → 交给菜单项
+     *   面板外 → 关闭菜单并吞掉这次点击（Win11 行为：点别处只关菜单，
+     *            不让这一下穿透到桌面图标/窗口） */
+    if (g_start_menu_open) {
+        if (tb_start_menu_click(mx, my)) return 1;
+        if (!rect_hit(g_tb2_sm_panel, mx, my)) {
+            /* 开始按钮本身走下面的开关逻辑（避免"关掉又立刻打开"） */
+            if (!rect_hit(g_tb2_start_rect, mx, my)) {
+                g_start_menu_open = 0;
+                slog("[taskbar] start menu closed (click outside)");
+                return 1;
+            }
+        }
+    }
     /* 主任务栏 */
     if (rect_hit(g_tb2_start_rect, mx, my)) {
         g_start_menu_open = !g_start_menu_open;

@@ -1157,28 +1157,31 @@ static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net,
     /* 保存按钮 */
     {
         u32 btn_bg = active == NET_ACT_SAVE ? 0xFF45454A : 0xFF3A3A3E;
-        fill_rounded_rect(fb, card_x + 470, card_y + 310, 180, 44, 3, btn_bg);
-        stroke_rounded_rect(fb, card_x + 470, card_y + 310, 180, 44, 3, 1, active == NET_ACT_SAVE ? 0xFF6C6C72 : 0xFF404044);
-        fb_text(fb, "Save", card_x + 530, card_y + 322, fg, btn_bg);
+        fill_rounded_rect(fb, card_x + 470, card_y + 310, 128, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 470, card_y + 310, 128, 44, 3, 1, active == NET_ACT_SAVE ? 0xFF6C6C72 : 0xFF404044);
+        fb_text(fb, "Save", card_x + 508, card_y + 322, fg, btn_bg);
     }
     /* 连接按钮 */
     {
         u32 btn_bg = active == NET_ACT_CONNECT ? 0xFF4A6A8A : 0xFF3A5070;
-        fill_rounded_rect(fb, card_x + 680, card_y + 310, 180, 44, 3, btn_bg);
-        stroke_rounded_rect(fb, card_x + 680, card_y + 310, 180, 44, 3, 1, active == NET_ACT_CONNECT ? 0xFF6A8AAA : 0xFF404060);
-        fb_text(fb, "Connect", card_x + 725, card_y + 322, 0xFFE0E0E0, btn_bg);
+        fill_rounded_rect(fb, card_x + 606, card_y + 310, 128, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 606, card_y + 310, 128, 44, 3, 1, active == NET_ACT_CONNECT ? 0xFF6A8AAA : 0xFF404060);
+        fb_text(fb, "Connect", card_x + 630, card_y + 322, 0xFFE0E0E0, btn_bg);
     }
     /* 跳过按钮：联网从不是进系统的前置条件，任何时刻都必须有退路。 */
     {
         u32 btn_bg = active == NET_ACT_SKIP ? 0xFF45454A : 0xFF303034;
-        fill_rounded_rect(fb, card_x + 890, card_y + 310, 150, 44, 3, btn_bg);
-        stroke_rounded_rect(fb, card_x + 890, card_y + 310, 150, 44, 3, 1, active == NET_ACT_SKIP ? 0xFF6C6C72 : 0xFF38383C);
-        fb_text(fb, "Skip", card_x + 935, card_y + 322, 0xFFB0B0B8, btn_bg);
+        fill_rounded_rect(fb, card_x + 742, card_y + 310, 128, 44, 3, btn_bg);
+        stroke_rounded_rect(fb, card_x + 742, card_y + 310, 128, 44, 3, 1, active == NET_ACT_SKIP ? 0xFF6C6C72 : 0xFF38383C);
+        fb_text(fb, "Skip", card_x + 784, card_y + 322, 0xFFB0B0B8, btn_bg);
     }
 
     /* 状态提示 */
     if (net->connected) {
         fb_text(fb, "Network profile saved", card_x + 470, card_y + 380, 0xFF5FAF6F, card);
+    } else if (g_no_wireless_device) {
+        /* 无无线设备只是提示，不跳过页面 —— 用户仍可用 Skip 前进 */
+        fb_text(fb, "No wireless device detected", card_x + 470, card_y + 380, 0xFFB08040, card);
     } else if (net->ssid[0]) {
         fb_text(fb, "Press Save or Connect", card_x + 470, card_y + 380, 0xFF808088, card);
     } else {
@@ -1246,7 +1249,7 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                     redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                 }
                 /* 保存按钮 */
-                if (*mx >= card_x + 470 && *mx < card_x + 650 && *my >= card_y + 310 && *my < card_y + 354) {
+                if (*mx >= card_x + 470 && *mx < card_x + 598 && *my >= card_y + 310 && *my < card_y + 354) {
                     net->connected = 1;
                     logl("[FirstInit] network profile saved");
                     redraw_network_card(fb, card_x, card_y, net, NET_ACT_SAVE, *mx, *my, bg, fg);
@@ -1254,7 +1257,7 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                     return;
                 }
                 /* 连接按钮 */
-                if (*mx >= card_x + 680 && *mx < card_x + 860 && *my >= card_y + 310 && *my < card_y + 354) {
+                if (*mx >= card_x + 606 && *mx < card_x + 734 && *my >= card_y + 310 && *my < card_y + 354) {
                     /* 严格错误策略：无 wlan 驱动栈 —— 零降级 panic */
                     firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
                     net->connected = 1;
@@ -1264,7 +1267,7 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                     return;
                 }
                 /* 跳过按钮：不配网络直接进系统（网络留到以后） */
-                if (*mx >= card_x + 890 && *mx < card_x + 1040 && *my >= card_y + 310 && *my < card_y + 354) {
+                if (*mx >= card_x + 742 && *mx < card_x + 870 && *my >= card_y + 310 && *my < card_y + 354) {
                     net->connected = 0;
                     logl("[FirstInit] network setup skipped by user");
                     redraw_network_card(fb, card_x, card_y, net, NET_ACT_SKIP, *mx, *my, bg, fg);
@@ -1631,19 +1634,41 @@ void dsk_entry(const dsk_boot_context *ctx) {
     net.connected = 0;
     net.ssid[0] = 0;
     net.password[0] = 0;
-    /* 无无线设备则直接跳过网络页：联网从来不是进系统的前置条件，
-     * 让用户在一个没有任何可选网络的页面上只能按 Save（或误按 Connect 吃
-     * NET-E01 panic）是设计缺陷。有设备时仍展示页面供确认/配置。 */
-    if (g_no_wireless_device) {
-        logl("[FirstInit] no wireless device; skipping network setup page");
-        net.connected = 0;
-    } else {
+    /* 网络设置页始终显示：联网不是进系统的前置条件，但页面本身要留给用户 ——
+     * 由用户点 Save / Connect / Skip 自己决定。无无线设备时不再自动跳过页面
+     * （那会抢走用户的选择权），Skip 按钮才是「跳过 Internet 连接」的入口。 */
+    cursor_bg_valid = 0;
+    cursor_cur_x = -100;
+    cursor_cur_y = -100;
+    logl("[FirstInit] entering network setup page");
+    read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
+    logl("[FirstInit] network setup page returned");
+
+    /* 页面返回后还要写盘（DSK 侧 USER.CONF + 回读校验 + firstInit.txt 翻位），
+     * 慢环境下没有提示会像卡死。给一个浮层，并作废光标备份防止它把旧背景
+     * 贴回来挖洞（与 login 的 "Logging in..." 同样的处理）。 */
+    {
         cursor_bg_valid = 0;
         cursor_cur_x = -100;
         cursor_cur_y = -100;
-        logl("[FirstInit] entering network setup page");
-        read_network_page(fb, card_x, card_y, &net, &mx, &my, bg, fg);
-        logl("[FirstInit] network setup page returned");
+        const char *tip = "Saving settings...";
+        i64 tw = (i64)17 * ASCII_STEP;
+        i64 bw = tw + 56, bh = 56;
+        i64 bx = cx - bw / 2, by = cy - bh / 2;
+        for (i64 r = -24; r < 648 + 24; r++) {
+            i64 yy = (card_y - 24) + r;
+            if (yy < 0 || (u64)yy >= fb_h) continue;
+            u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+            for (i64 c = -24; c < 948 + 24; c++) {
+                i64 xx = (card_x - 24) + c;
+                if (xx < 0 || (u64)xx >= fb_w) continue;
+                u32 px = line[(u64)xx];
+                line[(u64)xx] = ((px >> 2) & 0x3F3F3Fu) | 0xFF000000u;
+            }
+        }
+        fill_rounded_rect(fb, bx, by, bw, bh, 10, 0xFF30303Au);
+        stroke_rounded_rect(fb, bx, by, bw, bh, 10, 1, 0xFF6A6A78u);
+        fb_text(fb, tip, bx + 28, by + (bh - ASCII_H) / 2, 0xFFE8E8F0, 0xFF30303Au);
     }
     build_user_conf(pc, user, pass, &prefs, &net);
 
